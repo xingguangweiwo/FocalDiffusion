@@ -9,6 +9,7 @@ from typing import Dict, Optional
 import lpips
 
 
+
 class FocalDiffusionLoss(nn.Module):
     """Combined loss for FocalDiffusion training"""
 
