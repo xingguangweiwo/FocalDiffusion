@@ -4,7 +4,7 @@ Optimizer and scheduler utilities
 
 import torch
 from torch.optim import Optimizer
-from typing import Dict, Any
+from typing import Any, Dict, Tuple
 
 
 def get_optimizer(

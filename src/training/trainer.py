@@ -372,7 +372,8 @@ class FocalDiffusionTrainer:
             depth_weight=self.config['losses']['depth_weight'],
             rgb_weight=self.config['losses']['rgb_weight'],
             consistency_weight=self.config['losses']['consistency_weight'],
-        )
+            perceptual_weight=self.config['losses'].get('perceptual_weight', 0.05),
+        ).to(self.accelerator.device)
 
         progress_bar = tqdm(
             self.train_dataloader,
@@ -382,12 +383,25 @@ class FocalDiffusionTrainer:
 
         for step, batch in enumerate(progress_bar):
             with self.accelerator.accumulate(self.pipeline):
-                # Get batch data
-                focal_stack = batch['focal_stack']
-                focus_distances = batch['focus_distances']
-                depth_gt = batch['depth']
-                rgb_gt = batch['all_in_focus']
+                # Prepare batch data on device
+                device = self.accelerator.device
+                focal_stack = batch['focal_stack'].to(device)
+                focus_distances = batch['focus_distances'].to(device=device, dtype=focal_stack.dtype)
+                depth_gt = batch['depth'].to(device)
+                rgb_gt = batch['all_in_focus'].to(device)
                 camera_params = batch.get('camera_params')
+
+                if camera_params is not None:
+                    camera_params = {
+                        key: value.to(device=device, dtype=focal_stack.dtype)
+                        if isinstance(value, torch.Tensor)
+                        else value
+                        for key, value in camera_params.items()
+                    }
+
+                # Normalize inputs to match pipeline preprocessing
+                focal_stack = (focal_stack * 2.0) - 1.0
+                rgb_target = (rgb_gt * 2.0) - 1.0
 
                 # Extract focal features
                 focal_features = self.focal_processor(
@@ -396,18 +410,36 @@ class FocalDiffusionTrainer:
                     camera_params
                 )
 
-                # Add noise for diffusion training
-                noise = torch.randn_like(depth_gt)
+                focal_features = {
+                    key: value.to(self.pipeline.transformer.dtype)
+                    if isinstance(value, torch.Tensor) and value is not None else value
+                    for key, value in focal_features.items()
+                }
+
+                # Encode RGB target into VAE latent space
+                vae_dtype = next(self.pipeline.vae.parameters()).dtype
+                rgb_latent_input = rgb_target.to(dtype=vae_dtype)
+                latents_dist = self.pipeline.vae.encode(rgb_latent_input).latent_dist
+                latents = latents_dist.sample() * self.pipeline.vae.config.scaling_factor
+
+                # Sample noise for diffusion training
+                noise = torch.randn_like(latents)
                 timesteps = torch.randint(
                     0,
                     self.pipeline.scheduler.config.num_train_timesteps,
-                    (depth_gt.shape[0],),
-                    device=depth_gt.device
+                    (latents.shape[0],),
+                    device=device,
+                    dtype=torch.long
                 )
 
-                noisy_latents = self.pipeline.scheduler.add_noise(
-                    depth_gt, noise, timesteps
-                )
+                noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timesteps)
+                if hasattr(self.pipeline.scheduler, "scale_model_input"):
+                    model_input = self.pipeline.scheduler.scale_model_input(noisy_latents, timesteps)
+                else:
+                    model_input = noisy_latents
+
+                model_input = model_input.to(self.pipeline.transformer.dtype)
+                noise = noise.to(self.pipeline.transformer.dtype)
 
                 # Forward pass
                 with autocast(enabled=self.scaler is not None):
@@ -423,7 +455,7 @@ class FocalDiffusionTrainer:
 
                     # Predict noise
                     noise_pred = self.pipeline.transformer(
-                        hidden_states=noisy_latents,
+                        hidden_states=model_input,
                         timestep=timesteps,
                         encoder_hidden_states=prompt_embeds,
                         pooled_projections=pooled_prompt_embeds,
@@ -431,10 +463,44 @@ class FocalDiffusionTrainer:
                         return_dict=False,
                     )[0]
 
+                    # Decode auxiliary predictions for multi-task losses
+                    depth_logits, rgb_latent_pred = self.dual_decoder(latents)
+
+                    depth_probs = torch.sigmoid(depth_logits)
+                    depth_probs = F.interpolate(
+                        depth_probs,
+                        size=depth_gt.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+
+                    depth_min = depth_gt.amin(dim=(-2, -1), keepdim=True)
+                    depth_max = depth_gt.amax(dim=(-2, -1), keepdim=True)
+                    depth_range = (depth_max - depth_min).clamp(min=1e-6)
+                    depth_pred = depth_probs * depth_range + depth_min
+
+                    rgb_recon = self.pipeline.vae.decode(
+                        rgb_latent_pred / self.pipeline.vae.config.scaling_factor,
+                        return_dict=False
+                    )[0]
+                    rgb_recon = rgb_recon.clamp(-1, 1)
+
+                    # Cast tensors for stable loss computation
+                    noise_pred = noise_pred.float()
+                    noise_target = noise.float()
+                    depth_pred = depth_pred.float()
+                    depth_target = depth_gt.float()
+                    rgb_recon = rgb_recon.float()
+                    rgb_target_fp32 = rgb_target.float()
+
                     # Compute losses
                     loss_dict = loss_fn(
                         noise_pred=noise_pred,
-                        noise_target=noise,
+                        noise_target=noise_target,
+                        depth_pred=depth_pred,
+                        depth_target=depth_target,
+                        rgb_pred=rgb_recon,
+                        rgb_target=rgb_target_fp32,
                         focal_features=focal_features,
                     )
                     loss = loss_dict['total']
