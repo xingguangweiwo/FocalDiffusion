@@ -110,9 +110,10 @@ class PerceptualLoss(nn.Module):
     def __init__(self, net: str = "vgg") -> None:
         super().__init__()
         spec = importlib.util.find_spec("lpips")
+        self.register_buffer("_zero", torch.tensor(0.0), persistent=False)
+
         if spec is None:
             self._lpips = None
-            self.register_buffer("_zero", torch.tensor(0.0), persistent=False)
             return
 
         lpips_module = importlib.import_module("lpips")
@@ -122,3 +123,12 @@ class PerceptualLoss(nn.Module):
         pred_norm = (pred + 1) / 2
         target_norm = (target + 1) / 2
 
+        if self._lpips is None:
+            return self._zero.to(device=pred.device, dtype=pred.dtype)
+
+        loss = self._lpips(pred_norm, target_norm)
+
+        if isinstance(loss, torch.Tensor):
+            loss = loss.mean()
+
+        return loss
