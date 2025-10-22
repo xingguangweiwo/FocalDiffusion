@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+
 class FocalDiffusionLoss(nn.Module):
     """Combined loss used during training."""
 
@@ -121,10 +122,3 @@ class PerceptualLoss(nn.Module):
         pred_norm = (pred + 1) / 2
         target_norm = (target + 1) / 2
 
-        if self._lpips is None:
-            # Gracefully skip the perceptual component when the optional
-            # dependency is unavailable.
-            device = pred.device if pred is not None else target.device
-            return self._zero.to(device)
-
-        return self._lpips(pred_norm, target_norm).mean()
