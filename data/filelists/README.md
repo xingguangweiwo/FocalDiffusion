@@ -1,7 +1,9 @@
 # FocalDiffusion file lists
 
 Each text file enumerates the relative paths that compose a focal stack sample.
-Every non-comment line should follow the comma separated pattern:
+Two formats are supported:
+
+1. **Legacy CSV** – every non-comment line follows the comma separated pattern:
 
 ```
 <relative_path_to_stack>,<relative_path_to_depth_map>,<num_images_in_stack>
@@ -15,6 +17,37 @@ column is optional; when omitted the loader will fall back to the configured
 You can create separate lists for training, validation and testing. Example
 entries for the supported datasets are provided below together with the
 directory layouts expected by the loader.
+
+2. **JSON lines** – for more complex setups (e.g. synthesising focal stacks
+   on-the-fly or reading HyperSim HDF5 depth maps) you can emit a JSON object
+   per line. The following keys are recognised:
+
+   | Key | Description |
+   | --- | ----------- |
+   | `depth` / `depth_path` | Path to the metric depth map. Supports PNG, EXR, NPY and HDF5. |
+   | `focal_stack` / `focal_stack_dir` | Directory containing pre-rendered focal slices. Optional when `all_in_focus` is provided. |
+   | `all_in_focus` / `aif` | High-resolution sharp RGB image used to synthesise a focal stack through the built-in point spread function simulator. |
+   | `focus_distances` | Array of focus distances (metres) corresponding to each slice. If omitted, log-spaced values within `focal_range` are generated. |
+   | `camera` | Dictionary with camera metadata (`f_number`, `focal_length`, `pixel_size`, optionally `aperture`). |
+   | `depth_dataset` | Dataset name inside an HDF5 file (defaults to common HyperSim aliases). |
+   | `depth_scale` / `depth_shift` | Multiplicative/additive factors applied to the loaded depth map. |
+   | `depth_range` | `[min, max]` clamp for the valid metric depth range. The loader also returns the range so diffusion outputs can be re-scaled. |
+   | `generate_focal_stack` | Boolean overriding the global `generate_focal_stack` flag from the config. |
+   | `transpose_depth` | Set to true when the stored depth map needs transposing to match the RGB orientation. |
+
+   Example JSON entry combining an all-in-focus frame with a HyperSim HDF5 depth
+   map:
+
+   ```json
+   {
+     "all_in_focus": "ai_001_010/images/scene_cam_00_final_preview/frame.0031.color.jpg",
+     "depth": "ai_001_010/images/scene_cam_00_geometry_hdf5/frame.0031.depth_meters.hdf5",
+     "depth_dataset": "depth_meters",
+     "focus_distances": [0.5, 1.0, 2.0, 4.0, 8.0],
+     "camera": {"f_number": 8.0, "focal_length": 0.05, "pixel_size": 1.2e-5},
+     "generate_focal_stack": true
+   }
+   ```
 
 ## HyperSim
 
