@@ -4,18 +4,18 @@ Uses the FocalDiffusionTrainer class from src.training.trainer
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
-import yaml
+from typing import Any, Optional
 import logging
 from datetime import datetime
 
-# Add project root to path
+# Add project root to path before importing project modules
 project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-from src.training.trainer import FocalDiffusionTrainer
+from .utils import dump_yaml_file, load_yaml_file
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,35 +63,93 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file"""
-    config_path = Path(config_path)
+def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
+    """Load configuration from YAML file with nested defaults."""
+    config_path = Path(config_path).resolve()
 
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+    if _visited is None:
+        _visited = set()
 
-    # Handle inheritance from base config
-    if 'defaults' in config:
-        base_configs = config.pop('defaults')
-        if not isinstance(base_configs, list):
-            base_configs = [base_configs]
+    if config_path in _visited:
+        raise ValueError(f"Cyclic config dependency detected for {config_path}")
 
-        # Load base configs
-        merged_config = {}
-        for base_name in base_configs:
-            base_path = config_path.parent / f"{base_name}.yaml"
-            if base_path.exists():
-                with open(base_path, 'r') as f:
-                    base_config = yaml.safe_load(f)
-                    merged_config = deep_merge(merged_config, base_config)
+    _visited.add(config_path)
 
-        # Merge with current config
-        config = deep_merge(merged_config, config)
+    config = load_yaml_file(config_path) or {}
+
+    config_dir = config_path.parent
+
+    # Resolve relative paths before merging so that overrides inherit absolute values
+    _resolve_paths_inplace(config, config_dir)
+
+    defaults = config.pop('defaults', [])
+    if not isinstance(defaults, list):
+        defaults = [defaults]
+
+    merged_config: dict = {}
+    for default_entry in defaults:
+        base_config_path = _resolve_default_path(default_entry, config_dir)
+        base_config = load_config(base_config_path, _visited=_visited)
+        merged_config = deep_merge(merged_config, base_config)
+
+    config = deep_merge(merged_config, config)
+    _visited.remove(config_path)
 
     return config
+
+
+def _resolve_default_path(entry: Any, config_dir: Path) -> Path:
+    """Convert a defaults entry into an absolute path to a YAML file."""
+    if isinstance(entry, dict):
+        if len(entry) != 1:
+            raise ValueError(f"Unsupported defaults entry: {entry}")
+        key, value = next(iter(entry.items()))
+        relative = Path(key) / value
+    else:
+        relative = Path(str(entry))
+
+    if relative.suffix != '.yaml':
+        relative = relative.with_suffix('.yaml')
+
+    # First try resolving relative to the current config file
+    candidate_paths = [
+        (config_dir / relative).resolve(),
+        (project_root / "configs" / relative).resolve(),
+    ]
+
+    for base_path in candidate_paths:
+        if base_path.exists():
+            return base_path
+
+    raise FileNotFoundError(
+        f"Default config '{entry}' not found relative to {config_dir}: {candidate_paths[-1]}"
+    )
+
+
+def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
+    """Resolve relative paths for known config keys in-place."""
+
+    def _resolve(path_value: Optional[str]) -> Optional[str]:
+        if path_value is None:
+            return None
+        path = Path(path_value)
+        if path.is_absolute() or str(path_value).startswith("${"):
+            return str(path)
+        anchor = base_dir if str(path_value).startswith(('./', '../')) else project_root
+        return str((anchor / path).resolve())
+
+    data_block = config.get('data')
+    if isinstance(data_block, dict):
+        for key in ['data_root', 'train_filelist', 'val_filelist', 'test_filelist']:
+            if key in data_block:
+                data_block[key] = _resolve(data_block[key])
+
+    output_block = config.get('output')
+    if isinstance(output_block, dict) and 'save_dir' in output_block:
+        output_block['save_dir'] = _resolve(output_block['save_dir'])
 
 
 def deep_merge(dict1: dict, dict2: dict) -> dict:
@@ -145,7 +203,9 @@ def validate_config(config: dict) -> None:
     required_keys = [
         'model.base_model_id',
         'data.dataset_type',
-        'data.train_root',
+        'data.data_root',
+        'data.train_filelist',
+        'data.val_filelist',
         'training.num_epochs',
         'training.batch_size',
         'optimizer.learning_rate',
@@ -162,8 +222,10 @@ def validate_config(config: dict) -> None:
             value = value[key]
 
     # Check paths exist
-    if not Path(config['data']['train_root']).exists():
-        logger.warning(f"Training data root does not exist: {config['data']['train_root']}")
+    if not Path(config['data']['data_root']).exists():
+        logger.warning(
+            f"Training data root does not exist: {config['data']['data_root']}"
+        )
 
     # Create output directory
     output_dir = Path(config['output']['save_dir'])
@@ -199,8 +261,7 @@ def main():
 
     # Save final config
     config_save_path = Path(config['output']['save_dir']) / 'config.yaml'
-    with open(config_save_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False)
+    dump_yaml_file(config_save_path, config)
     logger.info(f"Saved configuration to {config_save_path}")
 
     if args.dry_run:
@@ -209,6 +270,8 @@ def main():
 
     # Create trainer
     logger.info("Initializing FocalDiffusion trainer...")
+    from src.training.trainer import FocalDiffusionTrainer  # Lazy import to avoid heavy deps during dry-runs
+
     trainer = FocalDiffusionTrainer(config)
 
     # Resume if specified

@@ -156,7 +156,7 @@ class FocalDiffusionTrainer:
         self.dual_decoder = DualOutputDecoder(
             in_channels=pipe.vae.config.latent_channels,
             out_channels_depth=1,
-            out_channels_rgb=3,
+            out_channels_rgb=pipe.vae.config.latent_channels,
         )
 
         # Create FocalDiffusion pipeline

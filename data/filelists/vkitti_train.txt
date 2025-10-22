@@ -1,0 +1,4 @@
+# Virtual KITTI training split
+# scene_path,depth_path,num_images
+Scene01/frames/rgb/Camera_0,Scene01/frames/depth/Camera_0/depth00001.png,7
+Scene02/frames/rgb/Camera_0,Scene02/frames/depth/Camera_0/depth00005.png,7

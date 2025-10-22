@@ -1,0 +1,3 @@
+# HyperSim validation split
+# scene_path,depth_path,num_images
+scenes/ai_001_003/images/frame.0010,scenes/ai_001_003/depth/frame.0010.depth.exr,9

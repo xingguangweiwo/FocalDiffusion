@@ -1,0 +1,19 @@
+# HyperSim-specific overrides built on top of configs/base.yaml
+defaults:
+  - base
+
+data:
+  dataset_type: hypersim
+  data_root: /data/hypersim_focal_stacks
+  train_filelist: data/filelists/hypersim_train.txt
+  val_filelist: data/filelists/hypersim_val.txt
+  test_filelist: data/filelists/hypersim_test.txt
+  focal_stack_size: 9
+  focal_range: [0.2, 40.0]
+
+output:
+  save_dir: outputs/experiments/hypersim
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 2
