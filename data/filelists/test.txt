@@ -1,0 +1,2 @@
+# Generic mixed dataset testing list
+Scene20/frames/rgb/Camera_0,Scene20/frames/depth/Camera_0/depth00010.png,7

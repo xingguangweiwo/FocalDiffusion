@@ -1,0 +1,66 @@
+# Default training recipe in a single file.
+# Other configs can extend this base via `defaults: [base]`.
+model:
+  base_model_id: stabilityai/stable-diffusion-3.5-medium
+  feature_dim: 128
+  num_scales: 3
+  max_focal_stack_size: 12
+
+data:
+  dataset_type: filelist
+  data_root: /path/to/focal_stacks
+  train_filelist: data/filelists/train.txt
+  val_filelist: data/filelists/val.txt
+  test_filelist: data/filelists/test.txt
+  image_size: [512, 512]
+  focal_stack_size: 5
+  focal_range: [0.3, 10.0]
+  num_workers: 8
+  max_train_samples: null
+  max_val_samples: null
+
+training:
+  num_epochs: 30
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  mixed_precision: fp16
+  seed: 42
+  val_every_n_epochs: 1
+  save_every_n_epochs: 1
+  use_ema: true
+  ema_decay: 0.999
+  max_grad_norm: 1.0
+  trainable_modules:
+    transformer: attention_only
+  lora_rank: 8
+  lora_alpha: 16
+
+optimizer:
+  type: adamw
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: cosine
+  warmup_steps: 500
+
+losses:
+  diffusion_weight: 1.0
+  depth_weight: 1.0
+  rgb_weight: 0.5
+  consistency_weight: 0.1
+
+validation:
+  num_inference_steps: 30
+  guidance_scale: 1.0
+
+logging:
+  level: INFO
+  use_wandb: false
+  log_every_n_steps: 10
+  tags: []
+
+output:
+  save_dir: outputs/experiments/base
+  save_top_k: 3

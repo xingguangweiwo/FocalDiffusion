@@ -1,0 +1,15 @@
+# Virtual KITTI recipe referencing configs/base.yaml
+defaults:
+  - base
+
+data:
+  dataset_type: virtual_kitti
+  data_root: /data/virtual_kitti_focal_stacks
+  train_filelist: data/filelists/vkitti_train.txt
+  val_filelist: data/filelists/vkitti_val.txt
+  test_filelist: data/filelists/vkitti_test.txt
+  focal_stack_size: 7
+  focal_range: [0.5, 80.0]
+
+output:
+  save_dir: outputs/experiments/virtual_kitti

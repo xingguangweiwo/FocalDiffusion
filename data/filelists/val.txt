@@ -1,0 +1,2 @@
+# Generic mixed dataset validation list
+scenes/ai_001_003/images/frame.0010,scenes/ai_001_003/depth/frame.0010.depth.exr,9

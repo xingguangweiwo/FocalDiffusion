@@ -1,0 +1,15 @@
+# Mixed HyperSim + Virtual KITTI recipe referencing configs/base.yaml
+defaults:
+  - base
+
+data:
+  dataset_type: filelist
+  data_root: /data/focaldiffusion_mixed
+  train_filelist: data/filelists/train.txt
+  val_filelist: data/filelists/val.txt
+  test_filelist: data/filelists/test.txt
+  focal_stack_size: 8
+  focal_range: [0.2, 80.0]
+
+output:
+  save_dir: outputs/experiments/mixed

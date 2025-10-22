@@ -1,26 +1,26 @@
-"""
-Loss functions for FocalDiffusion training
-"""
+"""Loss functions for FocalDiffusion training."""
 
+from __future__ import annotations
+
+import importlib
+from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
-import lpips
 
 
 
 class FocalDiffusionLoss(nn.Module):
-    """Combined loss for FocalDiffusion training"""
+    """Combined loss used during training."""
 
     def __init__(
-            self,
-            diffusion_weight: float = 1.0,
-            depth_weight: float = 0.1,
-            rgb_weight: float = 0.1,
-            consistency_weight: float = 0.05,
-            perceptual_weight: float = 0.05,
-    ):
+        self,
+        diffusion_weight: float = 1.0,
+        depth_weight: float = 0.1,
+        rgb_weight: float = 0.1,
+        consistency_weight: float = 0.05,
+        perceptual_weight: float = 0.05,
+    ) -> None:
         super().__init__()
         self.diffusion_weight = diffusion_weight
         self.depth_weight = depth_weight
@@ -28,111 +28,97 @@ class FocalDiffusionLoss(nn.Module):
         self.consistency_weight = consistency_weight
         self.perceptual_weight = perceptual_weight
 
-        # Initialize loss components
         self.depth_loss = DepthLoss()
         self.consistency_loss = ConsistencyLoss()
-
-        if perceptual_weight > 0:
-            self.perceptual_loss = PerceptualLoss()
-        else:
-            self.perceptual_loss = None
+        self.perceptual_loss = PerceptualLoss() if perceptual_weight > 0 else None
 
     def forward(
-            self,
-            noise_pred: torch.Tensor,
-            noise_target: torch.Tensor,
-            depth_pred: Optional[torch.Tensor] = None,
-            depth_target: Optional[torch.Tensor] = None,
-            rgb_pred: Optional[torch.Tensor] = None,
-            rgb_target: Optional[torch.Tensor] = None,
-            focal_features: Optional[Dict] = None,
+        self,
+        noise_pred: torch.Tensor,
+        noise_target: torch.Tensor,
+        depth_pred: Optional[torch.Tensor] = None,
+        depth_target: Optional[torch.Tensor] = None,
+        rgb_pred: Optional[torch.Tensor] = None,
+        rgb_target: Optional[torch.Tensor] = None,
+        focal_features: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Compute combined loss"""
-        losses = {}
+        losses: Dict[str, torch.Tensor] = {}
 
-        # Diffusion loss (main loss)
-        losses['diffusion'] = F.mse_loss(noise_pred, noise_target)
+        losses["diffusion"] = F.mse_loss(noise_pred, noise_target)
 
-        # Depth loss
         if depth_pred is not None and depth_target is not None and self.depth_weight > 0:
-            losses['depth'] = self.depth_loss(depth_pred, depth_target)
+            losses["depth"] = self.depth_loss(depth_pred, depth_target)
 
-        # RGB reconstruction loss
         if rgb_pred is not None and rgb_target is not None and self.rgb_weight > 0:
-            losses['rgb'] = F.l1_loss(rgb_pred, rgb_target)
-
-            # Perceptual loss
+            losses["rgb"] = F.l1_loss(rgb_pred, rgb_target)
             if self.perceptual_loss is not None and self.perceptual_weight > 0:
-                losses['perceptual'] = self.perceptual_loss(rgb_pred, rgb_target)
+                losses["perceptual"] = self.perceptual_loss(rgb_pred, rgb_target)
 
-        # Consistency loss
         if focal_features is not None and self.consistency_weight > 0:
-            losses['consistency'] = self.consistency_loss(focal_features)
+            losses["consistency"] = self.consistency_loss(focal_features)
 
-        # Combine losses
-        total_loss = sum(
-            losses.get(k, 0) * getattr(self, f'{k}_weight', 1.0)
-            for k in losses
-        )
-
-        losses['total'] = total_loss
+        total_loss = torch.zeros_like(losses["diffusion"])
+        for key, value in losses.items():
+            weight = getattr(self, f"{key}_weight", 1.0)
+            total_loss = total_loss + weight * value
+        losses["total"] = total_loss
         return losses
 
 
 class DepthLoss(nn.Module):
-    """Depth estimation loss with scale-invariant component"""
+    """Depth estimation loss with a scale-invariant component."""
 
-    def __init__(self, alpha: float = 0.5):
+    def __init__(self, alpha: float = 0.5, min_depth: float = 1e-3) -> None:
         super().__init__()
         self.alpha = alpha
+        self.min_depth = min_depth
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute scale-invariant depth loss"""
-        # L1 loss
-        l1_loss = F.l1_loss(pred, target)
+        pred_safe = pred.clamp(min=self.min_depth)
+        target_safe = target.clamp(min=self.min_depth)
 
-        # Scale-invariant loss
-        d = torch.log(pred + 1e-8) - torch.log(target + 1e-8)
-        scale_inv_loss = torch.mean(d ** 2) - self.alpha * torch.mean(d) ** 2
-
-        return l1_loss + 0.1 * scale_inv_loss
+        l1_loss = F.l1_loss(pred_safe, target_safe)
+        diff = torch.log(pred_safe) - torch.log(target_safe)
+        scale_inv = torch.mean(diff ** 2) - self.alpha * torch.mean(diff) ** 2
+        return l1_loss + 0.1 * scale_inv
 
 
 class ConsistencyLoss(nn.Module):
-    """Consistency loss for focal features"""
+    """Regularises focal attention to remain sharp and smooth."""
 
-    def forward(self, focal_features: Dict) -> torch.Tensor:
-        """Compute consistency across focal planes"""
-        if 'attention_weights' not in focal_features:
-            return torch.tensor(0.0)
+    def forward(self, focal_features: Dict[str, torch.Tensor]) -> torch.Tensor:
+        weights = focal_features.get("attention_weights")
+        if weights is None:
+            device = None
+            for value in focal_features.values():
+                if isinstance(value, torch.Tensor):
+                    device = value.device
+                    break
+            return torch.zeros((), device=device) if device is not None else torch.zeros(())
 
-        weights = focal_features['attention_weights']
-
-        # Entropy regularization - encourage focused attention
-        entropy = -torch.sum(weights * torch.log(weights + 1e-8), dim=-1)
-        entropy_loss = entropy.mean()
-
-        # Smoothness regularization
+        entropy = -torch.sum(weights * torch.log(weights + 1e-8), dim=-1).mean()
         if weights.shape[-1] > 1:
-            diff = torch.diff(weights, dim=-1)
-            smoothness_loss = torch.mean(diff ** 2)
+            smoothness = torch.mean(torch.diff(weights, dim=-1) ** 2)
         else:
-            smoothness_loss = 0.0
-
-        return entropy_loss + smoothness_loss
+            smoothness = torch.zeros_like(entropy)
+        return entropy + smoothness
 
 
 class PerceptualLoss(nn.Module):
-    """Perceptual loss using LPIPS"""
+    """LPIPS perceptual loss wrapper."""
 
-    def __init__(self, net: str = 'vgg'):
+    def __init__(self, net: str = "vgg") -> None:
         super().__init__()
-        self.lpips = lpips.LPIPS(net=net)
+        spec = importlib.util.find_spec("lpips")
+        if spec is None:
+            self._lpips = None
+            self.register_buffer("_zero", torch.tensor(0.0), persistent=False)
+            return
+
+        lpips_module = importlib.import_module("lpips")
+        self._lpips = lpips_module.LPIPS(net=net)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute perceptual loss"""
-        # Normalize to [0, 1] for LPIPS
         pred_norm = (pred + 1) / 2
         target_norm = (target + 1) / 2
 
-        return self.lpips(pred_norm, target_norm).mean()

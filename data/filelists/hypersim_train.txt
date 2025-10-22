@@ -1,0 +1,4 @@
+# HyperSim training split
+# scene_path,depth_path,num_images
+scenes/ai_001_001/images/frame.0000,scenes/ai_001_001/depth/frame.0000.depth.exr,9
+scenes/ai_001_002/images/frame.0005,scenes/ai_001_002/depth/frame.0005.depth.exr,9
