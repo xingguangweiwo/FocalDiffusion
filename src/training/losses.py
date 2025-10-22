@@ -122,3 +122,14 @@ class PerceptualLoss(nn.Module):
         pred_norm = (pred + 1) / 2
         target_norm = (target + 1) / 2
 
+        if self._lpips is None:
+            zero = self._zero.to(device=pred_norm.device, dtype=pred_norm.dtype)
+            if pred_norm.ndim == 4:
+                zero = zero.reshape(1, 1, 1, 1).expand(pred_norm.shape[0], 1, 1, 1)
+            return zero
+
+        loss = self._lpips(pred_norm, target_norm)
+        if loss.ndim == 0 and pred_norm.ndim == 4:
+            loss = loss.reshape(1, 1, 1, 1).expand(pred_norm.shape[0], 1, 1, 1)
+        return loss
+
