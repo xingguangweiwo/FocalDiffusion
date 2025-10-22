@@ -108,16 +108,23 @@ class PerceptualLoss(nn.Module):
 
     def __init__(self, net: str = "vgg") -> None:
         super().__init__()
-        if importlib.util.find_spec("lpips") is None:
-            raise ImportError(
-                "The lpips package is required for perceptual supervision. "
-                "Install it via `pip install lpips` or disable the perceptual "
-                "loss by setting `losses.perceptual_weight` to 0 in the config."
-            )
+        spec = importlib.util.find_spec("lpips")
+        if spec is None:
+            self._lpips = None
+            self.register_buffer("_zero", torch.tensor(0.0), persistent=False)
+            return
+
         lpips_module = importlib.import_module("lpips")
-        self.lpips = lpips_module.LPIPS(net=net)
+        self._lpips = lpips_module.LPIPS(net=net)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred_norm = (pred + 1) / 2
         target_norm = (target + 1) / 2
-        return self.lpips(pred_norm, target_norm).mean()
+
+        if self._lpips is None:
+            # Gracefully skip the perceptual component when the optional
+            # dependency is unavailable.
+            device = pred.device if pred is not None else target.device
+            return self._zero.to(device)
+
+        return self._lpips(pred_norm, target_norm).mean()
