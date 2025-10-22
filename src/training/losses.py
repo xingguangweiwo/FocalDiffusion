@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
 from typing import Dict, Optional
-
-import lpips
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -109,7 +108,14 @@ class PerceptualLoss(nn.Module):
 
     def __init__(self, net: str = "vgg") -> None:
         super().__init__()
-        self.lpips = lpips.LPIPS(net=net)
+        if importlib.util.find_spec("lpips") is None:
+            raise ImportError(
+                "The lpips package is required for perceptual supervision. "
+                "Install it via `pip install lpips` or disable the perceptual "
+                "loss by setting `losses.perceptual_weight` to 0 in the config."
+            )
+        lpips_module = importlib.import_module("lpips")
+        self.lpips = lpips_module.LPIPS(net=net)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pred_norm = (pred + 1) / 2
