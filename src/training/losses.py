@@ -122,14 +122,37 @@ class PerceptualLoss(nn.Module):
         pred_norm = (pred + 1) / 2
         target_norm = (target + 1) / 2
 
+        if pred_norm.ndim == 0:
+            batch_shape: Optional[torch.Size] = None
+        else:
+            spatial_dims = pred_norm.ndim - 1
+            batch_shape = torch.Size((pred_norm.shape[0],) + (1,) * spatial_dims)
+
         if self._lpips is None:
             zero = self._zero.to(device=pred_norm.device, dtype=pred_norm.dtype)
-            if pred_norm.ndim == 4:
-                zero = zero.reshape(1, 1, 1, 1).expand(pred_norm.shape[0], 1, 1, 1)
-            return zero
+            if batch_shape is None:
+                return zero
+            return zero.reshape((1,) + (1,) * spatial_dims).expand(batch_shape)
 
         loss = self._lpips(pred_norm, target_norm)
-        if loss.ndim == 0 and pred_norm.ndim == 4:
-            loss = loss.reshape(1, 1, 1, 1).expand(pred_norm.shape[0], 1, 1, 1)
+
+        if batch_shape is None:
+            return loss
+
+        if loss.shape == batch_shape:
+            return loss
+
+        if loss.ndim == 0:
+            return loss.reshape((1,) + (1,) * spatial_dims).expand(batch_shape)
+
+        if loss.shape[0] == pred_norm.shape[0]:
+            remaining = loss.shape[1:]
+            if remaining == batch_shape[1:]:
+                return loss
+            num_elements = loss.numel()
+            target_elements = pred_norm.shape[0]
+            if num_elements == target_elements:
+                return loss.reshape(batch_shape)
+
         return loss
 
