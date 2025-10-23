@@ -18,6 +18,16 @@ data:
   num_workers: 8
   max_train_samples: null
   max_val_samples: null
+  dataset_kwargs:
+    camera_defaults:
+      f_number: 8.0
+      focal_length: 0.05
+      pixel_size: 1.2e-5
+    simulator_kwargs:
+      sigma_quantisation: 0.25
+      max_sigma: 8.0
+    depth_bounds: [0.1, 100.0]
+    generate_focal_stack: false
 
 training:
   num_epochs: 30

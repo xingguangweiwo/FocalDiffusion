@@ -51,38 +51,57 @@ class FocalDiffusionTrainer:
 
         logger.info("Setting up data loaders from file lists...")
 
+        dataset_cfg = self.config['data']
+        dataset_kwargs_cfg = dataset_cfg.get('dataset_kwargs') or {}
+        base_dataset_kwargs = {
+            key: value for key, value in dataset_kwargs_cfg.items()
+            if key not in ('train', 'val')
+        }
+        if any(key in dataset_kwargs_cfg for key in ('train', 'val')):
+            train_dataset_kwargs = {**base_dataset_kwargs, **dataset_kwargs_cfg.get('train', {})}
+            val_dataset_kwargs = {**base_dataset_kwargs, **dataset_kwargs_cfg.get('val', {})}
+        else:
+            train_dataset_kwargs = dict(base_dataset_kwargs)
+            val_dataset_kwargs = dict(base_dataset_kwargs)
+
+        dataset_type = dataset_cfg.get('dataset_type')
+
         # Training dataloader
-        train_filelist = self.config['data']['train_filelist']
+        train_filelist = dataset_cfg['train_filelist']
         logger.info(f"Loading training data from: {train_filelist}")
 
         self.train_dataloader = create_dataloader(
+            dataset_type=dataset_type,
             filelist_path=train_filelist,
-            data_root=self.config['data']['data_root'],
+            data_root=dataset_cfg['data_root'],
             batch_size=self.config['training']['batch_size'],
-            num_workers=self.config['data']['num_workers'],
-            image_size=tuple(self.config['data']['image_size']),
-            focal_stack_size=self.config['data']['focal_stack_size'],
-            focal_range=tuple(self.config['data']['focal_range']),
+            num_workers=dataset_cfg['num_workers'],
+            image_size=tuple(dataset_cfg['image_size']),
+            focal_stack_size=dataset_cfg['focal_stack_size'],
+            focal_range=tuple(dataset_cfg['focal_range']),
             augmentation=True,
             shuffle=True,
-            max_samples=self.config['data'].get('max_train_samples'),  # Optional limit
+            max_samples=dataset_cfg.get('max_train_samples'),
+            **train_dataset_kwargs,
         )
 
         # Validation dataloader
-        val_filelist = self.config['data']['val_filelist']
+        val_filelist = dataset_cfg['val_filelist']
         logger.info(f"Loading validation data from: {val_filelist}")
 
         self.val_dataloader = create_dataloader(
+            dataset_type=dataset_type,
             filelist_path=val_filelist,
-            data_root=self.config['data']['data_root'],
+            data_root=dataset_cfg['data_root'],
             batch_size=self.config['training']['batch_size'],
-            num_workers=self.config['data']['num_workers'],
-            image_size=tuple(self.config['data']['image_size']),
-            focal_stack_size=self.config['data']['focal_stack_size'],
-            focal_range=tuple(self.config['data']['focal_range']),
+            num_workers=dataset_cfg['num_workers'],
+            image_size=tuple(dataset_cfg['image_size']),
+            focal_stack_size=dataset_cfg['focal_stack_size'],
+            focal_range=tuple(dataset_cfg['focal_range']),
             augmentation=False,
             shuffle=False,
-            max_samples=self.config['data'].get('max_val_samples'),
+            max_samples=dataset_cfg.get('max_val_samples'),
+            **val_dataset_kwargs,
         )
 
         logger.info(f"Train samples: {len(self.train_dataloader.dataset)}")
@@ -389,6 +408,7 @@ class FocalDiffusionTrainer:
                 focus_distances = batch['focus_distances'].to(device=device, dtype=focal_stack.dtype)
                 depth_gt = batch['depth'].to(device)
                 rgb_gt = batch['all_in_focus'].to(device)
+
                 camera_params = batch.get('camera_params')
 
                 if camera_params is not None:
@@ -476,6 +496,7 @@ class FocalDiffusionTrainer:
 
                     depth_min = depth_gt.amin(dim=(-2, -1), keepdim=True)
                     depth_max = depth_gt.amax(dim=(-2, -1), keepdim=True)
+
                     depth_range = (depth_max - depth_min).clamp(min=1e-6)
                     depth_pred = depth_probs * depth_range + depth_min
 
@@ -499,6 +520,7 @@ class FocalDiffusionTrainer:
                         noise_target=noise_target,
                         depth_pred=depth_pred,
                         depth_target=depth_target,
+
                         rgb_pred=rgb_recon,
                         rgb_target=rgb_target_fp32,
                         focal_features=focal_features,
@@ -567,9 +589,15 @@ class FocalDiffusionTrainer:
                 )
 
                 # Compute metrics
+                depth_gt = batch['depth'].to(output.depth_map.device).squeeze(1)
+                mask = batch.get('valid_mask')
+                if mask is not None:
+                    mask = mask.to(output.depth_map.device)
+
                 metrics = compute_metrics(
                     output.depth_map,
-                    batch['depth'].squeeze(1)
+                    depth_gt,
+                    mask=mask,
                 )
 
                 # Accumulate
@@ -577,10 +605,11 @@ class FocalDiffusionTrainer:
                     if k in val_metrics:
                         val_metrics[k] += v
 
-                val_metrics['loss'] += F.l1_loss(
-                    output.depth_map,
-                    batch['depth'].squeeze(1)
-                ).item()
+                if mask is not None:
+                    val_loss = F.l1_loss(output.depth_map[mask], depth_gt[mask])
+                else:
+                    val_loss = F.l1_loss(output.depth_map, depth_gt)
+                val_metrics['loss'] += val_loss.item()
 
                 num_batches += 1
 
