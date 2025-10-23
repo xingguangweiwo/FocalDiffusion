@@ -280,9 +280,16 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
         depth_logits, rgb_latents = self.dual_decoder(latents)
-        depth_map = torch.sigmoid(depth_logits)
-        depth_map = F.interpolate(depth_map, size=(height, width), mode="bilinear", align_corners=False)
-        depth_map = depth_map.squeeze(1)
+        depth_probs = torch.sigmoid(depth_logits)
+        depth_probs = F.interpolate(
+            depth_probs, size=(height, width), mode="bilinear", align_corners=False
+        )
+        depth_map = depth_probs.squeeze(1)
+
+        if camera_params is not None and "depth_min" in camera_params and "depth_max" in camera_params:
+            depth_min = camera_params["depth_min"].to(depth_map.dtype).view(-1, 1, 1)
+            depth_max = camera_params["depth_max"].to(depth_map.dtype).view(-1, 1, 1)
+            depth_map = depth_min + depth_map * (depth_max - depth_min)
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)

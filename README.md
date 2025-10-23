@@ -26,17 +26,20 @@ huggingface-cli login
 ## Datasets
 
 Training relies on focal stacks paired with ground-truth depth.  The
-`data/filelists/` directory contains examples of the text files expected by the
-data loader.  Each line follows the pattern:
+`data/filelists/` directory documents the supported text formats:
 
-```
-<stack_directory>,<depth_map_path>,<num_images_in_stack>
-```
+- **CSV** entries describe pre-rendered stacks with
+  `<stack_directory>,<depth_map_path>,<num_images>`.
+- **JSON** entries can point to HyperSim HDF5 files and optionally include an
+  all-in-focus RGB frame.  When `generate_focal_stack` is enabled the loader will
+  synthesise the stack on-the-fly using the built-in circle-of-confusion
+  simulator (mirroring the MATLAB reference shared above).  Camera parameters,
+  focus distances, depth scaling factors, and orientation fixes can be provided
+  per sample.
 
 Paths are resolved relative to `data.data_root` in the configuration.  Generate
-focal stacks from sources such as HyperSim or Virtual KITTI using your preferred
-point-spread-function simulator, then create `train`, `val`, and `test` file
-lists matching your layout.
+file lists for your `train`, `val`, and `test` splits after preparing the
+datasets (e.g. HyperSim, Virtual KITTI) or your own focal-stack generator.
 
 ## Configuration
 
@@ -52,7 +55,8 @@ You can start from one of the presets and edit the following keys:
 
 - `model.base_model_id` – the Stable Diffusion 3.5 checkpoint to adapt.
 - `data.data_root` and the `*_filelist` entries – absolute paths to your focal
-  stack datasets.
+  stack datasets.  Use `data.dataset_kwargs` to pass camera defaults,
+  `simulator_kwargs`, and per-split overrides such as `generate_focal_stack`.
 - `training.batch_size`, `training.gradient_accumulation_steps`,
   `optimizer.learning_rate` – adjusted to your hardware budget.
 
