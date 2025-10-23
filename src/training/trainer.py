@@ -413,24 +413,17 @@ class FocalDiffusionTrainer:
                     depth_range_tensor = depth_range_tensor.to(device=device, dtype=depth_gt.dtype)
                 depth_mask = batch.get('valid_mask')
                 if depth_mask is not None:
-                    depth_mask = depth_mask.to(device=device)
+                    depth_mask = depth_mask.to(device=device).bool()
 
                 camera_params = batch.get('camera_params')
 
                 if camera_params is not None:
-                    batch_size = focal_stack.shape[0]
-                    converted_params = {}
-                    for key, value in camera_params.items():
-                        if isinstance(value, torch.Tensor):
-                            converted_params[key] = value.to(device=device, dtype=focal_stack.dtype)
-                        else:
-                            converted_params[key] = torch.full(
-                                (batch_size,),
-                                float(value),
-                                device=device,
-                                dtype=focal_stack.dtype,
-                            )
-                    camera_params = converted_params
+                    camera_params = {
+                        key: value.to(device=device, dtype=focal_stack.dtype)
+                        if isinstance(value, torch.Tensor)
+                        else value
+                        for key, value in camera_params.items()
+                    }
 
                 # Normalize inputs to match pipeline preprocessing
                 focal_stack = (focal_stack * 2.0) - 1.0
@@ -507,15 +500,19 @@ class FocalDiffusionTrainer:
                         align_corners=False
                     )
 
+                    depth_min = depth_gt.amin(dim=(-2, -1), keepdim=True)
+                    depth_max = depth_gt.amax(dim=(-2, -1), keepdim=True)
+
                     if depth_range_tensor is not None:
                         depth_min = depth_range_tensor[:, 0].view(-1, 1, 1)
                         depth_max = depth_range_tensor[:, 1].view(-1, 1, 1)
-                    elif camera_params is not None and 'depth_min' in camera_params and 'depth_max' in camera_params:
+                    elif (
+                        camera_params is not None
+                        and 'depth_min' in camera_params
+                        and 'depth_max' in camera_params
+                    ):
                         depth_min = camera_params['depth_min'].to(dtype=depth_gt.dtype).view(-1, 1, 1)
                         depth_max = camera_params['depth_max'].to(dtype=depth_gt.dtype).view(-1, 1, 1)
-                    else:
-                        depth_min = depth_gt.amin(dim=(-2, -1), keepdim=True)
-                        depth_max = depth_gt.amax(dim=(-2, -1), keepdim=True)
 
                     depth_range = (depth_max - depth_min).clamp(min=1e-6)
                     depth_pred = depth_probs * depth_range + depth_min
@@ -540,7 +537,7 @@ class FocalDiffusionTrainer:
                         noise_target=noise_target,
                         depth_pred=depth_pred,
                         depth_target=depth_target,
-                        depth_mask=depth_mask,
+                        depth_mask=depth_mask if depth_mask is not None else None,
                         rgb_pred=rgb_recon,
                         rgb_target=rgb_target_fp32,
                         focal_features=focal_features,
