@@ -1,3 +1,2 @@
-# Virtual KITTI validation split
-# scene_path,depth_path,num_images
-Scene06/frames/rgb/Camera_0,Scene06/frames/depth/Camera_0/depth00003.png,7
+# Virtual KITTI validation split (RGB + depth pairs)
+Scene06/frames/rgb/Camera_0/rgb00020.png Scene06/frames/depth/Camera_0/depth00020.png

@@ -1,2 +1,2 @@
-# Generic mixed dataset validation list
-scenes/ai_001_003/images/frame.0010,scenes/ai_001_003/depth/frame.0010.depth.exr,9
+# Generic mixed dataset validation list (Marigold-style)
+ai_001_002/rgb_cam_00_fr0050.png ai_001_002/depth_plane_cam_00_fr0050.png

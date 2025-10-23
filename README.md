@@ -54,9 +54,11 @@ All experiments are described with YAML files located in `configs/`:
 You can start from one of the presets and edit the following keys:
 
 - `model.base_model_id` – the Stable Diffusion 3.5 checkpoint to adapt.
-- `data.data_root` and the `*_filelist` entries – absolute paths to your focal
-  stack datasets.  Use `data.dataset_kwargs` to pass camera defaults,
-  `simulator_kwargs`, and per-split overrides such as `generate_focal_stack`.
+- `data.train_sources` / `data.val_sources` – lists of `{data_root, filelist}`
+  mappings.  Provide one entry per dataset (e.g. HyperSim and Virtual KITTI) to
+  train on a concatenated mixture.  Use `data.dataset_kwargs` to pass camera
+  defaults, simulator hyper-parameters, and per-split overrides such as
+  `generate_focal_stack`.
 - `training.batch_size`, `training.gradient_accumulation_steps`,
   `optimizer.learning_rate` – adjusted to your hardware budget.
 

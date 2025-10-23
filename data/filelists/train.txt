@@ -1,4 +1,4 @@
-# Generic mixed dataset training list
+# Generic mixed dataset training list (Marigold-style)
 # Replace with either HyperSim or Virtual KITTI entries depending on experiment
-scenes/ai_001_001/images/frame.0000,scenes/ai_001_001/depth/frame.0000.depth.exr,9
-Scene01/frames/rgb/Camera_0,Scene01/frames/depth/Camera_0/depth00001.png,7
+ai_001_001/rgb_cam_00_fr0033.png ai_001_001/depth_plane_cam_00_fr0033.png
+Scene01/frames/rgb/Camera_0/rgb00010.png Scene01/frames/depth/Camera_0/depth00010.png
