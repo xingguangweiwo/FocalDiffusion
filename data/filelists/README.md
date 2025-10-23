@@ -23,31 +23,6 @@ Lines that begin with `#` are ignored. Paths are resolved relative to the
 `data_root` declared in the training YAML or, when mixing datasets, relative to
 the per-source `data_root` entry.
 
-### JSON lines
-
-For complex situations you can still emit a JSON object per line. The same keys
-listed in earlier revisions (`depth`, `all_in_focus`, `focal_stack_dir`,
-`camera`, …) remain valid. JSON lines override any inference performed by the
-plain-text parser, so you can explicitly request pre-rendered focal stacks or
-specify the HDF5 dataset name when needed.
-
-### HyperSim example
-
-```
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0000.color.jpg \
-  ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0000.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0001.color.jpg \
-  ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0001.depth_meters.hdf5
-```
-
-### Virtual KITTI example
-
-```
-Scene01/clone/frames/rgb/Camera_0/rgb_00042.jpg \
-  Scene01/clone/frames/depth/Camera_0/depth_00042.png
-Scene01/clone/frames/rgb/Camera_0/rgb_00043.jpg \
-  Scene01/clone/frames/depth/Camera_0/depth_00043.png
-```
 
 ### Mixing HyperSim and Virtual KITTI
 
