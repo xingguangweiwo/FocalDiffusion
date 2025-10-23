@@ -1,47 +1,65 @@
 # FocalDiffusion file lists
 
-Each text file enumerates the relative paths that compose a focal stack sample.
-Every non-comment line should follow the comma separated pattern:
+Each text file enumerates the samples that compose a training split. The loader
+now accepts the same whitespace separated format used by **Marigold**:
 
 ```
-<relative_path_to_stack>,<relative_path_to_depth_map>,<num_images_in_stack>
+<relative_rgb_path> <relative_depth_path> [optional_extra_tokens]
 ```
 
-The paths are interpreted relative to the `data_root` entry configured in the
-training YAML files. Lines beginning with `#` are ignored. The `num_images`
-column is optional; when omitted the loader will fall back to the configured
-`focal_stack_size`.
+* The first token points to an RGB image (PNG/JPG). When only an RGB frame and a
+  depth map are provided the dataset will treat the RGB as the all-in-focus
+  reference and synthesise a focal stack on the fly via the built-in circle of
+  confusion simulator. This mirrors the MATLAB pipeline shown in the project
+  discussion.
+* The second token is the metric depth map. PNG/EXR/NPY/HDF5 are supported –
+  HyperSim distributes depth in HDF5 containers by default, while the Marigold
+  preprocessing scripts convert them to PNG for convenience.
+* Additional tokens are optional. You can pass `key=value` pairs (e.g.
+  `generate_focal_stack=false`) or provide an explicit stack directory as a
+  third path. Integers are interpreted as the number of focal slices to load.
 
-You can create separate lists for training, validation and testing. Example
-entries for the supported datasets are provided below together with the
-directory layouts expected by the loader.
+Lines that begin with `#` are ignored. Paths are resolved relative to the
+`data_root` declared in the training YAML or, when mixing datasets, relative to
+the per-source `data_root` entry.
 
-## HyperSim
+### JSON lines
 
-Assuming your pre-processed focal stacks follow the structure
-`<data_root>/scenes/<scene_id>/images/<frame_id>/*.png` and the ground-truth
-depth lives in `<data_root>/scenes/<scene_id>/depth/<frame_id>.depth.exr`, the
-file list would look like:
+For complex situations you can still emit a JSON object per line. The same keys
+listed in earlier revisions (`depth`, `all_in_focus`, `focal_stack_dir`,
+`camera`, …) remain valid. JSON lines override any inference performed by the
+plain-text parser, so you can explicitly request pre-rendered focal stacks or
+specify the HDF5 dataset name when needed.
+
+### HyperSim example
 
 ```
-scenes/ai_001_001/images/frame.0000,scenes/ai_001_001/depth/frame.0000.depth.exr,9
-scenes/ai_001_002/images/frame.0005,scenes/ai_001_002/depth/frame.0005.depth.exr,9
+ai_001_001/rgb_cam_00_fr0033.png ai_001_001/depth_plane_cam_00_fr0033.png
+ai_001_001/rgb_cam_00_fr0034.png ai_001_001/depth_plane_cam_00_fr0034.png
 ```
 
-## Virtual KITTI
-
-Virtual KITTI stacks are usually generated per scene under
-`<data_root>/SceneXX/frames/rgb/Camera_0`. Depth maps share the same frame id in
-`frames/depth/Camera_0`. The corresponding file list lines become:
+### Virtual KITTI example
 
 ```
-Scene01/frames/rgb/Camera_0/rgb00001,Scene01/frames/depth/Camera_0/depth00001.png,7
-Scene02/frames/rgb/Camera_0/rgb00001,Scene02/frames/depth/Camera_0/depth00001.png,7
+Scene01/rgb/00010.png Scene01/depth/00010.png
+Scene02/rgb/00080.png Scene02/depth/00080.png
 ```
 
-## Mixed datasets
+### Mixing HyperSim and Virtual KITTI
 
-When mixing HyperSim and Virtual KITTI (or any other source) you can keep a
-single shared `data_root` and simply point different lines to the desired stack
-directories. The loader only requires that each relative path resolves to a
-directory containing the focal slices and that the matching depth map exists.
+Define separate file lists per dataset and list them in the training config
+under `train_sources` / `val_sources`. The loader will build a concatenated
+dataset so both sources contribute to each epoch:
+
+```yaml
+data:
+  train_sources:
+    - name: hypersim
+      data_root: /datasets/hypersim
+      filelist: data/filelists/hypersim_train.txt
+    - name: virtual_kitti
+      data_root: /datasets/vkitti
+      filelist: data/filelists/vkitti_train.txt
+```
+
+Validation/test splits follow the same structure.

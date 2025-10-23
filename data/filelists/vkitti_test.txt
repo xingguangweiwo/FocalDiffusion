@@ -1,3 +1,2 @@
-# Virtual KITTI testing split
-# scene_path,depth_path,num_images
-Scene20/frames/rgb/Camera_0,Scene20/frames/depth/Camera_0/depth00010.png,7
+# Virtual KITTI testing split (RGB + depth pairs)
+Scene20/frames/rgb/Camera_0/rgb00030.png Scene20/frames/depth/Camera_0/depth00030.png

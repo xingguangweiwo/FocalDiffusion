@@ -1,4 +1,3 @@
-# HyperSim training split
-# scene_path,depth_path,num_images
-scenes/ai_001_001/images/frame.0000,scenes/ai_001_001/depth/frame.0000.depth.exr,9
-scenes/ai_001_002/images/frame.0005,scenes/ai_001_002/depth/frame.0005.depth.exr,9
+# HyperSim training split (RGB + depth pairs)
+ai_001_001/rgb_cam_00_fr0033.png ai_001_001/depth_plane_cam_00_fr0033.png
+ai_001_001/rgb_cam_00_fr0034.png ai_001_001/depth_plane_cam_00_fr0034.png

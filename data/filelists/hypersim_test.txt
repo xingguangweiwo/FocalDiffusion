@@ -1,3 +1,2 @@
-# HyperSim testing split
-# scene_path,depth_path,num_images
-scenes/ai_001_004/images/frame.0015,scenes/ai_001_004/depth/frame.0015.depth.exr,9
+# HyperSim testing split (RGB + depth pairs)
+ai_001_003/rgb_cam_00_fr0070.png ai_001_003/depth_plane_cam_00_fr0070.png

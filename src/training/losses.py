@@ -40,6 +40,7 @@ class FocalDiffusionLoss(nn.Module):
         depth_target: Optional[torch.Tensor] = None,
         rgb_pred: Optional[torch.Tensor] = None,
         rgb_target: Optional[torch.Tensor] = None,
+        depth_mask: Optional[torch.Tensor] = None,
         focal_features: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         losses: Dict[str, torch.Tensor] = {}
@@ -47,7 +48,7 @@ class FocalDiffusionLoss(nn.Module):
         losses["diffusion"] = F.mse_loss(noise_pred, noise_target)
 
         if depth_pred is not None and depth_target is not None and self.depth_weight > 0:
-            losses["depth"] = self.depth_loss(depth_pred, depth_target)
+            losses["depth"] = self.depth_loss(depth_pred, depth_target, mask=depth_mask)
 
         if rgb_pred is not None and rgb_target is not None and self.rgb_weight > 0:
             losses["rgb"] = F.l1_loss(rgb_pred, rgb_target)
@@ -73,7 +74,25 @@ class DepthLoss(nn.Module):
         self.alpha = alpha
         self.min_depth = min_depth
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if mask is not None:
+            if mask.dim() == pred.dim():
+                valid = mask.bool()
+            else:
+                valid = mask.unsqueeze(1).expand_as(pred).bool()
+            if valid.sum() == 0:
+                return torch.zeros((), device=pred.device, dtype=pred.dtype)
+            pred = pred[valid]
+            target = target[valid]
+        else:
+            pred = pred.reshape(-1)
+            target = target.reshape(-1)
+
         pred_safe = pred.clamp(min=self.min_depth)
         target_safe = target.clamp(min=self.min_depth)
 
@@ -110,9 +129,10 @@ class PerceptualLoss(nn.Module):
     def __init__(self, net: str = "vgg") -> None:
         super().__init__()
         spec = importlib.util.find_spec("lpips")
+        self.register_buffer("_zero", torch.tensor(0.0), persistent=False)
+
         if spec is None:
             self._lpips = None
-            self.register_buffer("_zero", torch.tensor(0.0), persistent=False)
             return
 
         lpips_module = importlib.import_module("lpips")
@@ -122,3 +142,12 @@ class PerceptualLoss(nn.Module):
         pred_norm = (pred + 1) / 2
         target_norm = (target + 1) / 2
 
+        if self._lpips is None:
+            return self._zero.to(device=pred.device, dtype=pred.dtype)
+
+        loss = self._lpips(pred_norm, target_norm)
+
+        if isinstance(loss, torch.Tensor):
+            loss = loss.mean()
+
+        return loss
