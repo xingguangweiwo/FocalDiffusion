@@ -408,12 +408,6 @@ class FocalDiffusionTrainer:
                 focus_distances = batch['focus_distances'].to(device=device, dtype=focal_stack.dtype)
                 depth_gt = batch['depth'].to(device)
                 rgb_gt = batch['all_in_focus'].to(device)
-                depth_range_tensor = batch.get('depth_range')
-                if depth_range_tensor is not None:
-                    depth_range_tensor = depth_range_tensor.to(device=device, dtype=depth_gt.dtype)
-                depth_mask = batch.get('valid_mask')
-                if depth_mask is not None:
-                    depth_mask = depth_mask.to(device=device).bool()
 
                 camera_params = batch.get('camera_params')
 
@@ -503,17 +497,6 @@ class FocalDiffusionTrainer:
                     depth_min = depth_gt.amin(dim=(-2, -1), keepdim=True)
                     depth_max = depth_gt.amax(dim=(-2, -1), keepdim=True)
 
-                    if depth_range_tensor is not None:
-                        depth_min = depth_range_tensor[:, 0].view(-1, 1, 1)
-                        depth_max = depth_range_tensor[:, 1].view(-1, 1, 1)
-                    elif (
-                        camera_params is not None
-                        and 'depth_min' in camera_params
-                        and 'depth_max' in camera_params
-                    ):
-                        depth_min = camera_params['depth_min'].to(dtype=depth_gt.dtype).view(-1, 1, 1)
-                        depth_max = camera_params['depth_max'].to(dtype=depth_gt.dtype).view(-1, 1, 1)
-
                     depth_range = (depth_max - depth_min).clamp(min=1e-6)
                     depth_pred = depth_probs * depth_range + depth_min
 
@@ -537,7 +520,7 @@ class FocalDiffusionTrainer:
                         noise_target=noise_target,
                         depth_pred=depth_pred,
                         depth_target=depth_target,
-                        depth_mask=depth_mask if depth_mask is not None else None,
+
                         rgb_pred=rgb_recon,
                         rgb_target=rgb_target_fp32,
                         focal_features=focal_features,
