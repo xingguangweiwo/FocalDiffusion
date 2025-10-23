@@ -26,20 +26,36 @@ huggingface-cli login
 ## Datasets
 
 Training relies on focal stacks paired with ground-truth depth.  The
-`data/filelists/` directory documents the supported text formats:
+`data/filelists/` directory documents the whitespace separated format adopted
+from **Marigold**:
 
-- **CSV** entries describe pre-rendered stacks with
-  `<stack_directory>,<depth_map_path>,<num_images>`.
-- **JSON** entries can point to HyperSim HDF5 files and optionally include an
-  all-in-focus RGB frame.  When `generate_focal_stack` is enabled the loader will
-  synthesise the stack on-the-fly using the built-in circle-of-confusion
-  simulator (mirroring the MATLAB reference shared above).  Camera parameters,
-  focus distances, depth scaling factors, and orientation fixes can be provided
-  per sample.
+```
+<relative_rgb_path> <relative_depth_path> [optional_tokens]
+```
 
-Paths are resolved relative to `data.data_root` in the configuration.  Generate
-file lists for your `train`, `val`, and `test` splits after preparing the
-datasets (e.g. HyperSim, Virtual KITTI) or your own focal-stack generator.
+Providing just the RGB and depth paths lets the loader reuse the same
+all-in-focus RGB that Marigold expects while generating the focal stack
+on-the-fly via the thin-lens simulator (mirroring the MATLAB script shared in
+the discussion).  Additional `key=value` tokens or JSON lines can still
+reference pre-rendered stacks, specify HyperSim HDF5 dataset names, override
+camera parameters, or disable on-the-fly synthesis per sample.
+
+Paths are resolved relative to each source's `data_root` as declared in the
+configuration.  Create separate file lists for your `train`, `val`, and `test`
+splits – you can combine HyperSim and Virtual KITTI by listing both datasets
+under `train_sources` / `val_sources`.
+
+*HyperSim folder layout.*  After extracting the official download each scene
+resides in `<scene_id>/<scene_id>/images/`.  The RGB frames used by Marigold
+live under `scene_cam_00_final_preview/frame.XXXX.color.jpg` while metric depth
+maps stay inside `scene_cam_00_geometry_hdf5/frame.XXXX.depth_meters.hdf5`.
+Referencing those relative paths in the file lists lets you operate directly on
+the unmodified release without converting depth to PNG first.
+
+*Virtual KITTI 2 layout.*  Place `data_root` at the top-level directory that
+contains `SceneXX/clone/frames/`.  RGB frames live under
+`frames/rgb/Camera_0/rgb_XXXXX.jpg` and depth targets under
+`frames/depth/Camera_0/depth_XXXXX.png`.
 
 ## Configuration
 

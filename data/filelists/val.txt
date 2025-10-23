@@ -1,2 +1,11 @@
-# Generic mixed dataset validation list (Marigold-style)
-ai_001_002/rgb_cam_00_fr0050.png ai_001_002/depth_plane_cam_00_fr0050.png
+# Example mixed validation list
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0100.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0100.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0101.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0101.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0102.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0102.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0103.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0103.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0104.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0104.depth_meters.hdf5
+Scene01/clone/frames/rgb/Camera_0/rgb_00101.jpg Scene01/clone/frames/depth/Camera_0/depth_00101.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00102.jpg Scene01/clone/frames/depth/Camera_0/depth_00102.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00103.jpg Scene01/clone/frames/depth/Camera_0/depth_00103.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00104.jpg Scene01/clone/frames/depth/Camera_0/depth_00104.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00105.jpg Scene01/clone/frames/depth/Camera_0/depth_00105.png
