@@ -1,3 +1,11 @@
 # HyperSim validation split
-# scene_path,depth_path,num_images
-scenes/ai_001_003/images/frame.0010,scenes/ai_001_003/depth/frame.0010.depth.exr,9
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0100.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0100.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0101.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0101.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0102.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0102.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0103.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0103.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0104.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0104.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0105.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0105.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0106.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0106.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0107.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0107.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0108.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0108.depth_meters.hdf5
+ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0109.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0109.depth_meters.hdf5
