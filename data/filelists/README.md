@@ -10,8 +10,7 @@ now accepts the same whitespace separated format used by **Marigold**:
 * The first token points to an RGB image (PNG/JPG). When only an RGB frame and a
   depth map are provided the dataset will treat the RGB as the all-in-focus
   reference and synthesise a focal stack on the fly via the built-in circle of
-  confusion simulator. This mirrors the MATLAB pipeline shown in the project
-  discussion.
+  confusion simulator.
 * The second token is the metric depth map. PNG/EXR/NPY/HDF5 are supported –
   HyperSim distributes depth in HDF5 containers by default, while the Marigold
   preprocessing scripts convert them to PNG for convenience.
