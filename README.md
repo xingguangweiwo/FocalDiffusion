@@ -24,8 +24,6 @@ weights on demand:
 huggingface-cli login
 ```
 
-Optional accelerators (FlashAttention/xFormers) can be installed separately.
-
 ## Data
 
 Providing only RGB and depth paths triggers on-the-fly focal-stack synthesis via
