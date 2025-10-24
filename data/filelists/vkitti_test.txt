@@ -1,3 +1,11 @@
-# Virtual KITTI testing split
-# scene_path,depth_path,num_images
-Scene20/frames/rgb/Camera_0,Scene20/frames/depth/Camera_0/depth00010.png,7
+# Virtual KITTI 2 test split
+Scene01/clone/frames/rgb/Camera_0/rgb_00111.jpg Scene01/clone/frames/depth/Camera_0/depth_00111.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00112.jpg Scene01/clone/frames/depth/Camera_0/depth_00112.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00113.jpg Scene01/clone/frames/depth/Camera_0/depth_00113.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00114.jpg Scene01/clone/frames/depth/Camera_0/depth_00114.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00115.jpg Scene01/clone/frames/depth/Camera_0/depth_00115.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00116.jpg Scene01/clone/frames/depth/Camera_0/depth_00116.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00117.jpg Scene01/clone/frames/depth/Camera_0/depth_00117.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00118.jpg Scene01/clone/frames/depth/Camera_0/depth_00118.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00119.jpg Scene01/clone/frames/depth/Camera_0/depth_00119.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00120.jpg Scene01/clone/frames/depth/Camera_0/depth_00120.png

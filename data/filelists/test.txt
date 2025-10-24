@@ -1,2 +1,11 @@
-# Generic mixed dataset testing list
-Scene20/frames/rgb/Camera_0,Scene20/frames/depth/Camera_0/depth00010.png,7
+# Example mixed test list
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0010.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0010.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0011.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0011.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0012.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0012.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0013.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0013.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0014.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0014.depth_meters.hdf5
+Scene01/clone/frames/rgb/Camera_0/rgb_00106.jpg Scene01/clone/frames/depth/Camera_0/depth_00106.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00107.jpg Scene01/clone/frames/depth/Camera_0/depth_00107.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00108.jpg Scene01/clone/frames/depth/Camera_0/depth_00108.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00109.jpg Scene01/clone/frames/depth/Camera_0/depth_00109.png
+Scene01/clone/frames/rgb/Camera_0/rgb_00110.jpg Scene01/clone/frames/depth/Camera_0/depth_00110.png
