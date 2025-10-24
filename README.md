@@ -45,12 +45,29 @@ configuration.  Create separate file lists for your `train`, `val`, and `test`
 splits – you can combine HyperSim and Virtual KITTI by listing both datasets
 under `train_sources` / `val_sources`.
 
-*HyperSim folder layout.*  After extracting the official download each scene
-resides in `<scene_id>/<scene_id>/images/`.  The RGB frames used by Marigold
-live under `scene_cam_00_final_preview/frame.XXXX.color.jpg` while metric depth
-maps stay inside `scene_cam_00_geometry_hdf5/frame.XXXX.depth_meters.hdf5`.
+Download the raw datasets before launching training:
+
+- **HyperSim** – request access and download from the official project page
+  (<https://github.com/apple/ml-hypersim>).  Each archive expands to
+  `<scene_id>/<scene_id>/images/` with RGB frames located in
+  `scene_cam_00_final_preview/frame.XXXX.color.jpg` and depth delivered as
+  `scene_cam_00_geometry_hdf5/frame.XXXX.depth_meters.hdf5`.  Scene
+  `ai_001_001` ships frames `frame.0000`–`frame.0099`; the sample file lists only
+  reference indices within that range so they work out of the box after you set
+  `data_root` to the folder that contains `ai_001_001/`.
+- **Virtual KITTI 2** – download the RGB+depth release from the official web
+  page (<https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/>).
+  After extraction you should see `SceneXX/clone/frames/`.  RGB frames live
+  under `frames/rgb/Camera_0/rgb_XXXXX.jpg` while depth targets use
+  `frames/depth/Camera_0/depth_XXXXX.png`.  The provided lists reference
+  `rgb_00001`–`rgb_00110`, all of which are present in the standard download.
+
 Referencing those relative paths in the file lists lets you operate directly on
-the unmodified release without converting depth to PNG first.
+the unmodified releases without converting depth to PNG first.  Point the
+configuration's `data_root` entries (e.g. `configs/base.yaml:data.train_sources`
+→ `data_root`) at the folder that contains the extracted scene directories, such
+as `D:\Files\paper\DepthEstimation\Dataset\hypersim` or
+`/mnt/datasets/virtual_kitti`.
 
 *Virtual KITTI 2 layout.*  Place `data_root` at the top-level directory that
 contains `SceneXX/clone/frames/`.  RGB frames live under

@@ -1,11 +1,11 @@
-# HyperSim test split
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0110.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0110.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0111.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0111.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0112.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0112.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0113.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0113.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0114.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0114.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0115.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0115.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0116.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0116.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0117.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0117.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0118.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0118.depth_meters.hdf5
-ai_001_001/ai_001_001/images/scene_cam_00_final_preview/frame.0119.color.jpg ai_001_001/ai_001_001/images/scene_cam_00_geometry_hdf5/frame.0119.depth_meters.hdf5
+# HyperSim test split (ai_001_002 frames 0010-0019)
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0010.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0010.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0011.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0011.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0012.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0012.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0013.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0013.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0014.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0014.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0015.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0015.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0016.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0016.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0017.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0017.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0018.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0018.depth_meters.hdf5
+ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0019.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0019.depth_meters.hdf5
