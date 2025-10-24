@@ -1,10 +1,10 @@
-"""
-Evaluation metrics for depth estimation
-"""
+"""Evaluation metrics for depth and normal estimation utilities."""
 
-import torch
+from typing import Dict, Optional
+
 import numpy as np
-from typing import Dict, Tuple
+import torch
+import torch.nn.functional as F
 
 def compute_metrics(
     depth_pred: torch.Tensor,
