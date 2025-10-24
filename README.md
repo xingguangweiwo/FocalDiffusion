@@ -106,7 +106,7 @@ argument list.
 ## Repository layout
 
 - `configs/` — experiment presets.
-- `data/filelists/` — Marigold-style sample lists for HyperSim, Virtual KITTI,
+- `data/filelists/` — sample lists for HyperSim, Virtual KITTI,
   and mixed splits.
 - `script/` — CLI entry points for training, evaluation, and utilities.
 - `src/` — dataset, simulator, pipeline, and trainer implementations.
