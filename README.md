@@ -28,13 +28,6 @@ Optional accelerators (FlashAttention/xFormers) can be installed separately.
 
 ## Data
 
-Samples are declared on single lines inside `data/filelists/*.txt`, following the
-Marigold convention:
-
-```
-<relative_rgb_path> <relative_depth_path> [key=value ...]
-```
-
 Providing only RGB and depth paths triggers on-the-fly focal-stack synthesis via
 the built-in thin-lens simulator. Optional tokens such as
 `generate_focal_stack=false`, `focal_stack_dir=...`, or per-sample camera
