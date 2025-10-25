@@ -8,16 +8,42 @@ model:
 
 data:
   dataset_type: filelist
-  data_root: /path/to/focal_stacks
-  train_filelist: data/filelists/train.txt
-  val_filelist: data/filelists/val.txt
-  test_filelist: data/filelists/test.txt
+  train_sources:
+    - name: hypersim
+      data_root: /path/to/hypersim
+      filelist: data/filelists/hypersim_train.txt
+    - name: virtual_kitti
+      data_root: /path/to/virtual_kitti
+      filelist: data/filelists/vkitti_train.txt
+  val_sources:
+    - name: hypersim
+      data_root: /path/to/hypersim
+      filelist: data/filelists/hypersim_val.txt
+    - name: virtual_kitti
+      data_root: /path/to/virtual_kitti
+      filelist: data/filelists/vkitti_val.txt
+  test_sources:
+    - name: hypersim
+      data_root: /path/to/hypersim
+      filelist: data/filelists/hypersim_test.txt
+    - name: virtual_kitti
+      data_root: /path/to/virtual_kitti
+      filelist: data/filelists/vkitti_test.txt
   image_size: [512, 512]
   focal_stack_size: 5
   focal_range: [0.3, 10.0]
   num_workers: 8
   max_train_samples: null
   max_val_samples: null
+  dataset_kwargs:
+    camera_defaults:
+      f_number: 8.0
+      focal_length: 0.05
+      pixel_size: 1.2e-5
+    simulator_kwargs:
+      sigma_quantisation: 0.25
+      max_sigma: 8.0
+    depth_bounds: [0.1, 100.0]
 
 training:
   num_epochs: 30

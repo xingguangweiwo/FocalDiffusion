@@ -10,7 +10,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, StableDiffusion3Pipeline
-from diffusers.models.transformers import SD3Transformer2DModel, Transformer2DModelOutput
+
+try:
+    from diffusers.models.transformers import SD3Transformer2DModel
+except ImportError as err:  # pragma: no cover - import-time environment check
+    raise ImportError(
+        "FocalDiffusion requires diffusers>=0.28.0 so the Stable Diffusion 3 transformer is available. "
+        "Upgrade via `pip install --upgrade diffusers`."
+    ) from err
+
+try:  # diffusers>=0.35 moved Transformer2DModelOutput to modeling_outputs
+    from diffusers.models.transformers import Transformer2DModelOutput  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - compatibility shim for newer wheels
+    try:
+        from diffusers.models.modeling_outputs import Transformer2DModelOutput
+    except ImportError as err:
+        raise ImportError(
+            "FocalDiffusion requires diffusers to expose Transformer2DModelOutput. "
+            "Upgrade via `pip install --upgrade diffusers`."
+        ) from err
 from diffusers.utils import BaseOutput
 from transformers import (
     CLIPTextModelWithProjection,
@@ -280,9 +298,16 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
         depth_logits, rgb_latents = self.dual_decoder(latents)
-        depth_map = torch.sigmoid(depth_logits)
-        depth_map = F.interpolate(depth_map, size=(height, width), mode="bilinear", align_corners=False)
-        depth_map = depth_map.squeeze(1)
+        depth_probs = torch.sigmoid(depth_logits)
+        depth_probs = F.interpolate(
+            depth_probs, size=(height, width), mode="bilinear", align_corners=False
+        )
+        depth_map = depth_probs.squeeze(1)
+
+        if camera_params is not None and "depth_min" in camera_params and "depth_max" in camera_params:
+            depth_min = camera_params["depth_min"].to(depth_map.dtype).view(-1, 1, 1)
+            depth_max = camera_params["depth_max"].to(depth_map.dtype).view(-1, 1, 1)
+            depth_map = depth_min + depth_map * (depth_max - depth_min)
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
