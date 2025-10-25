@@ -24,7 +24,7 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 import wandb
 
-from typing import Dict, Optional, Any
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 

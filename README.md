@@ -1,23 +1,24 @@
 # FocalDiffusion
 
-FocalDiffusion adapts a pre-trained Stable Diffusion 3.5 backbone to focal-stack
-inputs in order to predict all-in-focus RGB images together with metric depth
-maps.  The repository provides the training and inference code used in the
-paper *FocalDiffusion: Affordable Zero-shot Diffusion-Based Image and Depth
-Generators from Focal Stack*.
+FocalDiffusion fine-tunes Stable Diffusion 3.5 to recover all-in-focus RGB and
+metric depth from focal stacks. The repository hosts the training, evaluation,
+and inference code released with *FocalDiffusion: Affordable Zero-shot
+Diffusion-Based Image and Depth Generators from Focal Stack*.
 
-## Prerequisites
+## Environment
 
-The project targets Python 3.10+ with CUDA-enabled PyTorch.  Install the core
-dependencies with:
+- Python 3.10+
+- CUDA-enabled PyTorch 2.2+
+
+Install the core dependencies:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install diffusers==0.31.0 transformers accelerate safetensors lpips einops
 ```
 
-Authenticate with Hugging Face before training so the Stable Diffusion 3.5
-weights can be downloaded:
+Authenticate with Hugging Face so diffusers can download Stable Diffusion 3.5
+weights on demand:
 
 ```bash
 huggingface-cli login
@@ -68,35 +69,35 @@ python -m script.train --config configs/hypersim.yaml --dry-run
 
 ## Training
 
-Launch full training once the datasets and configuration are in place:
+Launch optimisation once datasets and configs are in place:
 
 ```bash
 python -m script.train --config configs/hypersim.yaml
 ```
 
-Checkpoints and logs are written under `output.save_dir`.  Set
-`logging.use_wandb` to `true` to stream metrics to Weights & Biases via
-`accelerate`.
+Checkpoints and logs are written to `output.save_dir`. Enable Weights & Biases
+logging by setting `logging.use_wandb: true`.
 
 ## Inference
 
-After training, export predictions for a focal stack directory with:
+Export predictions for a focal stack directory:
 
 ```bash
-python -m script.inference --input /path/to/focal_stack_dir \
+python -m script.inference \
+    --input /path/to/focal_stack \
     --output outputs/inference/example \
     --config configs/hypersim.yaml \
     --model-path /path/to/checkpoint
 ```
 
-The script saves the all-in-focus reconstruction, depth map, and optional
-visualisations.  Refer to `python -m script.inference --help` for the complete
-set of arguments.
+The script produces the recovered all-in-focus RGB, the metric depth map, and
+optional visualisations. Run `python -m script.inference --help` for the complete
+argument list.
 
-## Project structure
+## Repository layout
 
-- `configs/`: training and dataset presets.
-- `data/filelists/`: file list templates for common benchmarks.
-- `script/`: entry points for training, evaluation, and utilities.
-- `src/`: library code implementing the pipeline, models, and trainer.
-
+- `configs/` — experiment presets.
+- `data/filelists/` — sample lists for HyperSim, Virtual KITTI,
+  and mixed splits.
+- `script/` — CLI entry points for training, evaluation, and utilities.
+- `src/` — dataset, simulator, pipeline, and trainer implementations.

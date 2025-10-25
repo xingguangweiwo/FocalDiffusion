@@ -21,6 +21,17 @@ from .focal_simulator import FocalStackSimulator
 logger = logging.getLogger(__name__)
 
 
+IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".gif",
+}
+
+
 class FocalStackDataset(Dataset):
     """Dataset that yields focal stacks, depth maps and auxiliary metadata."""
 
