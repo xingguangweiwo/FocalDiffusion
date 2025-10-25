@@ -24,7 +24,9 @@ weights on demand:
 huggingface-cli login
 ```
 
-## Datasets
+Optional accelerators (FlashAttention/xFormers) can be installed separately.
+
+## Data
 
 Training relies on focal stacks paired with ground-truth depth.  The
 `data/filelists/` directory documents the supported text formats:
@@ -44,15 +46,17 @@ datasets (e.g. HyperSim, Virtual KITTI) or your own focal-stack generator.
 
 ## Configuration
 
-All experiments are described with YAML files located in `configs/`:
+YAML presets in `configs/` describe each experiment. `configs/base.yaml` provides
+common optimisation, logging, and dataloader defaults, while
+`configs/hypersim.yaml`, `configs/virtual_kitti.yaml`, and `configs/mixed.yaml`
+override only the dataset section.
 
-- `configs/base.yaml` collects the default optimisation, model, and logging
-  settings.
-- `configs/hypersim.yaml`, `configs/virtual_kitti.yaml`, and
-  `configs/mixed.yaml` inherit from the base recipe and only override the dataset
-  section.
+> **Important:** Edit the configuration you actually launch (or pass overrides on
+> the CLI). Tweaking `configs/base.yaml` alone will not change
+> `configs/hypersim.yaml` because that file sets its own `data_root`
+> placeholder.
 
-You can start from one of the presets and edit the following keys:
+Important knobs:
 
 - `model.base_model_id` – the Stable Diffusion 3.5 checkpoint to adapt.
 - `data.data_root` and the `*_filelist` entries – absolute paths to your focal
@@ -61,7 +65,7 @@ You can start from one of the presets and edit the following keys:
 - `training.batch_size`, `training.gradient_accumulation_steps`,
   `optimizer.learning_rate` – adjusted to your hardware budget.
 
-Validate any configuration without starting optimisation via:
+Validate a configuration without starting optimisation:
 
 ```bash
 python -m script.train --config configs/hypersim.yaml --dry-run
