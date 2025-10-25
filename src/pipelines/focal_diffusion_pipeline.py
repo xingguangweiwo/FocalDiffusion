@@ -10,7 +10,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, StableDiffusion3Pipeline
-from diffusers.models.transformers import SD3Transformer2DModel, Transformer2DModelOutput
+
+try:
+    from diffusers.models.transformers import SD3Transformer2DModel
+except ImportError as err:  # pragma: no cover - import-time environment check
+    raise ImportError(
+        "FocalDiffusion requires diffusers>=0.28.0 so the Stable Diffusion 3 transformer is available. "
+        "Upgrade via `pip install --upgrade diffusers`."
+    ) from err
+
+try:  # diffusers>=0.35 moved Transformer2DModelOutput to modeling_outputs
+    from diffusers.models.transformers import Transformer2DModelOutput  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - compatibility shim for newer wheels
+    try:
+        from diffusers.models.modeling_outputs import Transformer2DModelOutput
+    except ImportError as err:
+        raise ImportError(
+            "FocalDiffusion requires diffusers to expose Transformer2DModelOutput. "
+            "Upgrade via `pip install --upgrade diffusers`."
+        ) from err
 from diffusers.utils import BaseOutput
 from transformers import (
     CLIPTextModelWithProjection,

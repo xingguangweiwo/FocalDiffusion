@@ -50,8 +50,6 @@ extracted scenes (e.g. `D:\Datasets\hypersim`, `/mnt/vkitti`). When mixing
 sources, list one entry per dataset under `data.train_sources` and
 `data.val_sources`.
 
-## Configuration
-
 YAML presets in `configs/` describe each experiment. `configs/base.yaml` provides
 common optimisation, logging, and dataloader defaults, while
 `configs/hypersim.yaml`, `configs/virtual_kitti.yaml`, and `configs/mixed.yaml`
