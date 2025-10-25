@@ -54,66 +54,26 @@ class FocalDiffusionTrainer:
         dataset_cfg = self.config['data']
         dataset_kwargs_cfg = dataset_cfg.get('dataset_kwargs') or {}
         base_dataset_kwargs = {
-            key: value
-            for key, value in dataset_kwargs_cfg.items()
-            if key not in ('train', 'val', 'test')
+            key: value for key, value in dataset_kwargs_cfg.items()
+            if key not in ('train', 'val')
         }
-
-        train_dataset_kwargs = {**base_dataset_kwargs, **dataset_kwargs_cfg.get('train', {})}
-        val_dataset_kwargs = {**base_dataset_kwargs, **dataset_kwargs_cfg.get('val', {})}
-
-        def _prepare_sources(split: str) -> List[Dict[str, Any]]:
-            sources_key = f'{split}_sources'
-            filelist_key = f'{split}_filelist'
-            max_samples_key = f'max_{split}_samples'
-
-            sources_cfg = dataset_cfg.get(sources_key)
-            max_samples_override = dataset_cfg.get(max_samples_key)
-
-            prepared: List[Dict[str, Any]] = []
-
-            if sources_cfg:
-                for source in sources_cfg:
-                    source_dict = dict(source)
-                    if max_samples_override is not None and 'max_samples' not in source_dict:
-                        source_dict['max_samples'] = max_samples_override
-                    prepared.append(source_dict)
-                return prepared
-
-            filelist_value = dataset_cfg.get(filelist_key)
-            if filelist_value:
-                single_source: Dict[str, Any] = {
-                    'data_root': dataset_cfg.get('data_root', './data'),
-                    'filelist': filelist_value,
-                }
-                if max_samples_override is not None:
-                    single_source['max_samples'] = max_samples_override
-                prepared.append(single_source)
-
-            return prepared
+        if any(key in dataset_kwargs_cfg for key in ('train', 'val')):
+            train_dataset_kwargs = {**base_dataset_kwargs, **dataset_kwargs_cfg.get('train', {})}
+            val_dataset_kwargs = {**base_dataset_kwargs, **dataset_kwargs_cfg.get('val', {})}
+        else:
+            train_dataset_kwargs = dict(base_dataset_kwargs)
+            val_dataset_kwargs = dict(base_dataset_kwargs)
 
         dataset_type = dataset_cfg.get('dataset_type')
 
-        train_sources = _prepare_sources('train')
-        if not train_sources:
-            raise ValueError('No training data sources configured.')
-
-        val_sources = _prepare_sources('val')
-        if not val_sources:
-            raise ValueError('No validation data sources configured.')
-
         # Training dataloader
-        for source in train_sources:
-            logger.info(
-                "Loading training data from: %s (root=%s)",
-                source.get('filelist', 'N/A'),
-                source.get('data_root', dataset_cfg.get('data_root', './data')),
-            )
+        train_filelist = dataset_cfg['train_filelist']
+        logger.info(f"Loading training data from: {train_filelist}")
 
         self.train_dataloader = create_dataloader(
             dataset_type=dataset_type,
-            filelist_path=None,
-            data_root=dataset_cfg.get('data_root', './data'),
+            filelist_path=train_filelist,
+            data_root=dataset_cfg['data_root'],
             batch_size=self.config['training']['batch_size'],
             num_workers=dataset_cfg['num_workers'],
             image_size=tuple(dataset_cfg['image_size']),
@@ -122,22 +82,17 @@ class FocalDiffusionTrainer:
             augmentation=True,
             shuffle=True,
             max_samples=dataset_cfg.get('max_train_samples'),
-            sources=train_sources,
             **train_dataset_kwargs,
         )
 
         # Validation dataloader
-        for source in val_sources:
-            logger.info(
-                "Loading validation data from: %s (root=%s)",
-                source.get('filelist', 'N/A'),
-                source.get('data_root', dataset_cfg.get('data_root', './data')),
-            )
+        val_filelist = dataset_cfg['val_filelist']
+        logger.info(f"Loading validation data from: {val_filelist}")
 
         self.val_dataloader = create_dataloader(
             dataset_type=dataset_type,
-            filelist_path=None,
-            data_root=dataset_cfg.get('data_root', './data'),
+            filelist_path=val_filelist,
+            data_root=dataset_cfg['data_root'],
             batch_size=self.config['training']['batch_size'],
             num_workers=dataset_cfg['num_workers'],
             image_size=tuple(dataset_cfg['image_size']),
@@ -146,7 +101,6 @@ class FocalDiffusionTrainer:
             augmentation=False,
             shuffle=False,
             max_samples=dataset_cfg.get('max_val_samples'),
-            sources=val_sources,
             **val_dataset_kwargs,
         )
 
@@ -459,17 +413,24 @@ class FocalDiffusionTrainer:
                     depth_range_tensor = depth_range_tensor.to(device=device, dtype=depth_gt.dtype)
                 depth_mask = batch.get('valid_mask')
                 if depth_mask is not None:
-                    depth_mask = depth_mask.to(device=device).bool()
+                    depth_mask = depth_mask.to(device=device)
 
                 camera_params = batch.get('camera_params')
 
                 if camera_params is not None:
-                    camera_params = {
-                        key: value.to(device=device, dtype=focal_stack.dtype)
-                        if isinstance(value, torch.Tensor)
-                        else value
-                        for key, value in camera_params.items()
-                    }
+                    batch_size = focal_stack.shape[0]
+                    converted_params = {}
+                    for key, value in camera_params.items():
+                        if isinstance(value, torch.Tensor):
+                            converted_params[key] = value.to(device=device, dtype=focal_stack.dtype)
+                        else:
+                            converted_params[key] = torch.full(
+                                (batch_size,),
+                                float(value),
+                                device=device,
+                                dtype=focal_stack.dtype,
+                            )
+                    camera_params = converted_params
 
                 # Normalize inputs to match pipeline preprocessing
                 focal_stack = (focal_stack * 2.0) - 1.0
@@ -546,19 +507,15 @@ class FocalDiffusionTrainer:
                         align_corners=False
                     )
 
-                    depth_min = depth_gt.amin(dim=(-2, -1), keepdim=True)
-                    depth_max = depth_gt.amax(dim=(-2, -1), keepdim=True)
-
                     if depth_range_tensor is not None:
                         depth_min = depth_range_tensor[:, 0].view(-1, 1, 1)
                         depth_max = depth_range_tensor[:, 1].view(-1, 1, 1)
-                    elif (
-                        camera_params is not None
-                        and 'depth_min' in camera_params
-                        and 'depth_max' in camera_params
-                    ):
+                    elif camera_params is not None and 'depth_min' in camera_params and 'depth_max' in camera_params:
                         depth_min = camera_params['depth_min'].to(dtype=depth_gt.dtype).view(-1, 1, 1)
                         depth_max = camera_params['depth_max'].to(dtype=depth_gt.dtype).view(-1, 1, 1)
+                    else:
+                        depth_min = depth_gt.amin(dim=(-2, -1), keepdim=True)
+                        depth_max = depth_gt.amax(dim=(-2, -1), keepdim=True)
 
                     depth_range = (depth_max - depth_min).clamp(min=1e-6)
                     depth_pred = depth_probs * depth_range + depth_min
@@ -583,7 +540,7 @@ class FocalDiffusionTrainer:
                         noise_target=noise_target,
                         depth_pred=depth_pred,
                         depth_target=depth_target,
-                        depth_mask=depth_mask if depth_mask is not None else None,
+                        depth_mask=depth_mask,
                         rgb_pred=rgb_recon,
                         rgb_target=rgb_target_fp32,
                         focal_features=focal_features,

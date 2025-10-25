@@ -1,7 +1,6 @@
 # FocalDiffusion file lists
 
-Each text file enumerates the samples that compose a training split. The loader
-now accepts the same whitespace separated format used by **Marigold**:
+Each text file enumerates the samples that compose a training split. 
 
 ```
 <relative_rgb_path> <relative_depth_path> [optional_extra_tokens]

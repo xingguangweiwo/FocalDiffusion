@@ -9,12 +9,12 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset
 
 from .focal_simulator import FocalStackSimulator
 
@@ -112,63 +112,17 @@ class FocalStackDataset(Dataset):
         return samples
 
     def _parse_legacy_entry(self, line: str) -> Dict:
-        tokens = [part.strip() for part in line.replace(",", " ").split() if part.strip()]
-        if len(tokens) < 2:
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
             raise ValueError(f"Invalid filelist entry: {line}")
 
-        sample: Dict = {}
-
-        first_token, second_token = tokens[0], tokens[1]
-        first_ext = Path(first_token).suffix.lower()
-
-        if first_ext in IMAGE_EXTENSIONS:
-            sample["all_in_focus"] = first_token
-        else:
-            sample["focal_stack_dir"] = first_token
-
-        sample["depth_path"] = second_token
-
-        for extra in tokens[2:]:
-            if "=" in extra:
-                key, value = extra.split("=", 1)
-                sample[key.strip()] = self._coerce_value(value.strip())
-                continue
-
-            ext = Path(extra).suffix.lower()
-            if ext in IMAGE_EXTENSIONS and "all_in_focus" not in sample:
-                sample["all_in_focus"] = extra
-                continue
-
-            try:
-                numeric = float(extra)
-            except ValueError:
-                continue
-
-            if numeric.is_integer():
-                sample["num_images"] = int(numeric)
-            else:
-                sample["num_images"] = int(round(numeric))
-
-        if "all_in_focus" in sample and "focal_stack_dir" not in sample:
-            sample.setdefault("generate_focal_stack", True)
-
+        sample = {
+            "focal_stack_dir": parts[0],
+            "depth_path": parts[1],
+        }
+        if len(parts) > 2 and parts[2]:
+            sample["num_images"] = int(parts[2])
         return sample
-
-    @staticmethod
-    def _coerce_value(raw: str):
-        lowered = raw.lower()
-        if lowered in {"true", "false"}:
-            return lowered == "true"
-
-        try:
-            integer = int(raw)
-        except ValueError:
-            try:
-                return float(raw)
-            except ValueError:
-                return raw
-        else:
-            return integer
 
     def _normalise_sample(self, entry: Dict) -> Dict:
         sample: Dict = {}
@@ -588,12 +542,11 @@ def create_dataloader(
     augmentation: bool = False,
     shuffle: bool = True,
     max_samples: Optional[int] = None,
-    sources: Optional[List[Dict[str, Any]]] = None,
     **dataset_kwargs,
 ) -> DataLoader:
     """Create dataloader for training or evaluation."""
 
-    if filelist_path or sources:
+    if filelist_path:
         dataset_class = FocalStackDataset
     elif dataset_type == "hypersim":
         dataset_class = HyperSimDataset
@@ -608,46 +561,16 @@ def create_dataloader(
 
         transform = FocalAugmentation()
 
-    def _build_dataset(source_kwargs: Dict[str, Any]) -> Dataset:
-        merged_kwargs = dict(dataset_kwargs)
-        merged_kwargs.update(source_kwargs.get("dataset_kwargs", {}))
-
-        root_override = source_kwargs.get("data_root", data_root)
-        filelist_override = source_kwargs.get("filelist", filelist_path)
-
-        if issubclass(dataset_class, FocalStackDataset) and filelist_override is None:
-            raise ValueError("filelist must be provided when using filelist datasets")
-
-        return dataset_class(
-            data_root=root_override,
-            filelist_path=filelist_override,
-            image_size=image_size,
-            focal_stack_size=focal_stack_size,
-            focal_range=focal_range,
-            transform=transform,
-            max_samples=source_kwargs.get("max_samples", max_samples),
-            **merged_kwargs,
-        )
-
-    datasets: List[Dataset]
-
-    if sources:
-        datasets = [_build_dataset(source) for source in sources]
-    else:
-        datasets = [
-            _build_dataset({
-                "data_root": data_root,
-                "filelist": filelist_path,
-                "max_samples": max_samples,
-                "dataset_kwargs": {},
-            })
-        ]
-
-    dataset: Dataset
-    if len(datasets) == 1:
-        dataset = datasets[0]
-    else:
-        dataset = ConcatDataset(datasets)
+    dataset = dataset_class(
+        data_root=data_root,
+        filelist_path=filelist_path,
+        image_size=image_size,
+        focal_stack_size=focal_stack_size,
+        focal_range=focal_range,
+        transform=transform,
+        max_samples=max_samples,
+        **dataset_kwargs,
+    )
 
     return DataLoader(
         dataset,

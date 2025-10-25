@@ -44,6 +44,7 @@ data:
       sigma_quantisation: 0.25
       max_sigma: 8.0
     depth_bounds: [0.1, 100.0]
+    generate_focal_stack: false
 
 training:
   num_epochs: 30
