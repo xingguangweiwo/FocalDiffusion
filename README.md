@@ -24,16 +24,7 @@ weights on demand:
 huggingface-cli login
 ```
 
-Optional accelerators (FlashAttention/xFormers) can be installed separately.
-
 ## Data
-
-Samples are declared on single lines inside `data/filelists/*.txt`, following the
-Marigold convention:
-
-```
-<relative_rgb_path> <relative_depth_path> [key=value ...]
-```
 
 Providing only RGB and depth paths triggers on-the-fly focal-stack synthesis via
 the built-in thin-lens simulator. Optional tokens such as
@@ -58,8 +49,6 @@ Point each configuration's `data_root` to the directory that contains the
 extracted scenes (e.g. `D:\Datasets\hypersim`, `/mnt/vkitti`). When mixing
 sources, list one entry per dataset under `data.train_sources` and
 `data.val_sources`.
-
-## Configuration
 
 YAML presets in `configs/` describe each experiment. `configs/base.yaml` provides
 common optimisation, logging, and dataloader defaults, while
@@ -110,23 +99,10 @@ The script produces the recovered all-in-focus RGB, the metric depth map, and
 optional visualisations. Run `python -m script.inference --help` for the complete
 argument list.
 
-## Troubleshooting
-
-- **`Training data root does not exist`** – update each config's `data_root`
-  fields to the absolute paths where HyperSim and Virtual KITTI are unpacked
-  (e.g. `D:\Files\paper\DepthEstimation\Dataset\hypersim`).
-- **`ImportError: ... Transformer2DModelOutput`** – ensure
-  `diffusers` is upgraded to v0.28.0 or newer. Older wheels do not expose the
-  SD3.5 transformer output class required by the pipeline.
-- **`WARNING[XFORMERS]: Need to compile C++ extensions`** – xFormers and
-  Triton are optional. Install prebuilt wheels that match your CUDA toolchain if
-  you want the memory-efficient attention kernels; otherwise, the pipeline
-  falls back to the PyTorch implementations.
-
 ## Repository layout
 
 - `configs/` — experiment presets.
-- `data/filelists/` — Marigold-style sample lists for HyperSim, Virtual KITTI,
+- `data/filelists/` — sample lists for HyperSim, Virtual KITTI,
   and mixed splits.
 - `script/` — CLI entry points for training, evaluation, and utilities.
 - `src/` — dataset, simulator, pipeline, and trainer implementations.
