@@ -10,13 +10,6 @@ Diffusion-Based Image and Depth Generators from Focal Stack*.
 - Python 3.10+
 - CUDA-enabled PyTorch 2.2+
 
-Install the core dependencies:
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install diffusers==0.31.0 transformers accelerate safetensors lpips einops
-```
-
 Authenticate with Hugging Face so diffusers can download Stable Diffusion 3.5
 weights on demand:
 
