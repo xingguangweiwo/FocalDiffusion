@@ -10,7 +10,7 @@ import json
 
 def load_pipeline(
         checkpoint_path: Union[str, Path],
-        base_model_id: str = "stabilityai/stable-diffusion-3.5-large",
+        base_model_id: str = "stabilityai/stable-diffusion-3.5-large-tensorrt",
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
 ) -> 'FocalDiffusionPipeline':
