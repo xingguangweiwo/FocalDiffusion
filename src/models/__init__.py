@@ -1,19 +1,13 @@
-"""FocalDiffusion models"""
+"""FocalDiffusion model components exposed for training and inference."""
 
-from .focal_processor import FocalStackProcessor
+from .attention_modules import FocalCrossAttention
 from .camera_invariant import CameraInvariantEncoder
 from .dual_decoder import DualOutputDecoder
-from .attention_modules import (
-    FocalCrossAttention,
-    FocalAwareRotaryEmbedding,
-    CrossModalityAttention,
-)
+from .focal_processor import FocalStackProcessor
 
 __all__ = [
+    "FocalCrossAttention",
     "FocalStackProcessor",
     "CameraInvariantEncoder",
     "DualOutputDecoder",
-    "FocalCrossAttention",
-    "FocalAwareRotaryEmbedding",
-    "CrossModalityAttention",
 ]

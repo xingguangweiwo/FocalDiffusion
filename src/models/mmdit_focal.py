@@ -3,20 +3,21 @@ FocalDiffusion Pipeline - Main inference pipeline with SD3.5 integration
 Complete implementation with proper SD3.5 architecture
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 from PIL import Image
 from tqdm.auto import tqdm
 
 from diffusers import (
-    StableDiffusion3Pipeline,
+    AutoencoderKL,
     FlowMatchEulerDiscreteScheduler,
     SD3Transformer2DModel,
-    AutoencoderKL
+    StableDiffusion3Pipeline,
 )
 from diffusers.models.transformers import SD3Transformer2DModel
 from diffusers.utils import BaseOutput
@@ -26,6 +27,8 @@ from transformers import (
     T5EncoderModel,
     T5TokenizerFast,
 )
+
+from .attention_modules import FocalCrossAttention
 
 
 @dataclass
@@ -53,18 +56,18 @@ class FocalInjectedSD3Transformer(SD3Transformer2DModel):
         hidden_size = config.attention_head_dim * config.num_attention_heads
 
         # Add focal cross-attention modules
-        self.focal_cross_attns = nn.ModuleList()
-        for i in range(config.num_layers):
-            if i in self.focal_injection_layers:
-                self.focal_cross_attns.append(
-                    FocalCrossAttention(
-                        hidden_size=hidden_size,
-                        num_heads=config.num_attention_heads,
-                        head_dim=config.attention_head_dim,
-                    )
+        self.focal_cross_attns = nn.ModuleList(
+            [
+                FocalCrossAttention(
+                    hidden_size=hidden_size,
+                    num_heads=config.num_attention_heads,
+                    head_dim=config.attention_head_dim,
                 )
-            else:
-                self.focal_cross_attns.append(None)
+                if i in self.focal_injection_layers
+                else None
+                for i in range(config.num_layers)
+            ]
+        )
 
     def forward(
         self,
@@ -117,53 +120,6 @@ class FocalInjectedSD3Transformer(SD3Transformer2DModel):
             return Transformer2DModelOutput(sample=hidden_states)
 
         return (hidden_states,)
-
-
-class FocalCrossAttention(nn.Module):
-    """Cross-attention module for focal feature injection"""
-
-    def __init__(self, hidden_size: int, num_heads: int = 8, head_dim: int = 64):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        inner_dim = num_heads * head_dim
-
-        self.to_q = nn.Linear(hidden_size, inner_dim, bias=False)
-        self.to_k = nn.Linear(hidden_size, inner_dim, bias=False)
-        self.to_v = nn.Linear(hidden_size, inner_dim, bias=False)
-        self.to_out = nn.Linear(inner_dim, hidden_size)
-
-        # QK normalization for SD3.5
-        self.q_norm = nn.LayerNorm(head_dim)
-        self.k_norm = nn.LayerNorm(head_dim)
-
-    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
-        B, N, D = hidden_states.shape
-
-        q = self.to_q(hidden_states)
-        k = self.to_k(encoder_hidden_states)
-        v = self.to_v(encoder_hidden_states)
-
-        # Reshape for multi-head attention
-        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Apply QK normalization
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # Attention
-        scale = self.head_dim ** -0.5
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)
-
-        # Reshape back
-        out = out.transpose(1, 2).reshape(B, N, -1)
-        out = self.to_out(out)
-
-        return out
 
 
 class DualOutputDecoder(nn.Module):
