@@ -55,17 +55,25 @@ class FocalDiffusionOutput(BaseOutput):
     focal_features: Optional[Dict[str, torch.Tensor]] = None
 
 
-class FocalInjectedSD3Transformer(SD3Transformer2DModel):
+class FocalInjectedSD3Transformer(nn.Module):
     """Wrapper around the SD3.5 transformer that accepts focal features."""
 
-    def __init__(self, config: Any) -> None:
-        super().__init__(config)
-        hidden_size = config.attention_head_dim * config.num_attention_heads
+    def __init__(self, base_transformer: SD3Transformer2DModel) -> None:
+        super().__init__()
+        self.base_transformer = base_transformer
+        self.config = base_transformer.config
+        hidden_size = self.config.attention_head_dim * self.config.num_attention_heads
         self.focal_attn = FocalCrossAttention(
             hidden_size=hidden_size,
-            num_heads=config.num_attention_heads,
-            head_dim=config.attention_head_dim,
+            num_heads=self.config.num_attention_heads,
+            head_dim=self.config.attention_head_dim,
         )
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
+        if name in {"base_transformer", "focal_attn", "config"}:
+            return super().__getattribute__(name)
+        return getattr(self.base_transformer, name)
 
     def forward(
         self,
@@ -77,7 +85,7 @@ class FocalInjectedSD3Transformer(SD3Transformer2DModel):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[Transformer2DModelOutput, Tuple[torch.Tensor]]:
-        result = super().forward(
+        result = self.base_transformer.forward(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
@@ -145,9 +153,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         )
 
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
-            wrapped = FocalInjectedSD3Transformer(self.transformer.config)
-            wrapped.load_state_dict(self.transformer.state_dict(), strict=False)
-            self.transformer = wrapped
+            self.transformer = FocalInjectedSD3Transformer(self.transformer)
 
     @torch.no_grad()
     def __call__(
