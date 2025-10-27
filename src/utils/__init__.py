@@ -17,17 +17,6 @@ from .metrics import compute_metrics
 from .visualization import visualize_results
 
 
-def ensure_sentencepiece_installed() -> None:
-    """Legacy no-op kept for backwards compatibility.
-
-    Older entry points imported :func:`ensure_sentencepiece_installed` to
-    perform an optional dependency check. The validation step has since been
-    inlined elsewhere, but keeping this stub avoids ``NameError`` crashes for
-    users running out-of-date scripts or notebooks that still reference the
-    helper.
-    """
-
-
 __all__ = [
     "load_image_stack",
     "save_depth_map",
