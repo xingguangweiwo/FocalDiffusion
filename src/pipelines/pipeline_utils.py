@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 import json
 
+from ..utils import ensure_sentencepiece_installed
+
 
 def load_pipeline(
         checkpoint_path: Union[str, Path],
@@ -18,6 +20,7 @@ def load_pipeline(
     from .focal_diffusion_pipeline import FocalDiffusionPipeline
 
     # Load base pipeline
+    ensure_sentencepiece_installed()
     pipeline = FocalDiffusionPipeline.from_pretrained(
         base_model_id,
         torch_dtype=dtype,
