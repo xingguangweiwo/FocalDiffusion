@@ -173,7 +173,8 @@ class FocalDiffusionTrainer:
 
         # Load base SD3.5 pipeline
         model_cfg = self.config['model']
-        base_model_id = model_cfg['base_model_id']
+        requested_model_id = model_cfg['base_model_id']
+        base_model_id = requested_model_id
         variant = model_cfg.get('variant')
 
         if variant is None:
@@ -184,6 +185,15 @@ class FocalDiffusionTrainer:
                     variant = suffix
                     break
 
+        if (variant or "").lower() == "tensorrt":
+            logger.warning(
+                "TensorRT checkpoints such as '%s' only contain serialized inference engines. "
+                "Falling back to the diffusers weights 'stabilityai/stable-diffusion-3.5-large' for training.",
+                requested_model_id,
+            )
+            base_model_id = "stabilityai/stable-diffusion-3.5-large"
+            variant = None
+
         auth_token, token_source = self._resolve_hf_token(model_cfg)
 
         if auth_token:
@@ -192,7 +202,7 @@ class FocalDiffusionTrainer:
             logger.warning(
                 "No Hugging Face token found. If '%s' is a gated model, please run "
                 "`huggingface-cli login` or set `model.auth_token` in your config.",
-                model_cfg['base_model_id'],
+                base_model_id,
             )
 
         try:
@@ -217,6 +227,21 @@ class FocalDiffusionTrainer:
                     "No token was supplied. Run `huggingface-cli login` or set `model.auth_token` / "
                     "the HF_TOKEN environment variable, then retry."
                 )
+            raise RuntimeError(" ".join(hint_lines)) from exc
+        except FileNotFoundError as exc:
+            cache_root_env = os.environ.get('HUGGINGFACE_HUB_CACHE')
+            if cache_root_env:
+                cache_root = Path(cache_root_env)
+            else:
+                hf_home = os.environ.get('HF_HOME')
+                cache_root = (Path(hf_home) if hf_home else Path.home() / '.cache' / 'huggingface') / 'hub'
+
+            repo_cache = cache_root / f"models--{base_model_id.replace('/', '--')}"
+            hint_lines = [
+                "Missing checkpoint shard(s) detected in the local Hugging Face cache.",
+                f"Remove the directory '{repo_cache}' and retry the download to restore the model files.",
+                "After cleanup, rerun the training script to trigger a fresh download."
+            ]
             raise RuntimeError(" ".join(hint_lines)) from exc
 
         # Initialize focal-specific components
