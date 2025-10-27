@@ -1,7 +1,7 @@
 # Default training recipe in a single file.
 # Other configs can extend this base via `defaults: [base]`.
 model:
-  base_model_id: stabilityai/stable-diffusion-3.5-large-tensorrt
+  base_model_id: "stabilityai/stable-diffusion-3.5-large"
   feature_dim: 128
   num_scales: 3
   max_focal_stack_size: 12
