@@ -117,6 +117,17 @@ class FocalInjectedSD3Transformer(nn.Module):
 class FocalDiffusionPipeline(StableDiffusion3Pipeline):
     """Stable Diffusion 3.5 pipeline that consumes focal stacks instead of text-only prompts."""
 
+    _MODULE_ATTRS = (
+        "vae",
+        "text_encoder",
+        "text_encoder_2",
+        "text_encoder_3",
+        "transformer",
+        "focal_processor",
+        "camera_encoder",
+        "dual_decoder",
+    )
+
     def __init__(
         self,
         vae: AutoencoderKL,
@@ -154,6 +165,29 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
             self.transformer = FocalInjectedSD3Transformer(self.transformer)
+
+    def _iter_registered_modules(self):
+        for attr in self._MODULE_ATTRS:
+            module = getattr(self, attr, None)
+            if module is None:
+                continue
+            # Some components (e.g. schedulers) are not nn.Module subclasses.
+            if isinstance(module, nn.Module):
+                yield attr, module
+
+    def parameters(self, recurse: bool = True):
+        """Yield parameters from every learnable submodule."""
+
+        for _, module in self._iter_registered_modules():
+            yield from module.parameters(recurse=recurse)
+
+    def named_parameters(self, prefix: str = "", recurse: bool = True):
+        """Yield named parameters, namespaced by component."""
+
+        for attr, module in self._iter_registered_modules():
+            component_prefix = f"{prefix}{attr}." if prefix else f"{attr}."
+            for name, param in module.named_parameters(prefix="", recurse=recurse):
+                yield component_prefix + name, param
 
     @torch.no_grad()
     def __call__(
