@@ -31,6 +31,7 @@ from src.utils import (
     create_visualization,
     parse_exif_data,
     estimate_focus_distances,
+    ensure_sentencepiece_installed,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -57,7 +58,7 @@ def parse_args():
     parser.add_argument(
         '--base-model',
         type=str,
-        default='stabilityai/stable-diffusion-3.5-large',
+        default='stabilityai/stable-diffusion-3.5-large-tensorrt',
         help='Base SD3.5 model ID'
     )
     parser.add_argument(
@@ -425,6 +426,7 @@ def main():
         )
     else:
         logger.info(f"Loading pretrained model: {args.base_model}")
+        ensure_sentencepiece_installed()
         pipeline = FocalDiffusionPipeline.from_pretrained(
             args.base_model,
             torch_dtype=dtype,
