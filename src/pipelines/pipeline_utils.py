@@ -7,9 +7,6 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 import json
 
-from ..utils import ensure_sentencepiece_installed
-
-
 def load_pipeline(
         checkpoint_path: Union[str, Path],
         base_model_id: str = "stabilityai/stable-diffusion-3.5-large-tensorrt",

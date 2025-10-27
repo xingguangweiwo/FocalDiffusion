@@ -26,7 +26,6 @@ import wandb
 
 from typing import Any, Dict, List, Optional
 
-from ..utils import ensure_sentencepiece_installed
 
 logger = logging.getLogger(__name__)
 
