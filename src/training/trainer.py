@@ -20,11 +20,13 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers import StableDiffusion3Pipeline
+from huggingface_hub import HfFolder
+from huggingface_hub.errors import GatedRepoError
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 import wandb
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,23 @@ class FocalDiffusionTrainer:
         # Training state
         self.current_epoch = 0
         self.global_step = 0
+
+    @staticmethod
+    def _resolve_hf_token(model_cfg: Dict[str, Any]) -> Tuple[Optional[str], str]:
+        """Return the Hugging Face token and a string describing its origin."""
+
+        if model_cfg.get('auth_token'):
+            return model_cfg['auth_token'], "the experiment config"
+
+        env_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_HUB_TOKEN')
+        if env_token:
+            return env_token, "environment variables"
+
+        cached_token = HfFolder.get_token()
+        if cached_token:
+            return cached_token, "huggingface-cli cache"
+
+        return None, "missing"
 
     def setup_data(self):
         """Setup datasets and dataloaders using file lists"""
@@ -165,18 +184,40 @@ class FocalDiffusionTrainer:
                     variant = suffix
                     break
 
-        auth_token = (
-            model_cfg.get('auth_token')
-            if 'auth_token' in model_cfg
-            else os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_HUB_TOKEN')
-        )
+        auth_token, token_source = self._resolve_hf_token(model_cfg)
 
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            base_model_id,
-            torch_dtype=torch.float16 if self.config['training']['mixed_precision'] == 'fp16' else torch.float32,
-            token=auth_token if auth_token else None,
-            variant=variant,
-        )
+        if auth_token:
+            logger.info("Using Hugging Face token from %s", token_source)
+        else:
+            logger.warning(
+                "No Hugging Face token found. If '%s' is a gated model, please run "
+                "`huggingface-cli login` or set `model.auth_token` in your config.",
+                model_cfg['base_model_id'],
+            )
+
+        try:
+            pipe = StableDiffusion3Pipeline.from_pretrained(
+                base_model_id,
+                torch_dtype=torch.float16 if self.config['training']['mixed_precision'] == 'fp16' else torch.float32,
+                token=auth_token if auth_token else None,
+                variant=variant,
+            )
+        except GatedRepoError as exc:
+            hint_lines = [
+                "Access to the requested Stable Diffusion checkpoint is gated.",
+                "Visit https://huggingface.co/stabilityai/stable-diffusion-3.5-large to request access.",
+            ]
+            if auth_token:
+                hint_lines.append(
+                    "The provided Hugging Face token was rejected. Double-check that the token belongs "
+                    "to an account with access to the model."
+                )
+            else:
+                hint_lines.append(
+                    "No token was supplied. Run `huggingface-cli login` or set `model.auth_token` / "
+                    "the HF_TOKEN environment variable, then retry."
+                )
+            raise RuntimeError(" ".join(hint_lines)) from exc
 
         # Initialize focal-specific components
         logger.info("Initializing focal components...")
