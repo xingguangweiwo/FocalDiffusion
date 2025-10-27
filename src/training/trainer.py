@@ -153,11 +153,29 @@ class FocalDiffusionTrainer:
         from ..models.dual_decoder import DualOutputDecoder
 
         # Load base SD3.5 pipeline
-        base_model_id = self.config['model']['base_model_id']
+        model_cfg = self.config['model']
+        base_model_id = model_cfg['base_model_id']
+        variant = model_cfg.get('variant')
+
+        if variant is None:
+            for suffix in ("tensorrt", "onnx", "fp16", "fp32"):
+                marker = f"-{suffix}"
+                if base_model_id.endswith(marker):
+                    base_model_id = base_model_id[: -len(marker)]
+                    variant = suffix
+                    break
+
+        auth_token = (
+            model_cfg.get('auth_token')
+            if 'auth_token' in model_cfg
+            else os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_HUB_TOKEN')
+        )
 
         pipe = StableDiffusion3Pipeline.from_pretrained(
             base_model_id,
             torch_dtype=torch.float16 if self.config['training']['mixed_precision'] == 'fp16' else torch.float32,
+            token=auth_token if auth_token else None,
+            variant=variant,
         )
 
         # Initialize focal-specific components
