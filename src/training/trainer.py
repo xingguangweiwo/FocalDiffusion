@@ -155,6 +155,10 @@ class FocalDiffusionTrainer:
         # Load base SD3.5 pipeline
         base_model_id = self.config['model']['base_model_id']
 
+        # Fail fast if sentencepiece is missing so users do not waste time
+        # downloading the checkpoint before encountering a tokenizer error.
+        ensure_sentencepiece_installed()
+
         pipe = StableDiffusion3Pipeline.from_pretrained(
             base_model_id,
             torch_dtype=torch.float16 if self.config['training']['mixed_precision'] == 'fp16' else torch.float32,

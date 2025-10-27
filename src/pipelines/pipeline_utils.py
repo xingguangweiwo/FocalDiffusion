@@ -17,6 +17,7 @@ def load_pipeline(
     from .focal_diffusion_pipeline import FocalDiffusionPipeline
 
     # Load base pipeline
+    ensure_sentencepiece_installed()
     pipeline = FocalDiffusionPipeline.from_pretrained(
         base_model_id,
         torch_dtype=dtype,

@@ -29,4 +29,5 @@ __all__ = [
     "get_depth_of_field",
     "compute_metrics",
     "visualize_results",
+    "ensure_sentencepiece_installed",
 ]
