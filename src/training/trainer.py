@@ -20,11 +20,13 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers import StableDiffusion3Pipeline
+from huggingface_hub import HfFolder
+from huggingface_hub.errors import GatedRepoError
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 import wandb
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,23 @@ class FocalDiffusionTrainer:
         # Training state
         self.current_epoch = 0
         self.global_step = 0
+
+    @staticmethod
+    def _resolve_hf_token(model_cfg: Dict[str, Any]) -> Tuple[Optional[str], str]:
+        """Return the Hugging Face token and a string describing its origin."""
+
+        if model_cfg.get('auth_token'):
+            return model_cfg['auth_token'], "the experiment config"
+
+        env_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_HUB_TOKEN')
+        if env_token:
+            return env_token, "environment variables"
+
+        cached_token = HfFolder.get_token()
+        if cached_token:
+            return cached_token, "huggingface-cli cache"
+
+        return None, "missing"
 
     def setup_data(self):
         """Setup datasets and dataloaders using file lists"""
@@ -153,12 +172,77 @@ class FocalDiffusionTrainer:
         from ..models.dual_decoder import DualOutputDecoder
 
         # Load base SD3.5 pipeline
-        base_model_id = self.config['model']['base_model_id']
+        model_cfg = self.config['model']
+        requested_model_id = model_cfg['base_model_id']
+        base_model_id = requested_model_id
+        variant = model_cfg.get('variant')
 
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            base_model_id,
-            torch_dtype=torch.float16 if self.config['training']['mixed_precision'] == 'fp16' else torch.float32,
-        )
+        if variant is None:
+            for suffix in ("tensorrt", "onnx", "fp16", "fp32"):
+                marker = f"-{suffix}"
+                if base_model_id.endswith(marker):
+                    base_model_id = base_model_id[: -len(marker)]
+                    variant = suffix
+                    break
+
+        if (variant or "").lower() == "tensorrt":
+            logger.warning(
+                "TensorRT checkpoints such as '%s' only contain serialized inference engines. "
+                "Falling back to the diffusers weights 'stabilityai/stable-diffusion-3.5-large' for training.",
+                requested_model_id,
+            )
+            base_model_id = "stabilityai/stable-diffusion-3.5-large"
+            variant = None
+
+        auth_token, token_source = self._resolve_hf_token(model_cfg)
+
+        if auth_token:
+            logger.info("Using Hugging Face token from %s", token_source)
+        else:
+            logger.warning(
+                "No Hugging Face token found. If '%s' is a gated model, please run "
+                "`huggingface-cli login` or set `model.auth_token` in your config.",
+                base_model_id,
+            )
+
+        try:
+            pipe = StableDiffusion3Pipeline.from_pretrained(
+                base_model_id,
+                torch_dtype=torch.float16 if self.config['training']['mixed_precision'] == 'fp16' else torch.float32,
+                token=auth_token if auth_token else None,
+                variant=variant,
+            )
+        except GatedRepoError as exc:
+            hint_lines = [
+                "Access to the requested Stable Diffusion checkpoint is gated.",
+                "Visit https://huggingface.co/stabilityai/stable-diffusion-3.5-large to request access.",
+            ]
+            if auth_token:
+                hint_lines.append(
+                    "The provided Hugging Face token was rejected. Double-check that the token belongs "
+                    "to an account with access to the model."
+                )
+            else:
+                hint_lines.append(
+                    "No token was supplied. Run `huggingface-cli login` or set `model.auth_token` / "
+                    "the HF_TOKEN environment variable, then retry."
+                )
+            raise RuntimeError(" ".join(hint_lines)) from exc
+        except FileNotFoundError as exc:
+            cache_root_env = os.environ.get('HUGGINGFACE_HUB_CACHE')
+            if cache_root_env:
+                cache_root = Path(cache_root_env)
+            else:
+                hf_home = os.environ.get('HF_HOME')
+                cache_root = (Path(hf_home) if hf_home else Path.home() / '.cache' / 'huggingface') / 'hub'
+
+            repo_cache = cache_root / f"models--{base_model_id.replace('/', '--')}"
+            hint_lines = [
+                "Missing checkpoint shard(s) detected in the local Hugging Face cache.",
+                f"Remove the directory '{repo_cache}' and retry the download to restore the model files.",
+                "After cleanup, rerun the training script to trigger a fresh download."
+            ]
+            raise RuntimeError(" ".join(hint_lines)) from exc
 
         # Initialize focal-specific components
         logger.info("Initializing focal components...")
@@ -236,8 +320,9 @@ class FocalDiffusionTrainer:
         self.dual_decoder.requires_grad_(True)
 
         # Log trainable parameters
-        trainable_params = sum(p.numel() for p in self.pipeline.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in self.pipeline.parameters())
+        pipeline_params = list(self._iter_pipeline_parameters())
+        total_params = sum(param.numel() for param in pipeline_params)
+        trainable_params = sum(param.numel() for param in pipeline_params if param.requires_grad)
         logger.info(
             f"Trainable params: {trainable_params:,} / {total_params:,} "
             f"({100 * trainable_params / total_params:.2f}%)"
@@ -266,7 +351,7 @@ class FocalDiffusionTrainer:
         from ..training.optimizers import get_optimizer
 
         # Get trainable parameters
-        trainable_params = [p for p in self.pipeline.parameters() if p.requires_grad]
+        trainable_params = list(self._iter_pipeline_parameters(only_trainable=True))
 
         # Create optimizer
         self.optimizer = get_optimizer(
@@ -305,6 +390,27 @@ class FocalDiffusionTrainer:
 
         # Setup gradient scaler for mixed precision
         self.scaler = GradScaler() if self.config['training']['mixed_precision'] == 'fp16' else None
+
+    def _iter_pipeline_parameters(self, only_trainable: bool = False):
+        """Yield pipeline parameters, tolerating older snapshots without helpers."""
+
+        if hasattr(self.pipeline, "parameters"):
+            for param in self.pipeline.parameters():
+                if not only_trainable or param.requires_grad:
+                    yield param
+            return
+
+        if hasattr(self.pipeline, "_iter_registered_modules"):
+            for _, module in self.pipeline._iter_registered_modules():
+                for param in module.parameters():
+                    if not only_trainable or param.requires_grad:
+                        yield param
+            return
+
+        raise AttributeError(
+            "FocalDiffusionPipeline is missing parameter accessors. "
+            "Please update src/pipelines/focal_diffusion_pipeline.py."
+        )
 
     def setup_tracking(self):
         """Setup experiment tracking"""
@@ -553,10 +659,12 @@ class FocalDiffusionTrainer:
 
                 # Gradient clipping
                 if self.config['training'].get('max_grad_norm'):
-                    self.accelerator.clip_grad_norm_(
-                        self.pipeline.parameters(),
-                        self.config['training']['max_grad_norm']
-                    )
+                    clip_params = list(self._iter_pipeline_parameters(only_trainable=True))
+                    if clip_params:
+                        self.accelerator.clip_grad_norm_(
+                            clip_params,
+                            self.config['training']['max_grad_norm']
+                        )
 
                 # Optimizer step
                 self.optimizer.step()
