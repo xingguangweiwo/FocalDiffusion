@@ -320,8 +320,9 @@ class FocalDiffusionTrainer:
         self.dual_decoder.requires_grad_(True)
 
         # Log trainable parameters
-        trainable_params = sum(p.numel() for p in self.pipeline.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in self.pipeline.parameters())
+        pipeline_params = list(self._iter_pipeline_parameters())
+        total_params = sum(param.numel() for param in pipeline_params)
+        trainable_params = sum(param.numel() for param in pipeline_params if param.requires_grad)
         logger.info(
             f"Trainable params: {trainable_params:,} / {total_params:,} "
             f"({100 * trainable_params / total_params:.2f}%)"
@@ -350,7 +351,7 @@ class FocalDiffusionTrainer:
         from ..training.optimizers import get_optimizer
 
         # Get trainable parameters
-        trainable_params = [p for p in self.pipeline.parameters() if p.requires_grad]
+        trainable_params = list(self._iter_pipeline_parameters(only_trainable=True))
 
         # Create optimizer
         self.optimizer = get_optimizer(
@@ -389,6 +390,27 @@ class FocalDiffusionTrainer:
 
         # Setup gradient scaler for mixed precision
         self.scaler = GradScaler() if self.config['training']['mixed_precision'] == 'fp16' else None
+
+    def _iter_pipeline_parameters(self, only_trainable: bool = False):
+        """Yield pipeline parameters, tolerating older snapshots without helpers."""
+
+        if hasattr(self.pipeline, "parameters"):
+            for param in self.pipeline.parameters():
+                if not only_trainable or param.requires_grad:
+                    yield param
+            return
+
+        if hasattr(self.pipeline, "_iter_registered_modules"):
+            for _, module in self.pipeline._iter_registered_modules():
+                for param in module.parameters():
+                    if not only_trainable or param.requires_grad:
+                        yield param
+            return
+
+        raise AttributeError(
+            "FocalDiffusionPipeline is missing parameter accessors. "
+            "Please update src/pipelines/focal_diffusion_pipeline.py."
+        )
 
     def setup_tracking(self):
         """Setup experiment tracking"""
@@ -637,10 +659,12 @@ class FocalDiffusionTrainer:
 
                 # Gradient clipping
                 if self.config['training'].get('max_grad_norm'):
-                    self.accelerator.clip_grad_norm_(
-                        self.pipeline.parameters(),
-                        self.config['training']['max_grad_norm']
-                    )
+                    clip_params = list(self._iter_pipeline_parameters(only_trainable=True))
+                    if clip_params:
+                        self.accelerator.clip_grad_norm_(
+                            clip_params,
+                            self.config['training']['max_grad_norm']
+                        )
 
                 # Optimizer step
                 self.optimizer.step()
