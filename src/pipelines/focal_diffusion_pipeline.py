@@ -189,6 +189,18 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             for name, param in module.named_parameters(prefix="", recurse=recurse):
                 yield component_prefix + name, param
 
+    def train(self, mode: bool = True):
+        """Set all registered modules to training or evaluation mode."""
+
+        for _, module in self._iter_registered_modules():
+            module.train(mode)
+        return self
+
+    def eval(self):
+        """Switch all registered modules to evaluation mode."""
+
+        return self.train(False)
+
     @torch.no_grad()
     def __call__(
         self,
