@@ -133,13 +133,15 @@ def _resolve_default_path(entry: Any, config_dir: Path) -> Path:
 def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
     """Resolve relative paths for known config keys in-place."""
 
-    def _resolve(path_value: Optional[str]) -> Optional[str]:
+    def _resolve(path_value: Any):
         if path_value is None:
             return None
+        if isinstance(path_value, (list, tuple)):
+            return [_resolve(item) for item in path_value]
         path = Path(path_value)
         if path.is_absolute() or str(path_value).startswith("${"):
             return str(path)
-        anchor = base_dir if str(path_value).startswith(('./', '../')) else project_root
+        anchor = base_dir if str(path_value).startswith(("./", "../")) else project_root
         return str((anchor / path).resolve())
 
     data_block = config.get('data')

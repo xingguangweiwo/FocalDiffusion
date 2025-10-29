@@ -10,7 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -594,24 +594,53 @@ class VirtualKITTIDataset(FocalStackDataset):
 
 
 def resolve_data_root(
-    root_candidate: Union[str, Path],
+    root_candidate: Union[
+        str,
+        Path,
+        List[Union[str, Path]],
+        Tuple[Union[str, Path], ...],
+        Set[Union[str, Path]],
+    ],
     *,
     dataset_type: Optional[str] = None,
     source_name: Optional[str] = None,
 ) -> Path:
     """Resolve the directory to use for dataset files.
-
-    The function first expands user and environment variables in the configured
-    path.  It then checks for override environment variables so that users can
-    keep repository configs generic while customising paths locally:
-
-    * ``{DATASET_TYPE}_DATA_ROOT`` (e.g. ``HYPERSIM_DATA_ROOT``)
-    * ``{SOURCE_NAME}_DATA_ROOT`` when mixing multiple datasets via ``sources``
-    * ``FOCALDIFFUSION_DATA_ROOT`` as a project-wide fallback
-
-    The first matching override is used.  When the override differs from the
-    configured path we log it so users understand which location is in effect.
     """
+
+    if isinstance(root_candidate, (list, tuple, set)):
+        candidates = list(root_candidate)
+        first_resolved: Optional[Path] = None
+        fallback_resolved: Optional[Path] = None
+        for index, candidate in enumerate(candidates):
+            resolved = resolve_data_root(
+                candidate,
+                dataset_type=dataset_type,
+                source_name=source_name,
+            )
+            if first_resolved is None:
+                first_resolved = resolved
+            if (
+                fallback_resolved is None
+                or (
+                    str(fallback_resolved).startswith("${")
+                    and not fallback_resolved.exists()
+                )
+            ):
+                fallback_resolved = resolved
+            if resolved.exists():
+                if index > 0:
+                    logger.info(
+                        "Using fallback data root candidate #%d: %s",
+                        index + 1,
+                        resolved,
+                    )
+                return resolved
+        if fallback_resolved is not None:
+            return fallback_resolved
+        return first_resolved or Path(
+            os.path.expanduser(os.path.expandvars(str(root_candidate)))
+        )
 
     resolved_default = Path(
         os.path.expanduser(os.path.expandvars(str(root_candidate)))
