@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -49,7 +50,8 @@ class FocalStackDataset(Dataset):
         simulator_kwargs: Optional[Dict[str, float]] = None,
         depth_bounds: Optional[Tuple[float, float]] = None,
     ) -> None:
-        self.data_root = Path(data_root)
+        resolved_root = Path(os.path.expanduser(os.path.expandvars(str(data_root))))
+        self.data_root = resolved_root
         self.image_size = image_size
         self.focal_stack_size = focal_stack_size
         self.focal_range = focal_range
@@ -388,6 +390,21 @@ class FocalStackDataset(Dataset):
     def _load_depth(self, sample_info: Dict) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         depth_path = self._resolve_path(sample_info["depth_path"])
 
+        if not depth_path.exists():
+            rel_hint = sample_info.get("depth_path")
+            logger.error(
+                "Missing depth map resolved to %s (entry '%s', data_root=%s)",
+                depth_path,
+                rel_hint,
+                self.data_root,
+            )
+            raise FileNotFoundError(
+                "Depth map not found. Expected file "
+                f"{depth_path} (from entry '{rel_hint}') under data_root {self.data_root}. "
+                "Verify that the HyperSim focal stack dataset is downloaded and that "
+                "data.filelist entries point to the correct location."
+            )
+
         if depth_path.suffix.lower() in {".h5", ".hdf5"}:
             depth = self._load_hdf5_depth(depth_path, sample_info.get("depth_dataset"))
         elif depth_path.suffix.lower() == ".npy":
@@ -576,6 +593,56 @@ class VirtualKITTIDataset(FocalStackDataset):
         return samples
 
 
+def resolve_data_root(
+    root_candidate: Union[str, Path],
+    *,
+    dataset_type: Optional[str] = None,
+    source_name: Optional[str] = None,
+) -> Path:
+    """Resolve the directory to use for dataset files.
+
+    The function first expands user and environment variables in the configured
+    path.  It then checks for override environment variables so that users can
+    keep repository configs generic while customising paths locally:
+
+    * ``{DATASET_TYPE}_DATA_ROOT`` (e.g. ``HYPERSIM_DATA_ROOT``)
+    * ``{SOURCE_NAME}_DATA_ROOT`` when mixing multiple datasets via ``sources``
+    * ``FOCALDIFFUSION_DATA_ROOT`` as a project-wide fallback
+
+    The first matching override is used.  When the override differs from the
+    configured path we log it so users understand which location is in effect.
+    """
+
+    resolved_default = Path(
+        os.path.expanduser(os.path.expandvars(str(root_candidate)))
+    )
+
+    override_keys: List[str] = []
+    if source_name:
+        override_keys.append(f"{source_name.upper()}_DATA_ROOT")
+    if dataset_type:
+        override_keys.append(f"{dataset_type.upper()}_DATA_ROOT")
+    override_keys.append("FOCALDIFFUSION_DATA_ROOT")
+
+    for key in override_keys:
+        env_value = os.environ.get(key)
+        if not env_value:
+            continue
+
+        candidate = Path(os.path.expanduser(os.path.expandvars(env_value)))
+        if candidate != resolved_default:
+            logger.info(
+                "Overriding data root using %s=%s", key, candidate
+            )
+        if not candidate.exists():
+            logger.warning(
+                "Data root override %s does not exist yet: %s", key, candidate
+            )
+        return candidate
+
+    return resolved_default
+
+
 def create_dataloader(
     dataset_type: Optional[str] = None,
     filelist_path: Optional[Union[str, Path]] = None,
@@ -613,6 +680,11 @@ def create_dataloader(
         merged_kwargs.update(source_kwargs.get("dataset_kwargs", {}))
 
         root_override = source_kwargs.get("data_root", data_root)
+        root_override = resolve_data_root(
+            root_override,
+            dataset_type=dataset_type,
+            source_name=source_kwargs.get("name"),
+        )
         filelist_override = source_kwargs.get("filelist", filelist_path)
 
         if issubclass(dataset_class, FocalStackDataset) and filelist_override is None:
