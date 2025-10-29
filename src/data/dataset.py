@@ -606,13 +606,6 @@ def resolve_data_root(
     source_name: Optional[str] = None,
 ) -> Path:
     """Resolve the directory to use for dataset files.
-
-    ``root_candidate`` may be a single path-like object or a collection of
-    candidates.  Each candidate is expanded (supporting ``~`` and environment
-    variables) and checked in order.  Environment variable overrides still win
-    regardless of the configured candidates so repository configs can remain
-    generic while users provide local paths via ``FOCALDIFFUSION_DATA_ROOT`` or
-    dataset-specific variables such as ``HYPERSIM_DATA_ROOT``.
     """
 
     if isinstance(root_candidate, (list, tuple, set)):
