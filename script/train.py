@@ -16,6 +16,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from .utils import dump_yaml_file, load_yaml_file
+from src.data.dataset import resolve_data_root
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -222,10 +223,19 @@ def validate_config(config: dict) -> None:
             value = value[key]
 
     # Check paths exist
-    if not Path(config['data']['data_root']).exists():
+    resolved_data_root = resolve_data_root(
+        config['data']['data_root'],
+        dataset_type=config['data'].get('dataset_type'),
+    )
+
+    if not resolved_data_root.exists():
         logger.warning(
-            f"Training data root does not exist: {config['data']['data_root']}"
+            "Training data root does not exist: %s", resolved_data_root
         )
+
+    # Persist the resolved path back into the config so downstream components use
+    # the same location that was validated here.
+    config['data']['data_root'] = str(resolved_data_root)
 
     # Create output directory
     output_dir = Path(config['output']['save_dir'])
