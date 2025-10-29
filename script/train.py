@@ -16,6 +16,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from .utils import dump_yaml_file, load_yaml_file
+from src.data.dataset import resolve_data_root
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -132,13 +133,15 @@ def _resolve_default_path(entry: Any, config_dir: Path) -> Path:
 def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
     """Resolve relative paths for known config keys in-place."""
 
-    def _resolve(path_value: Optional[str]) -> Optional[str]:
+    def _resolve(path_value: Any):
         if path_value is None:
             return None
+        if isinstance(path_value, (list, tuple)):
+            return [_resolve(item) for item in path_value]
         path = Path(path_value)
         if path.is_absolute() or str(path_value).startswith("${"):
             return str(path)
-        anchor = base_dir if str(path_value).startswith(('./', '../')) else project_root
+        anchor = base_dir if str(path_value).startswith(("./", "../")) else project_root
         return str((anchor / path).resolve())
 
     data_block = config.get('data')
@@ -222,10 +225,19 @@ def validate_config(config: dict) -> None:
             value = value[key]
 
     # Check paths exist
-    if not Path(config['data']['data_root']).exists():
+    resolved_data_root = resolve_data_root(
+        config['data']['data_root'],
+        dataset_type=config['data'].get('dataset_type'),
+    )
+
+    if not resolved_data_root.exists():
         logger.warning(
-            f"Training data root does not exist: {config['data']['data_root']}"
+            "Training data root does not exist: %s", resolved_data_root
         )
+
+    # Persist the resolved path back into the config so downstream components use
+    # the same location that was validated here.
+    config['data']['data_root'] = str(resolved_data_root)
 
     # Create output directory
     output_dir = Path(config['output']['save_dir'])

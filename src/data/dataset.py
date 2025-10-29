@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -49,7 +50,8 @@ class FocalStackDataset(Dataset):
         simulator_kwargs: Optional[Dict[str, float]] = None,
         depth_bounds: Optional[Tuple[float, float]] = None,
     ) -> None:
-        self.data_root = Path(data_root)
+        resolved_root = Path(os.path.expanduser(os.path.expandvars(str(data_root))))
+        self.data_root = resolved_root
         self.image_size = image_size
         self.focal_stack_size = focal_stack_size
         self.focal_range = focal_range
@@ -388,6 +390,21 @@ class FocalStackDataset(Dataset):
     def _load_depth(self, sample_info: Dict) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         depth_path = self._resolve_path(sample_info["depth_path"])
 
+        if not depth_path.exists():
+            rel_hint = sample_info.get("depth_path")
+            logger.error(
+                "Missing depth map resolved to %s (entry '%s', data_root=%s)",
+                depth_path,
+                rel_hint,
+                self.data_root,
+            )
+            raise FileNotFoundError(
+                "Depth map not found. Expected file "
+                f"{depth_path} (from entry '{rel_hint}') under data_root {self.data_root}. "
+                "Verify that the HyperSim focal stack dataset is downloaded and that "
+                "data.filelist entries point to the correct location."
+            )
+
         if depth_path.suffix.lower() in {".h5", ".hdf5"}:
             depth = self._load_hdf5_depth(depth_path, sample_info.get("depth_dataset"))
         elif depth_path.suffix.lower() == ".npy":
@@ -576,6 +593,92 @@ class VirtualKITTIDataset(FocalStackDataset):
         return samples
 
 
+def resolve_data_root(
+    root_candidate: Union[
+        str,
+        Path,
+        List[Union[str, Path]],
+        Tuple[Union[str, Path], ...],
+        Set[Union[str, Path]],
+    ],
+    *,
+    dataset_type: Optional[str] = None,
+    source_name: Optional[str] = None,
+) -> Path:
+    """Resolve the directory to use for dataset files.
+
+    ``root_candidate`` may be a single path-like object or a collection of
+    candidates.  Each candidate is expanded (supporting ``~`` and environment
+    variables) and checked in order.  Environment variable overrides still win
+    regardless of the configured candidates so repository configs can remain
+    generic while users provide local paths via ``FOCALDIFFUSION_DATA_ROOT`` or
+    dataset-specific variables such as ``HYPERSIM_DATA_ROOT``.
+    """
+
+    if isinstance(root_candidate, (list, tuple, set)):
+        candidates = list(root_candidate)
+        first_resolved: Optional[Path] = None
+        fallback_resolved: Optional[Path] = None
+        for index, candidate in enumerate(candidates):
+            resolved = resolve_data_root(
+                candidate,
+                dataset_type=dataset_type,
+                source_name=source_name,
+            )
+            if first_resolved is None:
+                first_resolved = resolved
+            if (
+                fallback_resolved is None
+                or (
+                    str(fallback_resolved).startswith("${")
+                    and not fallback_resolved.exists()
+                )
+            ):
+                fallback_resolved = resolved
+            if resolved.exists():
+                if index > 0:
+                    logger.info(
+                        "Using fallback data root candidate #%d: %s",
+                        index + 1,
+                        resolved,
+                    )
+                return resolved
+        if fallback_resolved is not None:
+            return fallback_resolved
+        return first_resolved or Path(
+            os.path.expanduser(os.path.expandvars(str(root_candidate)))
+        )
+
+    resolved_default = Path(
+        os.path.expanduser(os.path.expandvars(str(root_candidate)))
+    )
+
+    override_keys: List[str] = []
+    if source_name:
+        override_keys.append(f"{source_name.upper()}_DATA_ROOT")
+    if dataset_type:
+        override_keys.append(f"{dataset_type.upper()}_DATA_ROOT")
+    override_keys.append("FOCALDIFFUSION_DATA_ROOT")
+
+    for key in override_keys:
+        env_value = os.environ.get(key)
+        if not env_value:
+            continue
+
+        candidate = Path(os.path.expanduser(os.path.expandvars(env_value)))
+        if candidate != resolved_default:
+            logger.info(
+                "Overriding data root using %s=%s", key, candidate
+            )
+        if not candidate.exists():
+            logger.warning(
+                "Data root override %s does not exist yet: %s", key, candidate
+            )
+        return candidate
+
+    return resolved_default
+
+
 def create_dataloader(
     dataset_type: Optional[str] = None,
     filelist_path: Optional[Union[str, Path]] = None,
@@ -613,6 +716,11 @@ def create_dataloader(
         merged_kwargs.update(source_kwargs.get("dataset_kwargs", {}))
 
         root_override = source_kwargs.get("data_root", data_root)
+        root_override = resolve_data_root(
+            root_override,
+            dataset_type=dataset_type,
+            source_name=source_kwargs.get("name"),
+        )
         filelist_override = source_kwargs.get("filelist", filelist_path)
 
         if issubclass(dataset_class, FocalStackDataset) and filelist_override is None:
