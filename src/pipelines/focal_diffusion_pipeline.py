@@ -119,10 +119,13 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
     _optional_components = tuple(
         dict.fromkeys(
-            (*getattr(StableDiffusion3Pipeline, "_optional_components", ()),
-             "focal_processor",
-             "camera_encoder",
-             "dual_decoder",
+            (
+                "feature_extractor",
+                "image_encoder",
+                *getattr(StableDiffusion3Pipeline, "_optional_components", ()),
+                "focal_processor",
+                "camera_encoder",
+                "dual_decoder",
             )
         )
     )
