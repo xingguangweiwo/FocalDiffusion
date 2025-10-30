@@ -4,7 +4,8 @@ defaults:
 
 data:
   dataset_type: hypersim
-  data_root: /data/hypersim_focal_stacks
+  data_root:
+    - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
   train_filelist: data/filelists/hypersim_train.txt
   val_filelist: data/filelists/hypersim_val.txt
   test_filelist: data/filelists/hypersim_test.txt

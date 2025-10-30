@@ -105,8 +105,22 @@ class _MiniYAMLParser:
                     raise ValueError("Cannot mix list items with mapping entries")
                 value_text = line.content[2:].strip()
                 if value_text:
-                    value = self._parse_scalar(value_text)
                     index += 1
+                    if ":" in value_text:
+                        inline_key, inline_remainder = value_text.split(":", 1)
+                        inline_mapping: dict[str, Any] = {
+                            inline_key.strip(): self._parse_scalar(inline_remainder.strip())
+                        }
+                        if index < len(self.lines) and self.lines[index].indent > indent:
+                            nested_value, index = self._parse_block(index, indent + 2)
+                            if not isinstance(nested_value, dict):
+                                raise ValueError(
+                                    "List item with inline mapping must be followed by mapping entries"
+                                )
+                            inline_mapping.update(nested_value)
+                        value = inline_mapping
+                    else:
+                        value = self._parse_scalar(value_text)
                 else:
                     value, index = self._parse_block(index + 1, indent + 2)
                 items.append(value)
