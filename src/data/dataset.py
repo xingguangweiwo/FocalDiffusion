@@ -606,28 +606,33 @@ def resolve_data_root(
     source_name: Optional[str] = None,
 ) -> Path:
     """Resolve the directory to use for dataset files.
+
+    ``root_candidate`` may be a single path-like object or a collection of
+    candidates.  Each candidate is expanded (supporting ``~`` and environment
+    variables) and checked in order.  Environment variable overrides still win
+    regardless of the configured candidates so repository configs can remain
+    generic while users provide local paths via ``FOCALDIFFUSION_DATA_ROOT`` or
+    dataset-specific variables such as ``HYPERSIM_DATA_ROOT``.
     """
 
     if isinstance(root_candidate, (list, tuple, set)):
         candidates = list(root_candidate)
-        first_resolved: Optional[Path] = None
-        fallback_resolved: Optional[Path] = None
+        last_concrete: Optional[Path] = None
+        placeholder_fallback: Optional[Path] = None
+
         for index, candidate in enumerate(candidates):
-            resolved = resolve_data_root(
+            resolved, usable = _resolve_single_data_root_candidate(
                 candidate,
                 dataset_type=dataset_type,
                 source_name=source_name,
             )
-            if first_resolved is None:
-                first_resolved = resolved
-            if (
-                fallback_resolved is None
-                or (
-                    str(fallback_resolved).startswith("${")
-                    and not fallback_resolved.exists()
-                )
-            ):
-                fallback_resolved = resolved
+
+            if not usable:
+                placeholder_fallback = resolved
+                continue
+
+            last_concrete = resolved
+
             if resolved.exists():
                 if index > 0:
                     logger.info(
@@ -636,17 +641,57 @@ def resolve_data_root(
                         resolved,
                     )
                 return resolved
-        if fallback_resolved is not None:
-            return fallback_resolved
-        return first_resolved or Path(
-            os.path.expanduser(os.path.expandvars(str(root_candidate)))
-        )
+
+        if last_concrete is not None:
+            return last_concrete
+        if placeholder_fallback is not None:
+            return placeholder_fallback
+
+        return Path(os.path.expanduser(os.path.expandvars(str(root_candidate))))
+
+    resolved, _ = _resolve_single_data_root_candidate(
+        root_candidate,
+        dataset_type=dataset_type,
+        source_name=source_name,
+    )
+    return resolved
+
+
+def _resolve_single_data_root_candidate(
+    candidate: Union[str, Path],
+    *,
+    dataset_type: Optional[str],
+    source_name: Optional[str],
+) -> Tuple[Path, bool]:
+    """Expand a single data-root candidate.
+
+    Returns a tuple of the resolved path and a boolean indicating whether the
+    candidate is concrete (i.e. all environment placeholders were satisfied).
+    When ``False`` is returned for the second value the caller should treat the
+    path as a placeholder-only fallback and continue checking other entries.
+    """
+
+    raw = str(candidate)
+    placeholder_env: Optional[str] = None
+    if raw.startswith("${") and raw.endswith("}"):
+        placeholder_env = raw[2:-1]
+        env_value = os.environ.get(placeholder_env)
+        if env_value:
+            candidate = env_value
+        else:
+            logger.debug(
+                "Data root placeholder %s is unset; skipping until a real path is found",
+                placeholder_env,
+            )
+            return Path(raw), False
 
     resolved_default = Path(
-        os.path.expanduser(os.path.expandvars(str(root_candidate)))
+        os.path.expanduser(os.path.expandvars(str(candidate)))
     )
 
     override_keys: List[str] = []
+    if placeholder_env:
+        override_keys.append(placeholder_env)
     if source_name:
         override_keys.append(f"{source_name.upper()}_DATA_ROOT")
     if dataset_type:
@@ -658,18 +703,20 @@ def resolve_data_root(
         if not env_value:
             continue
 
-        candidate = Path(os.path.expanduser(os.path.expandvars(env_value)))
-        if candidate != resolved_default:
+        candidate_path = Path(
+            os.path.expanduser(os.path.expandvars(env_value))
+        )
+        if candidate_path != resolved_default:
             logger.info(
-                "Overriding data root using %s=%s", key, candidate
+                "Overriding data root using %s=%s", key, candidate_path
             )
-        if not candidate.exists():
+        if not candidate_path.exists():
             logger.warning(
-                "Data root override %s does not exist yet: %s", key, candidate
+                "Data root override %s does not exist yet: %s", key, candidate_path
             )
-        return candidate
+        return candidate_path, True
 
-    return resolved_default
+    return resolved_default, True
 
 
 def create_dataloader(

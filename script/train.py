@@ -4,9 +4,10 @@ Uses the FocalDiffusionTrainer class from src.training.trainer
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 import logging
 from datetime import datetime
 
@@ -97,6 +98,15 @@ def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
         merged_config = deep_merge(merged_config, base_config)
 
     config = deep_merge(merged_config, config)
+
+    local_overrides = _load_local_overrides(config_path)
+    if local_overrides:
+        logger.info(
+            "Applying %d local override configuration(s)", len(local_overrides)
+        )
+        for override_path, override_data in local_overrides:
+            logger.info(" - %s", override_path)
+            config = deep_merge(config, override_data)
     _visited.remove(config_path)
 
     return config
@@ -153,6 +163,58 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
     output_block = config.get('output')
     if isinstance(output_block, dict) and 'save_dir' in output_block:
         output_block['save_dir'] = _resolve(output_block['save_dir'])
+
+
+def _load_local_overrides(config_path: Path) -> List[Tuple[Path, dict]]:
+    """Load optional local override configuration files.
+
+    This allows developers to keep project configs generic while pointing data
+    directories to machine-specific locations via files that are typically
+    ignored by version control.  Overrides are loaded in the following order:
+
+    1. The config-specific ``<name>.local.yaml`` alongside ``config_path``.
+    2. A repository-wide ``configs/local.yaml``.
+    3. Any additional files listed in the ``FOCALDIFFUSION_LOCAL_CONFIG``
+       environment variable (separated by the OS path separator).
+
+    Later files take precedence via :func:`deep_merge`.
+    """
+
+    override_paths: List[Path] = []
+
+    specific_override = config_path.with_name(
+        f"{config_path.stem}.local{config_path.suffix}"
+    )
+    if specific_override.exists():
+        override_paths.append(specific_override)
+
+    repo_override = project_root / "configs" / "local.yaml"
+    if repo_override.exists():
+        override_paths.append(repo_override)
+
+    env_override = os.environ.get("FOCALDIFFUSION_LOCAL_CONFIG")
+    if env_override:
+        for chunk in env_override.split(os.pathsep):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            candidate = Path(chunk).expanduser()
+            if candidate.exists():
+                override_paths.append(candidate)
+            else:
+                logger.warning(
+                    "Local override config specified via FOCALDIFFUSION_LOCAL_CONFIG not found: %s",
+                    candidate,
+                )
+
+    overrides: List[Tuple[Path, dict]] = []
+    for path in override_paths:
+        try:
+            overrides.append((path, load_yaml_file(path) or {}))
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Failed to load local override %s: %s", path, exc)
+
+    return overrides
 
 
 def deep_merge(dict1: dict, dict2: dict) -> dict:
