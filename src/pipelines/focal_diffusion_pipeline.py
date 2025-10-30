@@ -117,6 +117,16 @@ class FocalInjectedSD3Transformer(nn.Module):
 class FocalDiffusionPipeline(StableDiffusion3Pipeline):
     """Stable Diffusion 3.5 pipeline that consumes focal stacks instead of text-only prompts."""
 
+    _optional_components = tuple(
+        dict.fromkeys(
+            (*getattr(StableDiffusion3Pipeline, "_optional_components", ()),
+             "focal_processor",
+             "camera_encoder",
+             "dual_decoder",
+            )
+        )
+    )
+
     _MODULE_ATTRS = (
         "vae",
         "text_encoder",
