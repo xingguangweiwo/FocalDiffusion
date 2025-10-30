@@ -279,6 +279,17 @@ class FocalDiffusionTrainer:
             dual_decoder=self.dual_decoder,
         )
 
+        # Ensure all components live on the accelerator device before training begins.
+        # DiffusionPipeline.to(...) moves every registered nn.Module, while keeping the
+        # object graph intact, so our existing references stay valid.
+        target_device = self.accelerator.device if hasattr(self, "accelerator") else torch.device("cpu")
+        self.pipeline.to(target_device)
+
+        # Refresh local handles in case the pipeline replaced any modules internally.
+        self.focal_processor = self.pipeline.focal_processor
+        self.camera_encoder = self.pipeline.camera_encoder
+        self.dual_decoder = self.pipeline.dual_decoder
+
         # Configure trainable parameters
         self._configure_trainable_params()
 

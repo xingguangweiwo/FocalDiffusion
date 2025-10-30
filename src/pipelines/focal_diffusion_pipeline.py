@@ -166,6 +166,18 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
             self.transformer = FocalInjectedSD3Transformer(self.transformer)
 
+        # Ensure diffusers tracks the newly attached modules so that calls to
+        # `pipeline.to(device)` migrate them alongside the base SD components.
+        # Without registering them, the focal stack processor (and friends)
+        # would remain on the CPU, which later causes device mismatches once
+        # the training batches are moved to the accelerator.
+        self.register_modules(
+            transformer=self.transformer,
+            focal_processor=self.focal_processor,
+            camera_encoder=self.camera_encoder,
+            dual_decoder=self.dual_decoder,
+        )
+
     def _iter_registered_modules(self):
         for attr in self._MODULE_ATTRS:
             module = getattr(self, attr, None)
