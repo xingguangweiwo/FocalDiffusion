@@ -117,6 +117,17 @@ class FocalInjectedSD3Transformer(nn.Module):
 class FocalDiffusionPipeline(StableDiffusion3Pipeline):
     """Stable Diffusion 3.5 pipeline that consumes focal stacks instead of text-only prompts."""
 
+    _MODULE_ATTRS = (
+        "vae",
+        "text_encoder",
+        "text_encoder_2",
+        "text_encoder_3",
+        "transformer",
+        "focal_processor",
+        "camera_encoder",
+        "dual_decoder",
+    )
+
     def __init__(
         self,
         vae: AutoencoderKL,
@@ -154,6 +165,53 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
             self.transformer = FocalInjectedSD3Transformer(self.transformer)
+
+        # Ensure diffusers tracks the newly attached modules so that calls to
+        # `pipeline.to(device)` migrate them alongside the base SD components.
+        # Without registering them, the focal stack processor (and friends)
+        # would remain on the CPU, which later causes device mismatches once
+        # the training batches are moved to the accelerator.
+        self.register_modules(
+            transformer=self.transformer,
+            focal_processor=self.focal_processor,
+            camera_encoder=self.camera_encoder,
+            dual_decoder=self.dual_decoder,
+        )
+
+    def _iter_registered_modules(self):
+        for attr in self._MODULE_ATTRS:
+            module = getattr(self, attr, None)
+            if module is None:
+                continue
+            # Some components (e.g. schedulers) are not nn.Module subclasses.
+            if isinstance(module, nn.Module):
+                yield attr, module
+
+    def parameters(self, recurse: bool = True):
+        """Yield parameters from every learnable submodule."""
+
+        for _, module in self._iter_registered_modules():
+            yield from module.parameters(recurse=recurse)
+
+    def named_parameters(self, prefix: str = "", recurse: bool = True):
+        """Yield named parameters, namespaced by component."""
+
+        for attr, module in self._iter_registered_modules():
+            component_prefix = f"{prefix}{attr}." if prefix else f"{attr}."
+            for name, param in module.named_parameters(prefix="", recurse=recurse):
+                yield component_prefix + name, param
+
+    def train(self, mode: bool = True):
+        """Set all registered modules to training or evaluation mode."""
+
+        for _, module in self._iter_registered_modules():
+            module.train(mode)
+        return self
+
+    def eval(self):
+        """Switch all registered modules to evaluation mode."""
+
+        return self.train(False)
 
     @torch.no_grad()
     def __call__(
