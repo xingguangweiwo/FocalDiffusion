@@ -4,3 +4,4 @@ __pycache__/
 *.ckpt
 outputs/
 wandb/
+configs/local*.yaml
