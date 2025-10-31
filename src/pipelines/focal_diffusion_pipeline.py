@@ -163,16 +163,23 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             if hasattr(internal, "pop"):
                 internal.pop(orphan, None)
 
-        base_optional = getattr(self, "_optional_components", ())
-        self._optional_components = tuple(
-            dict.fromkeys(
-                (
-                    *base_optional,
-                    "focal_processor",
-                    "camera_encoder",
-                    "dual_decoder",
-                )
-            )
+        base_optional = tuple(
+            name
+            for name in getattr(self, "_optional_components", ())
+            if name not in {"feature_extractor", "image_encoder"}
+        )
+        self._optional_components = base_optional + (
+            "focal_processor",
+            "camera_encoder",
+            "dual_decoder",
+        )
+
+        # Ensure the extended pipeline configuration tracks focal-specific components so
+        # serialization remains compatible with diffusers' component bookkeeping.
+        self.register_to_config(
+            focal_processor=None,
+            camera_encoder=None,
+            dual_decoder=None,
         )
 
         # Ensure the extended pipeline configuration tracks focal-specific components so
