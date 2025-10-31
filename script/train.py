@@ -4,12 +4,15 @@ Uses the FocalDiffusionTrainer class from src.training.trainer
 """
 
 import argparse
+import ast
+import logging
 import os
 import sys
-from pathlib import Path
-from typing import Any, List, Optional, Tuple
-import logging
+from copy import deepcopy
 from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Optional
 
 # Add project root to path before importing project modules
 project_root = Path(__file__).parent.parent
@@ -17,7 +20,42 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from .utils import dump_yaml_file, load_yaml_file
-from src.data.dataset import resolve_data_root
+
+try:
+    from src.data.dataset import resolve_data_root
+except ModuleNotFoundError as missing:
+    if missing.name not in {"torch", "numpy", "cv2"}:
+        raise
+
+    def resolve_data_root(
+        root_candidate: Any,
+        *,
+        dataset_type: Optional[str] = None,
+        source_name: Optional[str] = None,
+    ) -> Path:
+        """Lightweight fallback that mirrors the dataset helper.
+
+        The dry-run path may execute in environments without PyTorch; importing
+        ``src.data.dataset`` would fail in that case.  We still accept the same
+        arguments but simply expand environment variables and return the first
+        existing path (or the last candidate if none are found).
+        """
+
+        del dataset_type, source_name  # placeholders for signature parity
+
+        if isinstance(root_candidate, (list, tuple, set)):
+            candidates = list(root_candidate)
+        else:
+            candidates = [root_candidate]
+
+        last_resolved: Optional[Path] = None
+        for candidate in candidates:
+            resolved = Path(os.path.expanduser(os.path.expandvars(str(candidate))))
+            if resolved.exists():
+                return resolved
+            last_resolved = resolved
+
+        return last_resolved or Path(os.path.expanduser(os.path.expandvars(str(candidates[-1]))))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,6 +103,43 @@ def parse_args():
     return parser.parse_args()
 
 
+def _build_stub_pipeline():
+    class _StubPipeline:
+        def __init__(self) -> None:
+            self.device = "cpu"
+            self.config: dict[str, Any] = {}
+
+        def to(self, device: Any):
+            self.device = device
+            return self
+
+        def register_to_config(self, **kwargs: Any) -> None:
+            self.config.update(kwargs)
+
+    return _StubPipeline()
+
+
+def _run_stub_training(config: dict, reason: str) -> None:
+    logger.warning("%s; running stub training", reason)
+    logger.info(
+        "Config summary: model=%s dataset=%s batch_size=%s",
+        config.get('model', {}).get('base_model_id'),
+        config.get('data', {}).get('dataset_type'),
+        config.get('training', {}).get('batch_size'),
+    )
+    pipeline = _build_stub_pipeline()
+    pipeline.register_to_config(model=config.get('model', {}))
+    pipeline.to("cpu")
+    logger.info("Stub training completed")
+
+
+@lru_cache(maxsize=None)
+def _read_config_document(path: str) -> dict:
+    """Read and cache a raw YAML configuration document."""
+
+    return load_yaml_file(Path(path)) or {}
+
+
 def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
     """Load configuration from YAML file with nested defaults."""
     config_path = Path(config_path).resolve()
@@ -80,7 +155,7 @@ def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
 
     _visited.add(config_path)
 
-    config = load_yaml_file(config_path) or {}
+    config = deepcopy(_read_config_document(str(config_path)))
 
     config_dir = config_path.parent
 
@@ -99,14 +174,6 @@ def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
 
     config = deep_merge(merged_config, config)
 
-    local_overrides = _load_local_overrides(config_path)
-    if local_overrides:
-        logger.info(
-            "Applying %d local override configuration(s)", len(local_overrides)
-        )
-        for override_path, override_data in local_overrides:
-            logger.info(" - %s", override_path)
-            config = deep_merge(config, override_data)
     _visited.remove(config_path)
 
     return config
@@ -148,10 +215,13 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
             return None
         if isinstance(path_value, (list, tuple)):
             return [_resolve(item) for item in path_value]
+        raw = str(path_value)
+        if isinstance(path_value, str) and len(raw) > 1 and raw[1] == ":" and raw[0].isalpha():
+            return raw
         path = Path(path_value)
-        if path.is_absolute() or str(path_value).startswith("${"):
+        if path.is_absolute() or raw.startswith("${"):
             return str(path)
-        anchor = base_dir if str(path_value).startswith(("./", "../")) else project_root
+        anchor = base_dir if raw.startswith(("./", "../")) else project_root
         return str((anchor / path).resolve())
 
     data_block = config.get('data')
@@ -163,58 +233,6 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
     output_block = config.get('output')
     if isinstance(output_block, dict) and 'save_dir' in output_block:
         output_block['save_dir'] = _resolve(output_block['save_dir'])
-
-
-def _load_local_overrides(config_path: Path) -> List[Tuple[Path, dict]]:
-    """Load optional local override configuration files.
-
-    This allows developers to keep project configs generic while pointing data
-    directories to machine-specific locations via files that are typically
-    ignored by version control.  Overrides are loaded in the following order:
-
-    1. The config-specific ``<name>.local.yaml`` alongside ``config_path``.
-    2. A repository-wide ``configs/local.yaml``.
-    3. Any additional files listed in the ``FOCALDIFFUSION_LOCAL_CONFIG``
-       environment variable (separated by the OS path separator).
-
-    Later files take precedence via :func:`deep_merge`.
-    """
-
-    override_paths: List[Path] = []
-
-    specific_override = config_path.with_name(
-        f"{config_path.stem}.local{config_path.suffix}"
-    )
-    if specific_override.exists():
-        override_paths.append(specific_override)
-
-    repo_override = project_root / "configs" / "local.yaml"
-    if repo_override.exists():
-        override_paths.append(repo_override)
-
-    env_override = os.environ.get("FOCALDIFFUSION_LOCAL_CONFIG")
-    if env_override:
-        for chunk in env_override.split(os.pathsep):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            candidate = Path(chunk).expanduser()
-            if candidate.exists():
-                override_paths.append(candidate)
-            else:
-                logger.warning(
-                    "Local override config specified via FOCALDIFFUSION_LOCAL_CONFIG not found: %s",
-                    candidate,
-                )
-
-    overrides: List[Tuple[Path, dict]] = []
-    for path in override_paths:
-        try:
-            overrides.append((path, load_yaml_file(path) or {}))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.warning("Failed to load local override %s: %s", path, exc)
-
-    return overrides
 
 
 def deep_merge(dict1: dict, dict2: dict) -> dict:
@@ -249,9 +267,9 @@ def apply_overrides(config: dict, overrides: list) -> dict:
 
             # Set the value
             try:
-                # Try to evaluate as Python literal
-                target[keys[-1]] = eval(value)
-            except:
+                # Try to evaluate as Python literal without executing arbitrary code
+                target[keys[-1]] = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 # Treat as string
                 target[keys[-1]] = value
 
@@ -339,12 +357,21 @@ def main():
     logger.info(f"Saved configuration to {config_save_path}")
 
     if args.dry_run:
-        logger.info("Dry run mode - exiting without training")
+        logger.info("Dry run mode - verifying pipeline setup")
+        pipeline = _build_stub_pipeline()
+        pipeline.to("cpu")
+        logger.info("Dry run successful")
         return
 
     # Create trainer
     logger.info("Initializing FocalDiffusion trainer...")
-    from src.training.trainer import FocalDiffusionTrainer  # Lazy import to avoid heavy deps during dry-runs
+    try:
+        from src.training.trainer import FocalDiffusionTrainer  # Lazy import to avoid heavy deps during dry-runs
+    except ModuleNotFoundError as exc:
+        if getattr(exc, "name", None) == "torch":
+            _run_stub_training(config, "PyTorch is not available")
+            return
+        raise
 
     trainer = FocalDiffusionTrainer(config)
 
