@@ -182,6 +182,14 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             dual_decoder=None,
         )
 
+        # Ensure the extended pipeline configuration tracks focal-specific components so
+        # serialization remains compatible with diffusers' component bookkeeping.
+        self.register_to_config(
+            focal_processor=None,
+            camera_encoder=None,
+            dual_decoder=None,
+        )
+
         self.focal_processor = focal_processor or FocalStackProcessor()
         self.camera_encoder = camera_encoder or CameraInvariantEncoder()
         self.dual_decoder = dual_decoder or DualOutputDecoder(
