@@ -229,6 +229,17 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         return components
 
+    def to(self, *args, **kwargs):  # type: ignore[override]
+        """Move every registered module to the requested device/dtype."""
+
+        super().to(*args, **kwargs)
+
+        for _, module in self._iter_registered_modules():
+            if isinstance(module, nn.Module):
+                module.to(*args, **kwargs)
+
+        return self
+
     def _iter_registered_modules(self):
         for attr in self._MODULE_ATTRS:
             module = getattr(self, attr, None)
