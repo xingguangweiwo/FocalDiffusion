@@ -68,6 +68,7 @@ class FocalInjectedSD3Transformer(nn.Module):
             num_heads=self.config.num_attention_heads,
             head_dim=self.config.attention_head_dim,
         )
+        self.dtype = getattr(base_transformer, "dtype", torch.float32)
 
     def __getattr__(self, name: str) -> Any:
         # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
@@ -155,18 +156,30 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             scheduler=scheduler,
         )
 
-        base_optional = getattr(self, "_optional_components", ())
-        self._optional_components = tuple(
-            dict.fromkeys(
-                (
-                    *base_optional,
-                    "feature_extractor",
-                    "image_encoder",
-                    "focal_processor",
-                    "camera_encoder",
-                    "dual_decoder",
-                )
-            )
+        for orphan in ("feature_extractor", "image_encoder"):
+            if hasattr(self.config, orphan):
+                delattr(self.config, orphan)
+            internal = getattr(self.config, "_internal_dict", None)
+            if hasattr(internal, "pop"):
+                internal.pop(orphan, None)
+
+        base_optional = tuple(
+            name
+            for name in getattr(self, "_optional_components", ())
+            if name not in {"feature_extractor", "image_encoder"}
+        )
+        self._optional_components = base_optional + (
+            "focal_processor",
+            "camera_encoder",
+            "dual_decoder",
+        )
+
+        # Ensure the extended pipeline configuration tracks focal-specific components so
+        # serialization remains compatible with diffusers' component bookkeeping.
+        self.register_to_config(
+            focal_processor=None,
+            camera_encoder=None,
+            dual_decoder=None,
         )
 
         self.focal_processor = focal_processor or FocalStackProcessor()
@@ -191,6 +204,13 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             camera_encoder=self.camera_encoder,
             dual_decoder=self.dual_decoder,
         )
+
+    @property
+    def components(self):  # type: ignore[override]
+        components = dict(super().components)  # type: ignore[misc]
+        components.pop("feature_extractor", None)
+        components.pop("image_encoder", None)
+        return components
 
     def _iter_registered_modules(self):
         for attr in self._MODULE_ATTRS:
