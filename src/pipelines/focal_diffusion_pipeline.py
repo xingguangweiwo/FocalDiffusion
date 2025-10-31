@@ -182,14 +182,6 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             dual_decoder=None,
         )
 
-        # Ensure the extended pipeline configuration tracks focal-specific components so
-        # serialization remains compatible with diffusers' component bookkeeping.
-        self.register_to_config(
-            focal_processor=None,
-            camera_encoder=None,
-            dual_decoder=None,
-        )
-
         self.focal_processor = focal_processor or FocalStackProcessor()
         self.camera_encoder = camera_encoder or CameraInvariantEncoder()
         self.dual_decoder = dual_decoder or DualOutputDecoder(
@@ -215,9 +207,26 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
     @property
     def components(self):  # type: ignore[override]
-        components = dict(super().components)  # type: ignore[misc]
-        components.pop("feature_extractor", None)
-        components.pop("image_encoder", None)
+        """Return the active pipeline components without SD3's unused optional slots."""
+
+        components = {
+            "vae": self.vae,
+            "text_encoder": self.text_encoder,
+            "text_encoder_2": self.text_encoder_2,
+            "transformer": self.transformer,
+            "scheduler": self.scheduler,
+            "tokenizer": self.tokenizer,
+            "tokenizer_2": self.tokenizer_2,
+            "focal_processor": self.focal_processor,
+            "camera_encoder": self.camera_encoder,
+            "dual_decoder": self.dual_decoder,
+        }
+
+        if getattr(self, "text_encoder_3", None) is not None:
+            components["text_encoder_3"] = self.text_encoder_3
+        if getattr(self, "tokenizer_3", None) is not None:
+            components["tokenizer_3"] = self.tokenizer_3
+
         return components
 
     def _iter_registered_modules(self):
