@@ -575,19 +575,19 @@ class FocalDiffusionTrainer:
 
                 # Sample noise for diffusion training
                 noise = torch.randn_like(latents)
-                timesteps = torch.randint(
-                    0,
-                    self.pipeline.scheduler.config.num_train_timesteps,
-                    (latents.shape[0],),
-                    device=device,
-                    dtype=torch.long
-                )
 
-                if hasattr(self.pipeline.scheduler, "add_noise"):
-                    noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timesteps)
-                elif hasattr(self.pipeline.scheduler, "scale_noise"):
-                    scheduler = self.pipeline.scheduler
+                scheduler = self.pipeline.scheduler
 
+                if hasattr(scheduler, "add_noise"):
+                    timesteps = torch.randint(
+                        0,
+                        scheduler.config.num_train_timesteps,
+                        (latents.shape[0],),
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+                elif hasattr(scheduler, "scale_noise"):
                     timesteps_attr = getattr(scheduler, "timesteps", None)
                     needs_timesteps = timesteps_attr is None
                     if not needs_timesteps:
@@ -610,14 +610,33 @@ class FocalDiffusionTrainer:
                                 " to initialize the training timestep schedule."
                             )
 
-                        scheduler.set_timesteps(num_train_timesteps, device=device, dtype=latents.dtype)
-
+                        scheduler.set_timesteps(num_train_timesteps, device=device)
                         timesteps_attr = getattr(scheduler, "timesteps", None)
-                        if timesteps_attr is None or (hasattr(timesteps_attr, "__len__") and len(timesteps_attr) == 0):
-                            raise RuntimeError(
-                                "Failed to initialize scheduler timesteps for scale_noise training."
-                            )
 
+                    if timesteps_attr is None:
+                        raise RuntimeError(
+                            "Failed to initialize scheduler timesteps for scale_noise training."
+                        )
+
+                    if not torch.is_tensor(timesteps_attr):
+                        schedule_timesteps = torch.as_tensor(timesteps_attr, device=device)
+                    else:
+                        schedule_timesteps = timesteps_attr.to(device=device)
+
+                    if schedule_timesteps.ndim != 1 or schedule_timesteps.numel() == 0:
+                        raise RuntimeError(
+                            "Scheduler timesteps must be a 1D tensor with at least one entry to"
+                            " perform scale_noise training."
+                        )
+
+                    step_indices = torch.randint(
+                        0,
+                        schedule_timesteps.shape[0],
+                        (latents.shape[0],),
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    timesteps = schedule_timesteps.index_select(0, step_indices)
                     noisy_latents = scheduler.scale_noise(latents, timesteps, noise)
                 else:
                     raise AttributeError(
