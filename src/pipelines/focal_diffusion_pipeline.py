@@ -68,6 +68,7 @@ class FocalInjectedSD3Transformer(nn.Module):
             num_heads=self.config.num_attention_heads,
             head_dim=self.config.attention_head_dim,
         )
+        self.dtype = getattr(base_transformer, "dtype", torch.float32)
 
     def __getattr__(self, name: str) -> Any:
         # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
@@ -155,18 +156,30 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             scheduler=scheduler,
         )
 
-        base_optional = getattr(self, "_optional_components", ())
-        self._optional_components = tuple(
-            dict.fromkeys(
-                (
-                    *base_optional,
-                    "feature_extractor",
-                    "image_encoder",
-                    "focal_processor",
-                    "camera_encoder",
-                    "dual_decoder",
-                )
-            )
+        for orphan in ("feature_extractor", "image_encoder"):
+            if hasattr(self.config, orphan):
+                delattr(self.config, orphan)
+            internal = getattr(self.config, "_internal_dict", None)
+            if hasattr(internal, "pop"):
+                internal.pop(orphan, None)
+
+        base_optional = tuple(
+            name
+            for name in getattr(self, "_optional_components", ())
+            if name not in {"feature_extractor", "image_encoder"}
+        )
+        self._optional_components = base_optional + (
+            "focal_processor",
+            "camera_encoder",
+            "dual_decoder",
+        )
+
+        # Ensure the extended pipeline configuration tracks focal-specific components so
+        # serialization remains compatible with diffusers' component bookkeeping.
+        self.register_to_config(
+            focal_processor=None,
+            camera_encoder=None,
+            dual_decoder=None,
         )
 
         self.focal_processor = focal_processor or FocalStackProcessor()
@@ -191,6 +204,41 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             camera_encoder=self.camera_encoder,
             dual_decoder=self.dual_decoder,
         )
+
+    @property
+    def components(self):  # type: ignore[override]
+        """Return the active pipeline components without SD3's unused optional slots."""
+
+        components = {
+            "vae": self.vae,
+            "text_encoder": self.text_encoder,
+            "text_encoder_2": self.text_encoder_2,
+            "transformer": self.transformer,
+            "scheduler": self.scheduler,
+            "tokenizer": self.tokenizer,
+            "tokenizer_2": self.tokenizer_2,
+            "focal_processor": self.focal_processor,
+            "camera_encoder": self.camera_encoder,
+            "dual_decoder": self.dual_decoder,
+        }
+
+        if getattr(self, "text_encoder_3", None) is not None:
+            components["text_encoder_3"] = self.text_encoder_3
+        if getattr(self, "tokenizer_3", None) is not None:
+            components["tokenizer_3"] = self.tokenizer_3
+
+        return components
+
+    def to(self, *args, **kwargs):  # type: ignore[override]
+        """Move every registered module to the requested device/dtype."""
+
+        super().to(*args, **kwargs)
+
+        for _, module in self._iter_registered_modules():
+            if isinstance(module, nn.Module):
+                module.to(*args, **kwargs)
+
+        return self
 
     def _iter_registered_modules(self):
         for attr in self._MODULE_ATTRS:
