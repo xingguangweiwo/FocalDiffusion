@@ -583,7 +583,47 @@ class FocalDiffusionTrainer:
                     dtype=torch.long
                 )
 
-                noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timesteps)
+                if hasattr(self.pipeline.scheduler, "add_noise"):
+                    noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timesteps)
+                elif hasattr(self.pipeline.scheduler, "scale_noise"):
+                    scheduler = self.pipeline.scheduler
+
+                    timesteps_attr = getattr(scheduler, "timesteps", None)
+                    needs_timesteps = timesteps_attr is None
+                    if not needs_timesteps:
+                        try:
+                            needs_timesteps = len(timesteps_attr) == 0  # type: ignore[arg-type]
+                        except TypeError:
+                            needs_timesteps = False
+
+                    if needs_timesteps:
+                        if not hasattr(scheduler, "set_timesteps"):
+                            raise AttributeError(
+                                "The active scheduler exposes `scale_noise` but does not provide"
+                                " `set_timesteps`, preventing training-time noise scaling."
+                            )
+
+                        num_train_timesteps = getattr(scheduler.config, "num_train_timesteps", None)
+                        if num_train_timesteps is None:
+                            raise AttributeError(
+                                "Scheduler is missing `config.num_train_timesteps`, which is required"
+                                " to initialize the training timestep schedule."
+                            )
+
+                        scheduler.set_timesteps(num_train_timesteps, device=device, dtype=latents.dtype)
+
+                        timesteps_attr = getattr(scheduler, "timesteps", None)
+                        if timesteps_attr is None or (hasattr(timesteps_attr, "__len__") and len(timesteps_attr) == 0):
+                            raise RuntimeError(
+                                "Failed to initialize scheduler timesteps for scale_noise training."
+                            )
+
+                    noisy_latents = scheduler.scale_noise(latents, timesteps, noise)
+                else:
+                    raise AttributeError(
+                        "The active scheduler does not implement `add_noise` or `scale_noise`,"
+                        " which are required for forward diffusion during training."
+                    )
                 if hasattr(self.pipeline.scheduler, "scale_model_input"):
                     model_input = self.pipeline.scheduler.scale_model_input(noisy_latents, timesteps)
                 else:
