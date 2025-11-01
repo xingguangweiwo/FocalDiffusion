@@ -583,7 +583,15 @@ class FocalDiffusionTrainer:
                     dtype=torch.long
                 )
 
-                noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timesteps)
+                if hasattr(self.pipeline.scheduler, "add_noise"):
+                    noisy_latents = self.pipeline.scheduler.add_noise(latents, noise, timesteps)
+                elif hasattr(self.pipeline.scheduler, "scale_noise"):
+                    noisy_latents = self.pipeline.scheduler.scale_noise(latents, timesteps, noise)
+                else:
+                    raise AttributeError(
+                        "The active scheduler does not implement `add_noise` or `scale_noise`,"
+                        " which are required for forward diffusion during training."
+                    )
                 if hasattr(self.pipeline.scheduler, "scale_model_input"):
                     model_input = self.pipeline.scheduler.scale_model_input(noisy_latents, timesteps)
                 else:
