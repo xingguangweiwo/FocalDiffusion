@@ -399,6 +399,16 @@ class FocalDiffusionTrainer:
             self.lr_scheduler
         )
 
+        try:
+            from ..pipelines import FocalInjectedSD3Transformer
+
+            unwrapped = self.accelerator.unwrap_model(self.pipeline)
+            transformer = getattr(unwrapped, "transformer", None)
+            if isinstance(transformer, FocalInjectedSD3Transformer):
+                _ = transformer.base_transformer
+        except (ImportError, AttributeError):
+            pass
+
         # Setup gradient scaler for mixed precision
         self.scaler = GradScaler() if self.config['training']['mixed_precision'] == 'fp16' else None
 

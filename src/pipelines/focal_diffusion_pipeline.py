@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -61,18 +61,55 @@ class FocalInjectedSD3Transformer(nn.Module):
     def __init__(self, base_transformer: SD3Transformer2DModel) -> None:
         super().__init__()
         self.base_transformer = base_transformer
-        self.config = base_transformer.config
+        base = self.base_transformer
+        self.config = base.config
         hidden_size = self.config.attention_head_dim * self.config.num_attention_heads
         self.focal_attn = FocalCrossAttention(
             hidden_size=hidden_size,
             num_heads=self.config.num_attention_heads,
             head_dim=self.config.attention_head_dim,
         )
-        self.dtype = getattr(base_transformer, "dtype", torch.float32)
+        self.dtype = getattr(base, "dtype", torch.float32)
+
+    @property
+    def base_transformer(self) -> SD3Transformer2DModel:
+        """Return the wrapped SD3 transformer, restoring it if Accelerate detached it."""
+
+        base = self._modules.get("base_transformer")  # type: ignore[attr-defined]
+        if base is not None:
+            return cast(SD3Transformer2DModel, base)
+
+        base = getattr(self, "_base_transformer_ref", None)
+        if base is None:
+            raise AttributeError(
+                "FocalInjectedSD3Transformer is missing its base transformer. "
+                "Re-wrap the SD3 transformer by calling `attach_base_transformer`."
+            )
+
+        self.attach_base_transformer(base)
+        return cast(SD3Transformer2DModel, self._modules["base_transformer"])  # type: ignore[attr-defined]
+
+    @base_transformer.setter
+    def base_transformer(self, module: SD3Transformer2DModel) -> None:
+        if not isinstance(module, SD3Transformer2DModel):
+            raise TypeError(
+                "FocalInjectedSD3Transformer expects an SD3Transformer2DModel, "
+                f"but received {type(module)!r}."
+            )
+
+        super().__setattr__("base_transformer", module)
+        super().__setattr__("_base_transformer_ref", module)
+        super().__setattr__("config", module.config)
+        super().__setattr__("dtype", getattr(module, "dtype", torch.float32))
+
+    def attach_base_transformer(self, module: SD3Transformer2DModel) -> None:
+        """Explicitly (re)attach the wrapped SD3 transformer."""
+
+        self.base_transformer = module
 
     def __getattr__(self, name: str) -> Any:
         # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
-        if name in {"base_transformer", "focal_attn", "config"}:
+        if name in {"base_transformer", "focal_attn", "config", "_base_transformer_ref"}:
             return super().__getattribute__(name)
         return getattr(self.base_transformer, name)
 
@@ -86,7 +123,8 @@ class FocalInjectedSD3Transformer(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[Transformer2DModelOutput, Tuple[torch.Tensor]]:
-        result = self.base_transformer.forward(
+        base = self.base_transformer
+        result = base.forward(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
@@ -192,6 +230,8 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
             self.transformer = FocalInjectedSD3Transformer(self.transformer)
+        else:
+            _ = self.transformer.base_transformer
 
         # Ensure diffusers tracks the newly attached modules so that calls to
         # `pipeline.to(device)` migrate them alongside the base SD components.
