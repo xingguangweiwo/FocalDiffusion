@@ -10,7 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -50,8 +50,9 @@ class FocalStackDataset(Dataset):
         simulator_kwargs: Optional[Dict[str, float]] = None,
         depth_bounds: Optional[Tuple[float, float]] = None,
     ) -> None:
-        resolved_root = Path(os.path.expanduser(os.path.expandvars(str(data_root))))
-        self.data_root = resolved_root
+        self.data_roots = self._normalise_root_map(data_root)
+        default_candidates = self._select_root_candidates("default")
+        self.data_root = default_candidates[0]
         self.image_size = image_size
         self.focal_stack_size = focal_stack_size
         self.focal_range = focal_range
@@ -89,11 +90,81 @@ class FocalStackDataset(Dataset):
             self._simulator = FocalStackSimulator(**self.simulator_kwargs)
         return self._simulator
 
-    def _resolve_path(self, path_like: Union[str, Path]) -> Path:
+    _ROOT_ALIASES: Mapping[str, Tuple[str, ...]] = {
+        "default": ("default", "all_in_focus", "focal_stack", "depth"),
+        "all_in_focus": ("all_in_focus", "rgb", "images", "aif", "focal_stack", "default"),
+        "focal_stack": ("focal_stack", "stack", "rgb", "images", "all_in_focus", "default"),
+        "depth": ("depth", "depth_map", "disparity", "default"),
+    }
+
+    def _normalise_root_map(
+        self, data_root: Union[str, Path, Mapping[str, Any], Sequence[Any]]
+    ) -> Dict[str, Tuple[Path, ...]]:
+        """Normalise the configured data roots into a dictionary of path tuples."""
+
+        def _expand_path(candidate: Union[str, Path]) -> Path:
+            raw = Path(os.path.expanduser(os.path.expandvars(str(candidate))))
+            return raw
+
+        def _as_paths(candidate: Any) -> Tuple[Path, ...]:
+            if isinstance(candidate, (list, tuple, set)):
+                paths = tuple(_expand_path(item) for item in candidate)
+            else:
+                paths = (_expand_path(candidate),)
+            if not paths:
+                raise ValueError("data_root candidate list must not be empty")
+            return paths
+
+        if isinstance(data_root, Mapping):
+            root_map: Dict[str, Tuple[Path, ...]] = {}
+            for raw_key, value in data_root.items():
+                key = str(raw_key).lower()
+                root_map[key] = _as_paths(value)
+
+            if "default" not in root_map and root_map:
+                fallback_key = next(
+                    (alias for alias in ("all_in_focus", "focal_stack", "depth") if alias in root_map),
+                    None,
+                )
+                if fallback_key:
+                    root_map["default"] = root_map[fallback_key]
+            return root_map
+
+        default_paths = _as_paths(data_root)
+        return {"default": default_paths}
+
+    def _select_root_candidates(self, kind: str) -> Tuple[Path, ...]:
+        key = kind.lower()
+        if key in self.data_roots:
+            return self.data_roots[key]
+        alias_candidates = self._ROOT_ALIASES.get(key, ())
+        for alias in alias_candidates:
+            if alias in self.data_roots:
+                return self.data_roots[alias]
+        return self.data_roots.get("default", next(iter(self.data_roots.values())))
+
+    def _resolve_path(self, path_like: Union[str, Path], *, kind: str = "default") -> Path:
         path = Path(path_like)
-        if not path.is_absolute():
-            path = self.data_root / path
-        return path
+        if path.is_absolute():
+            return path
+
+        base_candidates = self._select_root_candidates(kind)
+        last_candidate: Optional[Path] = None
+
+        for base in base_candidates:
+            candidate = base / path
+            if candidate.exists():
+                return candidate
+            last_candidate = candidate
+
+            # Handle roots that already point at a specific scene (e.g. Scene01)
+            if path.parts and base.name.lower() == path.parts[0].lower():
+                trimmed = base / Path(*path.parts[1:])
+                if trimmed.exists():
+                    return trimmed
+                last_candidate = trimmed
+
+        return last_candidate or base_candidates[0] / path
 
     # ---------------------------------------------------------------------
     # File list handling
@@ -289,7 +360,7 @@ class FocalStackDataset(Dataset):
     ) -> torch.Tensor:
         path = sample_info.get("all_in_focus")
         if path:
-            return self._load_image(self._resolve_path(path))
+            return self._load_image(self._resolve_path(path, kind="all_in_focus"))
         if fallback is not None:
             return self._generate_all_in_focus(fallback)
         raise ValueError(
@@ -308,7 +379,7 @@ class FocalStackDataset(Dataset):
         if not dir_key:
             raise ValueError("Sample must include a focal_stack_dir when not generating")
 
-        scene_dir = self._resolve_path(dir_key)
+        scene_dir = self._resolve_path(dir_key, kind="focal_stack")
         if not scene_dir.exists():
             raise FileNotFoundError(f"Focal stack directory {scene_dir} does not exist")
 
@@ -388,7 +459,7 @@ class FocalStackDataset(Dataset):
         return params
 
     def _load_depth(self, sample_info: Dict) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        depth_path = self._resolve_path(sample_info["depth_path"])
+        depth_path = self._resolve_path(sample_info["depth_path"], kind="depth")
 
         if not depth_path.exists():
             rel_hint = sample_info.get("depth_path")
@@ -719,6 +790,41 @@ def _resolve_single_data_root_candidate(
     return resolved_default, True
 
 
+def _prepare_root_override(
+    root_override: Any,
+    *,
+    dataset_type: Optional[str] = None,
+    source_name: Optional[str] = None,
+) -> Any:
+    """Recursively resolve dataset root overrides for dataloader construction."""
+
+    if isinstance(root_override, Mapping):
+        return {
+            str(key).lower(): _prepare_root_override(
+                value,
+                dataset_type=dataset_type,
+                source_name=f"{source_name}.{key}" if source_name else str(key),
+            )
+            for key, value in root_override.items()
+        }
+
+    if isinstance(root_override, (list, tuple, set)):
+        return [
+            resolve_data_root(
+                candidate,
+                dataset_type=dataset_type,
+                source_name=source_name,
+            )
+            for candidate in root_override
+        ]
+
+    return resolve_data_root(
+        root_override,
+        dataset_type=dataset_type,
+        source_name=source_name,
+    )
+
+
 def create_dataloader(
     dataset_type: Optional[str] = None,
     filelist_path: Optional[Union[str, Path]] = None,
@@ -755,9 +861,8 @@ def create_dataloader(
         merged_kwargs = dict(dataset_kwargs)
         merged_kwargs.update(source_kwargs.get("dataset_kwargs", {}))
 
-        root_override = source_kwargs.get("data_root", data_root)
-        root_override = resolve_data_root(
-            root_override,
+        root_override = _prepare_root_override(
+            source_kwargs.get("data_root", data_root),
             dataset_type=dataset_type,
             source_name=source_kwargs.get("name"),
         )
