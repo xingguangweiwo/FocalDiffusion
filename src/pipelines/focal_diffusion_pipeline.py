@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -61,17 +61,55 @@ class FocalInjectedSD3Transformer(nn.Module):
     def __init__(self, base_transformer: SD3Transformer2DModel) -> None:
         super().__init__()
         self.base_transformer = base_transformer
-        self.config = base_transformer.config
+        base = self.base_transformer
+        self.config = base.config
         hidden_size = self.config.attention_head_dim * self.config.num_attention_heads
         self.focal_attn = FocalCrossAttention(
             hidden_size=hidden_size,
             num_heads=self.config.num_attention_heads,
             head_dim=self.config.attention_head_dim,
         )
+        self.dtype = getattr(base, "dtype", torch.float32)
+
+    @property
+    def base_transformer(self) -> SD3Transformer2DModel:
+        """Return the wrapped SD3 transformer, restoring it if Accelerate detached it."""
+
+        base = self._modules.get("base_transformer")  # type: ignore[attr-defined]
+        if base is not None:
+            return cast(SD3Transformer2DModel, base)
+
+        base = getattr(self, "_base_transformer_ref", None)
+        if base is None:
+            raise AttributeError(
+                "FocalInjectedSD3Transformer is missing its base transformer. "
+                "Re-wrap the SD3 transformer by calling `attach_base_transformer`."
+            )
+
+        self.attach_base_transformer(base)
+        return cast(SD3Transformer2DModel, self._modules["base_transformer"])  # type: ignore[attr-defined]
+
+    @base_transformer.setter
+    def base_transformer(self, module: SD3Transformer2DModel) -> None:
+        if not isinstance(module, SD3Transformer2DModel):
+            raise TypeError(
+                "FocalInjectedSD3Transformer expects an SD3Transformer2DModel, "
+                f"but received {type(module)!r}."
+            )
+
+        super().__setattr__("base_transformer", module)
+        super().__setattr__("_base_transformer_ref", module)
+        super().__setattr__("config", module.config)
+        super().__setattr__("dtype", getattr(module, "dtype", torch.float32))
+
+    def attach_base_transformer(self, module: SD3Transformer2DModel) -> None:
+        """Explicitly (re)attach the wrapped SD3 transformer."""
+
+        self.base_transformer = module
 
     def __getattr__(self, name: str) -> Any:
         # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
-        if name in {"base_transformer", "focal_attn", "config"}:
+        if name in {"base_transformer", "focal_attn", "config", "_base_transformer_ref"}:
             return super().__getattribute__(name)
         return getattr(self.base_transformer, name)
 
@@ -85,7 +123,8 @@ class FocalInjectedSD3Transformer(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[Transformer2DModelOutput, Tuple[torch.Tensor]]:
-        result = self.base_transformer.forward(
+        base = self.base_transformer
+        result = base.forward(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
@@ -155,18 +194,30 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             scheduler=scheduler,
         )
 
-        base_optional = getattr(self, "_optional_components", ())
-        self._optional_components = tuple(
-            dict.fromkeys(
-                (
-                    *base_optional,
-                    "feature_extractor",
-                    "image_encoder",
-                    "focal_processor",
-                    "camera_encoder",
-                    "dual_decoder",
-                )
-            )
+        for orphan in ("feature_extractor", "image_encoder"):
+            if hasattr(self.config, orphan):
+                delattr(self.config, orphan)
+            internal = getattr(self.config, "_internal_dict", None)
+            if hasattr(internal, "pop"):
+                internal.pop(orphan, None)
+
+        base_optional = tuple(
+            name
+            for name in getattr(self, "_optional_components", ())
+            if name not in {"feature_extractor", "image_encoder"}
+        )
+        self._optional_components = base_optional + (
+            "focal_processor",
+            "camera_encoder",
+            "dual_decoder",
+        )
+
+        # Ensure the extended pipeline configuration tracks focal-specific components so
+        # serialization remains compatible with diffusers' component bookkeeping.
+        self.register_to_config(
+            focal_processor=None,
+            camera_encoder=None,
+            dual_decoder=None,
         )
 
         self.focal_processor = focal_processor or FocalStackProcessor()
@@ -179,6 +230,8 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
             self.transformer = FocalInjectedSD3Transformer(self.transformer)
+        else:
+            _ = self.transformer.base_transformer
 
         # Ensure diffusers tracks the newly attached modules so that calls to
         # `pipeline.to(device)` migrate them alongside the base SD components.
@@ -191,6 +244,41 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             camera_encoder=self.camera_encoder,
             dual_decoder=self.dual_decoder,
         )
+
+    @property
+    def components(self):  # type: ignore[override]
+        """Return the active pipeline components without SD3's unused optional slots."""
+
+        components = {
+            "vae": self.vae,
+            "text_encoder": self.text_encoder,
+            "text_encoder_2": self.text_encoder_2,
+            "transformer": self.transformer,
+            "scheduler": self.scheduler,
+            "tokenizer": self.tokenizer,
+            "tokenizer_2": self.tokenizer_2,
+            "focal_processor": self.focal_processor,
+            "camera_encoder": self.camera_encoder,
+            "dual_decoder": self.dual_decoder,
+        }
+
+        if getattr(self, "text_encoder_3", None) is not None:
+            components["text_encoder_3"] = self.text_encoder_3
+        if getattr(self, "tokenizer_3", None) is not None:
+            components["tokenizer_3"] = self.tokenizer_3
+
+        return components
+
+    def to(self, *args, **kwargs):  # type: ignore[override]
+        """Move every registered module to the requested device/dtype."""
+
+        super().to(*args, **kwargs)
+
+        for _, module in self._iter_registered_modules():
+            if isinstance(module, nn.Module):
+                module.to(*args, **kwargs)
+
+        return self
 
     def _iter_registered_modules(self):
         for attr in self._MODULE_ATTRS:

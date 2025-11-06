@@ -106,7 +106,7 @@ class _MiniYAMLParser:
                 value_text = line.content[2:].strip()
                 if value_text:
                     index += 1
-                    if ":" in value_text:
+                    if ": " in value_text or value_text.endswith(":"):
                         inline_key, inline_remainder = value_text.split(":", 1)
                         inline_mapping: dict[str, Any] = {
                             inline_key.strip(): self._parse_scalar(inline_remainder.strip())
