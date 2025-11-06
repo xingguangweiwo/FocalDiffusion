@@ -60,6 +60,13 @@ except ModuleNotFoundError as missing:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+SUPPORTED_DATASET_TYPES = {
+    "",
+    "filelist",
+    "hypersim",
+    "virtual_kitti",
+}
+
 
 def parse_args():
     """Parse command line arguments"""
@@ -98,6 +105,36 @@ def parse_args():
         '--dry-run',
         action='store_true',
         help='Run without actually training (for testing setup)'
+    )
+
+    parser.add_argument(
+        '--data-root',
+        type=str,
+        help='Override the dataset root directory defined in the config',
+    )
+
+    parser.add_argument(
+        '--train-filelist',
+        type=str,
+        help='Override the training file list path defined in the config',
+    )
+
+    parser.add_argument(
+        '--val-filelist',
+        type=str,
+        help='Override the validation file list path defined in the config',
+    )
+
+    parser.add_argument(
+        '--test-filelist',
+        type=str,
+        help='Override the test file list path defined in the config',
+    )
+
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        help='Override the run output directory defined in the config',
     )
 
     return parser.parse_args()
@@ -281,6 +318,27 @@ def apply_overrides(config: dict, overrides: list) -> dict:
     return config
 
 
+def apply_path_overrides(config: dict, args: argparse.Namespace) -> dict:
+    """Apply explicit CLI path overrides for datasets and outputs."""
+
+    data_cfg = config.setdefault('data', {})
+    output_cfg = config.setdefault('output', {})
+
+    def _set_path(block: dict, key: str, value: Optional[str]) -> None:
+        if not value:
+            return
+        block[key] = value
+        logger.info("Override: %s = %s", key, value)
+
+    _set_path(data_cfg, 'data_root', getattr(args, 'data_root', None))
+    _set_path(data_cfg, 'train_filelist', getattr(args, 'train_filelist', None))
+    _set_path(data_cfg, 'val_filelist', getattr(args, 'val_filelist', None))
+    _set_path(data_cfg, 'test_filelist', getattr(args, 'test_filelist', None))
+    _set_path(output_cfg, 'save_dir', getattr(args, 'output_dir', None))
+
+    return config
+
+
 def validate_config(config: dict) -> None:
     """Validate configuration"""
     required_keys = [
@@ -289,6 +347,7 @@ def validate_config(config: dict) -> None:
         'data.data_root',
         'data.train_filelist',
         'data.val_filelist',
+        'data.test_filelist',
         'training.num_epochs',
         'training.batch_size',
         'optimizer.learning_rate',
@@ -304,10 +363,17 @@ def validate_config(config: dict) -> None:
                 raise ValueError(f"Missing required config key: {key_path}")
             value = value[key]
 
+    dataset_type_raw = str(config['data'].get('dataset_type', '') or '').lower()
+    if dataset_type_raw not in SUPPORTED_DATASET_TYPES:
+        raise ValueError(
+            "Unsupported data.dataset_type '%s'. Supported values are: %s"
+            % (dataset_type_raw, ", ".join(sorted(t for t in SUPPORTED_DATASET_TYPES if t))),
+        )
+
     # Check paths exist
     resolved_data_root = resolve_data_root(
         config['data']['data_root'],
-        dataset_type=config['data'].get('dataset_type'),
+        dataset_type=dataset_type_raw or None,
     )
 
     if not resolved_data_root.exists():
@@ -318,6 +384,12 @@ def validate_config(config: dict) -> None:
     # Persist the resolved path back into the config so downstream components use
     # the same location that was validated here.
     config['data']['data_root'] = str(resolved_data_root)
+
+    # Ensure filelists exist and give actionable warnings
+    for key in ('train_filelist', 'val_filelist', 'test_filelist'):
+        filelist_path = Path(config['data'][key])
+        if not filelist_path.exists():
+            logger.warning("Config filelist %s does not exist: %s", key, filelist_path)
 
     # Create output directory
     output_dir = Path(config['output']['save_dir'])
@@ -343,6 +415,8 @@ def main():
     # Apply overrides
     if args.override:
         config = apply_overrides(config, args.override)
+
+    config = apply_path_overrides(config, args)
 
     # Validate configuration
     validate_config(config)
