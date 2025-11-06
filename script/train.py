@@ -12,7 +12,7 @@ from copy import deepcopy
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 # Add project root to path before importing project modules
 project_root = Path(__file__).parent.parent
@@ -33,13 +33,6 @@ except ModuleNotFoundError as missing:
         dataset_type: Optional[str] = None,
         source_name: Optional[str] = None,
     ) -> Path:
-        """Lightweight fallback that mirrors the dataset helper.
-
-        The dry-run path may execute in environments without PyTorch; importing
-        ``src.data.dataset`` would fail in that case.  We still accept the same
-        arguments but simply expand environment variables and return the first
-        existing path (or the last candidate if none are found).
-        """
 
         del dataset_type, source_name  # placeholders for signature parity
 
@@ -250,6 +243,8 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
     def _resolve(path_value: Any):
         if path_value is None:
             return None
+        if isinstance(path_value, Mapping):
+            return {str(key): _resolve(value) for key, value in path_value.items()}
         if isinstance(path_value, (list, tuple)):
             return [_resolve(item) for item in path_value]
         raw = str(path_value)
@@ -339,6 +334,78 @@ def apply_path_overrides(config: dict, args: argparse.Namespace) -> dict:
     return config
 
 
+def _resolve_data_root_spec(
+    spec: Any,
+    *,
+    dataset_type: Optional[str] = None,
+    context: str = "data_root",
+) -> Any:
+    """Resolve data-root specifications for validation.
+
+    The specification may be a single path, a collection of fallbacks, or a
+    dictionary mapping logical dataset components (e.g., ``depth`` vs.
+    ``all_in_focus``) to separate root directories.
+    """
+
+    if isinstance(spec, Mapping):
+        return {
+            str(key).lower(): _resolve_data_root_spec(
+                value,
+                dataset_type=dataset_type,
+                context=f"{context}.{key}",
+            )
+            for key, value in spec.items()
+        }
+
+    if isinstance(spec, (list, tuple, set)):
+        return [
+            resolve_data_root(
+                candidate,
+                dataset_type=dataset_type,
+                source_name=context,
+            )
+            for candidate in spec
+        ]
+
+    return resolve_data_root(
+        spec,
+        dataset_type=dataset_type,
+        source_name=context,
+    )
+
+
+def _warn_missing_data_roots(resolved_spec: Any, *, context: str = "data_root") -> None:
+    """Emit warnings for any resolved data roots that do not yet exist."""
+
+    if isinstance(resolved_spec, dict):
+        for key, value in resolved_spec.items():
+            _warn_missing_data_roots(value, context=f"{context}.{key}")
+        return
+
+    if isinstance(resolved_spec, (list, tuple)):
+        for index, value in enumerate(resolved_spec):
+            _warn_missing_data_roots(value, context=f"{context}[{index}]")
+        return
+
+    if isinstance(resolved_spec, Path) and not resolved_spec.exists():
+        logger.warning("Training data root does not exist (%s): %s", context, resolved_spec)
+
+
+def _stringify_data_root_spec(resolved_spec: Any) -> Any:
+    """Convert resolved Path objects back to plain strings for serialization."""
+
+    if isinstance(resolved_spec, dict):
+        return {key: _stringify_data_root_spec(value) for key, value in resolved_spec.items()}
+
+    if isinstance(resolved_spec, (list, tuple)):
+        return [str(value) for value in resolved_spec]
+
+    if isinstance(resolved_spec, Path):
+        return str(resolved_spec)
+
+    return resolved_spec
+
+
 def validate_config(config: dict) -> None:
     """Validate configuration"""
     required_keys = [
@@ -371,19 +438,22 @@ def validate_config(config: dict) -> None:
         )
 
     # Check paths exist
-    resolved_data_root = resolve_data_root(
+    resolved_data_root = _resolve_data_root_spec(
         config['data']['data_root'],
         dataset_type=dataset_type_raw or None,
     )
 
-    if not resolved_data_root.exists():
-        logger.warning(
-            "Training data root does not exist: %s", resolved_data_root
-        )
+    _warn_missing_data_roots(resolved_data_root)
 
     # Persist the resolved path back into the config so downstream components use
     # the same location that was validated here.
-    config['data']['data_root'] = str(resolved_data_root)
+    config['data']['data_root'] = _stringify_data_root_spec(resolved_data_root)
+
+    # Ensure filelists exist and give actionable warnings
+    for key in ('train_filelist', 'val_filelist', 'test_filelist'):
+        filelist_path = Path(config['data'][key])
+        if not filelist_path.exists():
+            logger.warning("Config filelist %s does not exist: %s", key, filelist_path)
 
     # Ensure filelists exist and give actionable warnings
     for key in ('train_filelist', 'val_filelist', 'test_filelist'):
