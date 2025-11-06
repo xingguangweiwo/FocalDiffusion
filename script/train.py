@@ -33,13 +33,6 @@ except ModuleNotFoundError as missing:
         dataset_type: Optional[str] = None,
         source_name: Optional[str] = None,
     ) -> Path:
-        """Lightweight fallback that mirrors the dataset helper.
-
-        The dry-run path may execute in environments without PyTorch; importing
-        ``src.data.dataset`` would fail in that case.  We still accept the same
-        arguments but simply expand environment variables and return the first
-        existing path (or the last candidate if none are found).
-        """
 
         del dataset_type, source_name  # placeholders for signature parity
 
