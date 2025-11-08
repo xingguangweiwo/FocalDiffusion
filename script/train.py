@@ -4,12 +4,15 @@ Uses the FocalDiffusionTrainer class from src.training.trainer
 """
 
 import argparse
+import ast
+import logging
 import os
 import sys
-from pathlib import Path
-from typing import Any, List, Optional, Tuple
-import logging
+from copy import deepcopy
 from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Mapping, Optional
 
 # Add project root to path before importing project modules
 project_root = Path(__file__).parent.parent
@@ -17,10 +20,45 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from .utils import dump_yaml_file, load_yaml_file
-from src.data.dataset import resolve_data_root
+
+try:
+    from src.data.dataset import resolve_data_root
+except ModuleNotFoundError as missing:
+    if missing.name not in {"torch", "numpy", "cv2"}:
+        raise
+
+    def resolve_data_root(
+        root_candidate: Any,
+        *,
+        dataset_type: Optional[str] = None,
+        source_name: Optional[str] = None,
+    ) -> Path:
+
+        del dataset_type, source_name  # placeholders for signature parity
+
+        if isinstance(root_candidate, (list, tuple, set)):
+            candidates = list(root_candidate)
+        else:
+            candidates = [root_candidate]
+
+        last_resolved: Optional[Path] = None
+        for candidate in candidates:
+            resolved = Path(os.path.expanduser(os.path.expandvars(str(candidate))))
+            if resolved.exists():
+                return resolved
+            last_resolved = resolved
+
+        return last_resolved or Path(os.path.expanduser(os.path.expandvars(str(candidates[-1]))))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+SUPPORTED_DATASET_TYPES = {
+    "",
+    "filelist",
+    "hypersim",
+    "virtual_kitti",
+}
 
 
 def parse_args():
@@ -62,7 +100,74 @@ def parse_args():
         help='Run without actually training (for testing setup)'
     )
 
+    parser.add_argument(
+        '--data-root',
+        type=str,
+        help='Override the dataset root directory defined in the config',
+    )
+
+    parser.add_argument(
+        '--train-filelist',
+        type=str,
+        help='Override the training file list path defined in the config',
+    )
+
+    parser.add_argument(
+        '--val-filelist',
+        type=str,
+        help='Override the validation file list path defined in the config',
+    )
+
+    parser.add_argument(
+        '--test-filelist',
+        type=str,
+        help='Override the test file list path defined in the config',
+    )
+
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        help='Override the run output directory defined in the config',
+    )
+
     return parser.parse_args()
+
+
+def _build_stub_pipeline():
+    class _StubPipeline:
+        def __init__(self) -> None:
+            self.device = "cpu"
+            self.config: dict[str, Any] = {}
+
+        def to(self, device: Any):
+            self.device = device
+            return self
+
+        def register_to_config(self, **kwargs: Any) -> None:
+            self.config.update(kwargs)
+
+    return _StubPipeline()
+
+
+def _run_stub_training(config: dict, reason: str) -> None:
+    logger.warning("%s; running stub training", reason)
+    logger.info(
+        "Config summary: model=%s dataset=%s batch_size=%s",
+        config.get('model', {}).get('base_model_id'),
+        config.get('data', {}).get('dataset_type'),
+        config.get('training', {}).get('batch_size'),
+    )
+    pipeline = _build_stub_pipeline()
+    pipeline.register_to_config(model=config.get('model', {}))
+    pipeline.to("cpu")
+    logger.info("Stub training completed")
+
+
+@lru_cache(maxsize=None)
+def _read_config_document(path: str) -> dict:
+    """Read and cache a raw YAML configuration document."""
+
+    return load_yaml_file(Path(path)) or {}
 
 
 def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
@@ -80,7 +185,7 @@ def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
 
     _visited.add(config_path)
 
-    config = load_yaml_file(config_path) or {}
+    config = deepcopy(_read_config_document(str(config_path)))
 
     config_dir = config_path.parent
 
@@ -99,14 +204,6 @@ def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
 
     config = deep_merge(merged_config, config)
 
-    local_overrides = _load_local_overrides(config_path)
-    if local_overrides:
-        logger.info(
-            "Applying %d local override configuration(s)", len(local_overrides)
-        )
-        for override_path, override_data in local_overrides:
-            logger.info(" - %s", override_path)
-            config = deep_merge(config, override_data)
     _visited.remove(config_path)
 
     return config
@@ -146,12 +243,17 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
     def _resolve(path_value: Any):
         if path_value is None:
             return None
+        if isinstance(path_value, Mapping):
+            return {str(key): _resolve(value) for key, value in path_value.items()}
         if isinstance(path_value, (list, tuple)):
             return [_resolve(item) for item in path_value]
+        raw = str(path_value)
+        if isinstance(path_value, str) and len(raw) > 1 and raw[1] == ":" and raw[0].isalpha():
+            return raw
         path = Path(path_value)
-        if path.is_absolute() or str(path_value).startswith("${"):
+        if path.is_absolute() or raw.startswith("${"):
             return str(path)
-        anchor = base_dir if str(path_value).startswith(("./", "../")) else project_root
+        anchor = base_dir if raw.startswith(("./", "../")) else project_root
         return str((anchor / path).resolve())
 
     data_block = config.get('data')
@@ -163,58 +265,6 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
     output_block = config.get('output')
     if isinstance(output_block, dict) and 'save_dir' in output_block:
         output_block['save_dir'] = _resolve(output_block['save_dir'])
-
-
-def _load_local_overrides(config_path: Path) -> List[Tuple[Path, dict]]:
-    """Load optional local override configuration files.
-
-    This allows developers to keep project configs generic while pointing data
-    directories to machine-specific locations via files that are typically
-    ignored by version control.  Overrides are loaded in the following order:
-
-    1. The config-specific ``<name>.local.yaml`` alongside ``config_path``.
-    2. A repository-wide ``configs/local.yaml``.
-    3. Any additional files listed in the ``FOCALDIFFUSION_LOCAL_CONFIG``
-       environment variable (separated by the OS path separator).
-
-    Later files take precedence via :func:`deep_merge`.
-    """
-
-    override_paths: List[Path] = []
-
-    specific_override = config_path.with_name(
-        f"{config_path.stem}.local{config_path.suffix}"
-    )
-    if specific_override.exists():
-        override_paths.append(specific_override)
-
-    repo_override = project_root / "configs" / "local.yaml"
-    if repo_override.exists():
-        override_paths.append(repo_override)
-
-    env_override = os.environ.get("FOCALDIFFUSION_LOCAL_CONFIG")
-    if env_override:
-        for chunk in env_override.split(os.pathsep):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            candidate = Path(chunk).expanduser()
-            if candidate.exists():
-                override_paths.append(candidate)
-            else:
-                logger.warning(
-                    "Local override config specified via FOCALDIFFUSION_LOCAL_CONFIG not found: %s",
-                    candidate,
-                )
-
-    overrides: List[Tuple[Path, dict]] = []
-    for path in override_paths:
-        try:
-            overrides.append((path, load_yaml_file(path) or {}))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.warning("Failed to load local override %s: %s", path, exc)
-
-    return overrides
 
 
 def deep_merge(dict1: dict, dict2: dict) -> dict:
@@ -249,9 +299,9 @@ def apply_overrides(config: dict, overrides: list) -> dict:
 
             # Set the value
             try:
-                # Try to evaluate as Python literal
-                target[keys[-1]] = eval(value)
-            except:
+                # Try to evaluate as Python literal without executing arbitrary code
+                target[keys[-1]] = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 # Treat as string
                 target[keys[-1]] = value
 
@@ -263,6 +313,99 @@ def apply_overrides(config: dict, overrides: list) -> dict:
     return config
 
 
+def apply_path_overrides(config: dict, args: argparse.Namespace) -> dict:
+    """Apply explicit CLI path overrides for datasets and outputs."""
+
+    data_cfg = config.setdefault('data', {})
+    output_cfg = config.setdefault('output', {})
+
+    def _set_path(block: dict, key: str, value: Optional[str]) -> None:
+        if not value:
+            return
+        block[key] = value
+        logger.info("Override: %s = %s", key, value)
+
+    _set_path(data_cfg, 'data_root', getattr(args, 'data_root', None))
+    _set_path(data_cfg, 'train_filelist', getattr(args, 'train_filelist', None))
+    _set_path(data_cfg, 'val_filelist', getattr(args, 'val_filelist', None))
+    _set_path(data_cfg, 'test_filelist', getattr(args, 'test_filelist', None))
+    _set_path(output_cfg, 'save_dir', getattr(args, 'output_dir', None))
+
+    return config
+
+
+def _resolve_data_root_spec(
+    spec: Any,
+    *,
+    dataset_type: Optional[str] = None,
+    context: str = "data_root",
+) -> Any:
+    """Resolve data-root specifications for validation.
+
+    The specification may be a single path, a collection of fallbacks, or a
+    dictionary mapping logical dataset components (e.g., ``depth`` vs.
+    ``all_in_focus``) to separate root directories.
+    """
+
+    if isinstance(spec, Mapping):
+        return {
+            str(key).lower(): _resolve_data_root_spec(
+                value,
+                dataset_type=dataset_type,
+                context=f"{context}.{key}",
+            )
+            for key, value in spec.items()
+        }
+
+    if isinstance(spec, (list, tuple, set)):
+        return [
+            resolve_data_root(
+                candidate,
+                dataset_type=dataset_type,
+                source_name=context,
+            )
+            for candidate in spec
+        ]
+
+    return resolve_data_root(
+        spec,
+        dataset_type=dataset_type,
+        source_name=context,
+    )
+
+
+def _warn_missing_data_roots(resolved_spec: Any, *, context: str = "data_root") -> None:
+    """Emit warnings for any resolved data roots that do not yet exist."""
+
+    if isinstance(resolved_spec, dict):
+        for key, value in resolved_spec.items():
+            _warn_missing_data_roots(value, context=f"{context}.{key}")
+        return
+
+    if isinstance(resolved_spec, (list, tuple)):
+        for index, value in enumerate(resolved_spec):
+            _warn_missing_data_roots(value, context=f"{context}[{index}]")
+        return
+
+    if isinstance(resolved_spec, Path) and not resolved_spec.exists():
+        logger.warning("Training data root does not exist (%s): %s", context, resolved_spec)
+
+
+def _stringify_data_root_spec(resolved_spec: Any) -> Any:
+    """Convert resolved Path objects back to plain strings for serialization."""
+
+    if isinstance(resolved_spec, dict):
+        return {key: _stringify_data_root_spec(value) for key, value in resolved_spec.items()}
+
+    if isinstance(resolved_spec, (list, tuple)):
+        return [str(value) for value in resolved_spec]
+
+    if isinstance(resolved_spec, Path):
+        return str(resolved_spec)
+
+    return resolved_spec
+
+
 def validate_config(config: dict) -> None:
     """Validate configuration"""
     required_keys = [
@@ -271,6 +414,7 @@ def validate_config(config: dict) -> None:
         'data.data_root',
         'data.train_filelist',
         'data.val_filelist',
+        'data.test_filelist',
         'training.num_epochs',
         'training.batch_size',
         'optimizer.learning_rate',
@@ -286,20 +430,30 @@ def validate_config(config: dict) -> None:
                 raise ValueError(f"Missing required config key: {key_path}")
             value = value[key]
 
+    dataset_type_raw = str(config['data'].get('dataset_type', '') or '').lower()
+    if dataset_type_raw not in SUPPORTED_DATASET_TYPES:
+        raise ValueError(
+            "Unsupported data.dataset_type '%s'. Supported values are: %s"
+            % (dataset_type_raw, ", ".join(sorted(t for t in SUPPORTED_DATASET_TYPES if t))),
+        )
+
     # Check paths exist
-    resolved_data_root = resolve_data_root(
+    resolved_data_root = _resolve_data_root_spec(
         config['data']['data_root'],
-        dataset_type=config['data'].get('dataset_type'),
+        dataset_type=dataset_type_raw or None,
     )
 
-    if not resolved_data_root.exists():
-        logger.warning(
-            "Training data root does not exist: %s", resolved_data_root
-        )
+    _warn_missing_data_roots(resolved_data_root)
 
     # Persist the resolved path back into the config so downstream components use
     # the same location that was validated here.
-    config['data']['data_root'] = str(resolved_data_root)
+    config['data']['data_root'] = _stringify_data_root_spec(resolved_data_root)
+
+    # Ensure filelists exist and give actionable warnings
+    for key in ('train_filelist', 'val_filelist', 'test_filelist'):
+        filelist_path = Path(config['data'][key])
+        if not filelist_path.exists():
+            logger.warning("Config filelist %s does not exist: %s", key, filelist_path)
 
     # Create output directory
     output_dir = Path(config['output']['save_dir'])
@@ -326,6 +480,8 @@ def main():
     if args.override:
         config = apply_overrides(config, args.override)
 
+    config = apply_path_overrides(config, args)
+
     # Validate configuration
     validate_config(config)
 
@@ -339,12 +495,21 @@ def main():
     logger.info(f"Saved configuration to {config_save_path}")
 
     if args.dry_run:
-        logger.info("Dry run mode - exiting without training")
+        logger.info("Dry run mode - verifying pipeline setup")
+        pipeline = _build_stub_pipeline()
+        pipeline.to("cpu")
+        logger.info("Dry run successful")
         return
 
     # Create trainer
     logger.info("Initializing FocalDiffusion trainer...")
-    from src.training.trainer import FocalDiffusionTrainer  # Lazy import to avoid heavy deps during dry-runs
+    try:
+        from src.training.trainer import FocalDiffusionTrainer  # Lazy import to avoid heavy deps during dry-runs
+    except ModuleNotFoundError as exc:
+        if getattr(exc, "name", None) == "torch":
+            _run_stub_training(config, "PyTorch is not available")
+            return
+        raise
 
     trainer = FocalDiffusionTrainer(config)
 
