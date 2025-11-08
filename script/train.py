@@ -455,12 +455,6 @@ def validate_config(config: dict) -> None:
         if not filelist_path.exists():
             logger.warning("Config filelist %s does not exist: %s", key, filelist_path)
 
-    # Ensure filelists exist and give actionable warnings
-    for key in ('train_filelist', 'val_filelist', 'test_filelist'):
-        filelist_path = Path(config['data'][key])
-        if not filelist_path.exists():
-            logger.warning("Config filelist %s does not exist: %s", key, filelist_path)
-
     # Create output directory
     output_dir = Path(config['output']['save_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)

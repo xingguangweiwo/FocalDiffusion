@@ -75,6 +75,14 @@ class FocalStackDataset(Dataset):
         else:
             self.samples = self._scan_directory()
 
+        dropped = self._prune_missing_samples(self.samples)
+        if dropped:
+            logger.warning(
+                "Dropped %d samples with missing assets; %d remain",
+                dropped,
+                len(self.samples),
+            )
+
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
 
@@ -121,13 +129,25 @@ class FocalStackDataset(Dataset):
                 key = str(raw_key).lower()
                 root_map[key] = _as_paths(value)
 
-            if "default" not in root_map and root_map:
-                fallback_key = next(
-                    (alias for alias in ("all_in_focus", "focal_stack", "depth") if alias in root_map),
-                    None,
-                )
-                if fallback_key:
-                    root_map["default"] = root_map[fallback_key]
+            if root_map:
+                if "default" not in root_map:
+                    fallback_key = next(
+                        (alias for alias in ("all_in_focus", "focal_stack", "depth") if alias in root_map),
+                        None,
+                    )
+                    if fallback_key:
+                        root_map["default"] = root_map[fallback_key]
+
+                # Make sure the default bucket contains all known candidates so that
+                # generic resolution attempts still discover modality-specific
+                # fallbacks (e.g. when only the depth root exists locally).
+                if "default" in root_map:
+                    seen: List[Path] = []
+                    for paths in root_map.values():
+                        for path in paths:
+                            if path not in seen:
+                                seen.append(path)
+                    root_map["default"] = tuple(seen)
             return root_map
 
         default_paths = _as_paths(data_root)
@@ -226,6 +246,53 @@ class FocalStackDataset(Dataset):
             sample.setdefault("generate_focal_stack", True)
 
         return sample
+
+    def _prune_missing_samples(self, samples: List[Dict]) -> int:
+        """Remove samples whose required files are missing."""
+
+        valid: List[Dict] = []
+        missing_count = 0
+
+        def _check(path_like: Union[str, Path], *, kind: str) -> bool:
+            resolved = self._resolve_path(path_like, kind=kind)
+            if not resolved.exists():
+                logger.error(
+                    "Missing %s resolved to %s (entry %r, data_root=%s)",
+                    kind,
+                    resolved,
+                    path_like,
+                    self._select_root_candidates(kind)[0],
+                )
+                return False
+            return True
+
+        for sample in samples:
+            ok = True
+
+            if sample.get("depth_path"):
+                ok &= _check(sample["depth_path"], kind="depth")
+
+            if sample.get("all_in_focus"):
+                ok &= _check(sample["all_in_focus"], kind="all_in_focus")
+
+            focal_dir = sample.get("focal_stack_dir")
+            if focal_dir:
+                resolved_dir = self._resolve_path(focal_dir, kind="focal_stack")
+                if not resolved_dir.exists():
+                    logger.error(
+                        "Missing focal stack directory %s (entry %r)",
+                        resolved_dir,
+                        focal_dir,
+                    )
+                    ok = False
+
+            if ok:
+                valid.append(sample)
+            else:
+                missing_count += 1
+
+        samples[:] = valid
+        return missing_count
 
     @staticmethod
     def _coerce_value(raw: str):
