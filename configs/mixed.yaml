@@ -4,7 +4,22 @@ defaults:
 
 data:
   dataset_type: filelist
-  data_root: /data/focaldiffusion_mixed
+  data_root:
+    default:
+      - /data/hypersim_focal_stacks
+      - /data/virtual_kitti_focal_stacks
+      - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
+      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_rgb"
+    all_in_focus:
+      - /data/hypersim_focal_stacks
+      - /data/virtual_kitti_focal_stacks
+      - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
+      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_rgb"
+    depth:
+      - /data/hypersim_focal_stacks
+      - /data/virtual_kitti_focal_stacks
+      - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
+      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_depth"
   train_filelist: data/filelists/train.txt
   val_filelist: data/filelists/val.txt
   test_filelist: data/filelists/test.txt
@@ -13,3 +28,7 @@ data:
 
 output:
   save_dir: outputs/experiments/mixed
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 2

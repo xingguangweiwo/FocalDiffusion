@@ -48,6 +48,9 @@ class FocalDiffusionTrainer:
         self.current_epoch = 0
         self.global_step = 0
 
+        # Cache for prompt embeddings used during training
+        self._empty_prompt_cache: Optional[Dict[str, torch.Tensor]] = None
+
     @staticmethod
     def _resolve_hf_token(model_cfg: Dict[str, Any]) -> Tuple[Optional[str], str]:
         """Return the Hugging Face token and a string describing its origin."""
@@ -528,6 +531,8 @@ class FocalDiffusionTrainer:
             disable=not self.accelerator.is_local_main_process
         )
 
+        prompt_embeds, pooled_prompt_embeds = self._get_empty_prompt_embeddings()
+
         for step, batch in enumerate(progress_bar):
             with self.accelerator.accumulate(self.pipeline):
                 # Prepare batch data on device
@@ -587,6 +592,8 @@ class FocalDiffusionTrainer:
                 noise = torch.randn_like(latents)
 
                 scheduler = self.pipeline.scheduler
+
+                noise_levels = None
 
                 if hasattr(scheduler, "add_noise"):
                     timesteps = torch.randint(
@@ -648,6 +655,10 @@ class FocalDiffusionTrainer:
                     )
                     timesteps = schedule_timesteps.index_select(0, step_indices)
                     noisy_latents = scheduler.scale_noise(latents, timesteps, noise)
+                    if hasattr(scheduler, "sigmas"):
+                        sigma_schedule = scheduler.sigmas.to(device=device, dtype=latents.dtype)
+                        sigma_indices = step_indices.clamp(max=sigma_schedule.shape[0] - 1)
+                        noise_levels = sigma_schedule.index_select(0, sigma_indices)
                 else:
                     raise AttributeError(
                         "The active scheduler does not implement `add_noise` or `scale_noise`,"
@@ -663,16 +674,6 @@ class FocalDiffusionTrainer:
 
                 # Forward pass
                 with autocast(enabled=self.scaler is not None):
-                    # Encode text (empty prompt for zero-shot)
-                    prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
-                        prompt="",
-                        prompt_2="",
-                        prompt_3="",
-                        num_images_per_prompt=1,
-                        do_classifier_free_guidance=False,
-                        device=self.accelerator.device,
-                    )
-
                     # Predict noise
                     noise_pred = self.pipeline.transformer(
                         hidden_states=model_input,
@@ -683,8 +684,16 @@ class FocalDiffusionTrainer:
                         return_dict=False,
                     )[0]
 
+                    clean_latent_pred = self._predict_clean_latents(
+                        noisy_latents=noisy_latents,
+                        noise_pred=noise_pred,
+                        timesteps=timesteps,
+                        noise_levels=noise_levels,
+                        reference_latents=latents,
+                    )
+
                     # Decode auxiliary predictions for multi-task losses
-                    depth_logits, rgb_latent_pred = self.dual_decoder(latents)
+                    depth_logits, rgb_latent_pred = self.dual_decoder(clean_latent_pred)
 
                     depth_probs = torch.sigmoid(depth_logits)
                     depth_probs = F.interpolate(
@@ -771,6 +780,84 @@ class FocalDiffusionTrainer:
                         }, step=global_step + step)
 
         return epoch_loss / len(self.train_dataloader)
+
+    def _get_empty_prompt_embeddings(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Cache and return the embeddings for the empty prompt used during training."""
+
+        cache = self._empty_prompt_cache
+        dtype = self.pipeline.transformer.dtype
+        device = self.accelerator.device
+
+        if cache and cache.get("dtype") == dtype and cache.get("device") == device:
+            return cache["prompt_embeds"], cache["pooled_prompt_embeds"]
+
+        with torch.no_grad():
+            prompt_embeds, _, pooled_prompt_embeds, _ = self.pipeline.encode_prompt(
+                prompt="",
+                prompt_2="",
+                prompt_3="",
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+                device=device,
+            )
+
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype).detach()
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype).detach()
+
+        self._empty_prompt_cache = {
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
+            "dtype": dtype,
+            "device": device,
+        }
+
+        return prompt_embeds, pooled_prompt_embeds
+
+    def _predict_clean_latents(
+        self,
+        noisy_latents: torch.Tensor,
+        noise_pred: torch.Tensor,
+        timesteps: torch.Tensor,
+        noise_levels: Optional[torch.Tensor] = None,
+        reference_latents: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Reconstruct the clean latent sample from the model's noise prediction."""
+
+        scheduler = self.pipeline.scheduler
+        latent_dtype = noisy_latents.dtype
+        device = noisy_latents.device
+
+        noise_pred = noise_pred.to(dtype=latent_dtype)
+
+        if noise_levels is not None:
+            sigma = noise_levels.to(device=device, dtype=latent_dtype)
+            sigma = sigma.view(-1, *[1] * (noisy_latents.ndim - 1))
+            denom = 1.0 - sigma
+            near_zero = denom.abs() < 1e-6
+            denom = denom.clamp(min=1e-6)
+            clean = (noisy_latents - sigma * noise_pred) / denom
+
+            if reference_latents is not None and torch.any(near_zero):
+                fallback = reference_latents.to(device=device, dtype=latent_dtype).detach()
+                clean = torch.where(near_zero, fallback, clean)
+
+            return clean
+
+        if hasattr(scheduler, "alphas_cumprod"):
+            alphas_cumprod = scheduler.alphas_cumprod.to(device=device, dtype=latent_dtype)
+            timestep_indices = timesteps.to(device=device)
+            if timestep_indices.dtype not in (torch.int32, torch.int64, torch.int16, torch.uint8):
+                timestep_indices = timestep_indices.long()
+            timestep_indices = timestep_indices.clamp(min=0, max=alphas_cumprod.shape[0] - 1)
+            alpha_prod_t = alphas_cumprod.index_select(0, timestep_indices)
+            alpha = alpha_prod_t.sqrt().view(-1, *[1] * (noisy_latents.ndim - 1))
+            sigma = (1 - alpha_prod_t).sqrt().view(-1, *[1] * (noisy_latents.ndim - 1))
+            clean = (noisy_latents - sigma * noise_pred) / alpha.clamp(min=1e-6)
+            return clean
+
+        raise RuntimeError(
+            "Unable to recover clean latents for the active scheduler."
+        )
 
     def validate(self, epoch: int) -> dict:
         """Validation loop"""
