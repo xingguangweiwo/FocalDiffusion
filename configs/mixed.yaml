@@ -6,18 +6,18 @@ data:
   dataset_type: filelist
   data_root:
     default:
-      - /data/hypersim_focal_stacks
-      - /data/virtual_kitti_focal_stacks
+      - /data/hypersim
+      - /data/virtual_kitti
       - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
       - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_rgb"
     all_in_focus:
-      - /data/hypersim_focal_stacks
-      - /data/virtual_kitti_focal_stacks
+      - /data/hypersim_focal
+      - /data/virtual_kitti
       - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
       - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_rgb"
     depth:
-      - /data/hypersim_focal_stacks
-      - /data/virtual_kitti_focal_stacks
+      - /data/hypersim
+      - /data/virtual_kitti
       - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
       - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_depth"
   train_filelist: data/filelists/train.txt
