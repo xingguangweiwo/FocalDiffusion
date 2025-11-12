@@ -69,6 +69,19 @@ class FocalInjectedSD3Transformer(nn.Module):
             num_heads=self.config.num_attention_heads,
             head_dim=self.config.attention_head_dim,
         )
+        self.pre_focal_attn = FocalCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=self.config.num_attention_heads,
+            head_dim=self.config.attention_head_dim,
+        )
+
+        self.pre_norm = nn.LayerNorm(hidden_size)
+        self.post_norm = nn.LayerNorm(hidden_size)
+        self.condition_scale = nn.Parameter(torch.tensor(0.5))
+        self.pre_scale = nn.Parameter(torch.tensor(0.5))
+        self.post_scale = nn.Parameter(torch.tensor(1.0))
+
+        self._condition_adapters = nn.ModuleDict()
         self.dtype = getattr(base, "dtype", torch.float32)
 
     @property
@@ -124,6 +137,10 @@ class FocalInjectedSD3Transformer(nn.Module):
         return_dict: bool = True,
     ) -> Union[Transformer2DModelOutput, Tuple[torch.Tensor]]:
         base = self.base_transformer
+        condition_pre = self._extract_condition(focal_features, hidden_states.shape[-2:])
+        if condition_pre is not None:
+            hidden_states = self._apply_condition(hidden_states, condition_pre, self.pre_focal_attn, self.pre_norm, self.pre_scale)
+
         result = base.forward(
             hidden_states=hidden_states,
             timestep=timestep,
@@ -133,24 +150,60 @@ class FocalInjectedSD3Transformer(nn.Module):
             return_dict=False,
         )[0]
 
-        if focal_features is not None and "fused_features" in focal_features:
-            fused = focal_features["fused_features"]
-            if fused.dim() == 5:
-                # Some processors keep the stack dimension – collapse it.
-                fused = fused.mean(dim=1)
-
-            if fused.shape[-2:] != result.shape[-2:]:
-                fused = F.interpolate(fused, size=result.shape[-2:], mode="bilinear", align_corners=False)
-
-            fused_seq = fused.flatten(2).transpose(1, 2)
-            hidden_seq = result.flatten(2).transpose(1, 2)
-            hidden_seq = hidden_seq + self.focal_attn(hidden_seq, fused_seq)
-            result = hidden_seq.transpose(1, 2).reshape_as(result)
+        condition_post = self._extract_condition(focal_features, result.shape[-2:])
+        if condition_post is not None:
+            result = self._apply_condition(result, condition_post, self.focal_attn, self.post_norm, self.post_scale)
 
         if return_dict:
             return Transformer2DModelOutput(sample=result)
 
         return (result,)
+
+    def _get_condition_adapter(self, channels: int) -> nn.Conv2d:
+        key = str(channels)
+        if key not in self._condition_adapters:
+            adapter = nn.Conv2d(channels, self.config.attention_head_dim * self.config.num_attention_heads, kernel_size=1)
+            self._condition_adapters[key] = adapter
+        return self._condition_adapters[key]
+
+    def _extract_condition(
+        self,
+        focal_features: Optional[Dict[str, torch.Tensor]],
+        spatial_size: Tuple[int, int]
+    ) -> Optional[torch.Tensor]:
+        if not focal_features or "fused_features" not in focal_features:
+            return None
+
+        fused = focal_features["fused_features"]
+        if fused.dim() == 5:
+            fused = fused.mean(dim=1)
+
+        if fused.shape[-2:] != spatial_size:
+            fused = F.interpolate(fused, size=spatial_size, mode="bilinear", align_corners=False)
+
+        adapter = self._get_condition_adapter(fused.shape[1])
+        conditioned = adapter(fused)
+
+        spatial_maps = focal_features.get("temporal_attention_maps")
+        if spatial_maps is not None:
+            spatial = spatial_maps.mean(dim=1, keepdim=True)
+            spatial = F.interpolate(spatial, size=spatial_size, mode="bilinear", align_corners=False)
+            conditioned = conditioned * (1 + self.condition_scale * spatial)
+
+        return conditioned
+
+    def _apply_condition(
+        self,
+        hidden_states: torch.Tensor,
+        condition: torch.Tensor,
+        attn: FocalCrossAttention,
+        norm: nn.LayerNorm,
+        scale: nn.Parameter
+    ) -> torch.Tensor:
+        hidden_seq = hidden_states.flatten(2).transpose(1, 2)
+        cond_seq = condition.flatten(2).transpose(1, 2)
+        hidden_seq = hidden_seq + scale * attn(norm(hidden_seq), cond_seq)
+        return hidden_seq.transpose(1, 2).reshape_as(hidden_states)
 
 
 class FocalDiffusionPipeline(StableDiffusion3Pipeline):
