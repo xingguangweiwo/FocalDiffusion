@@ -6,21 +6,38 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class _ConvBlock(nn.Module):
-    """Simple convolutional block with SiLU activation."""
+class _ResidualBlock(nn.Module):
+    """Residual convolutional block with optional dilation."""
 
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        dilation: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=max(1, out_channels // 16), num_channels=out_channels),
-            nn.SiLU(),
-        )
+        padding = dilation
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=padding, dilation=dilation)
+        self.norm1 = nn.GroupNorm(num_groups=max(1, out_channels // 16), num_channels=out_channels)
+        self.act = nn.SiLU()
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=padding, dilation=dilation)
+        self.norm2 = nn.GroupNorm(num_groups=max(1, out_channels // 16), num_channels=out_channels)
+        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401 - inherited
-        return self.block(x)
+        residual = self.skip(x)
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.act(out)
+        out = self.dropout(out)
+        out = self.conv2(out)
+        out = self.norm2(out)
+        return self.act(out + residual)
 
 
 class DualOutputDecoder(nn.Module):
@@ -46,18 +63,30 @@ class DualOutputDecoder(nn.Module):
 
         dims: List[int] = [in_channels, *hidden_dims]
 
+        dilations = [1, 2, 3]
         self.shared = nn.ModuleList([
-            _ConvBlock(dims[i], dims[i + 1]) for i in range(len(dims) - 1)
+            _ResidualBlock(dims[i], dims[i + 1], dilation=dilations[min(i, len(dilations) - 1)], dropout=0.1)
+            for i in range(len(dims) - 1)
         ])
 
-        depth_layers: List[nn.Module] = []
-        rgb_layers: List[nn.Module] = []
-        for _ in range(2):
-            depth_layers.append(_ConvBlock(dims[-1], dims[-1]))
-            rgb_layers.append(_ConvBlock(dims[-1], dims[-1]))
+        self.context_projections = nn.ModuleList([
+            nn.Conv2d(dims[i + 1], dims[-1], kernel_size=1) for i in range(len(dims) - 1)
+        ])
 
-        self.depth_branch = nn.Sequential(*depth_layers)
-        self.rgb_branch = nn.Sequential(*rgb_layers)
+        self.global_context = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dims[-1], dims[-1], kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(dims[-1], dims[-1], kernel_size=1),
+        )
+
+        branch_block = lambda: nn.Sequential(
+            _ResidualBlock(dims[-1], dims[-1], dilation=1, dropout=0.1),
+            _ResidualBlock(dims[-1], dims[-1], dilation=2, dropout=0.1),
+        )
+
+        self.depth_branch = branch_block()
+        self.rgb_branch = branch_block()
 
         self.depth_head = nn.Conv2d(dims[-1], out_channels_depth, kernel_size=3, padding=1)
         self.rgb_head = nn.Conv2d(dims[-1], self.out_channels_rgb, kernel_size=3, padding=1)
@@ -67,11 +96,27 @@ class DualOutputDecoder(nn.Module):
 
         features = latents
         skip: Optional[torch.Tensor] = None
+        pyramid: List[torch.Tensor] = []
 
-        for layer in self.shared:
+        for idx, layer in enumerate(self.shared):
             features = layer(features)
+            pyramid.append(features)
             if self.use_skip_connections:
                 skip = features if skip is None else skip + features
+
+        # Fuse multi-dilation context back into the final representation
+        fused_context = torch.zeros_like(pyramid[-1])
+        for feat, proj in zip(pyramid, self.context_projections):
+            context = proj(feat)
+            if context.shape[-2:] != fused_context.shape[-2:]:
+                context = F.interpolate(context, size=fused_context.shape[-2:], mode="bilinear", align_corners=False)
+            fused_context = fused_context + context
+
+        fused_context = fused_context / len(pyramid)
+        global_feat = self.global_context(pyramid[-1])
+        fused_context = fused_context + global_feat
+
+        features = pyramid[-1] + fused_context
 
         depth_features = self.depth_branch(features)
         rgb_features = self.rgb_branch(features)

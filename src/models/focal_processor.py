@@ -118,13 +118,17 @@ class MultiScaleAdaptiveFusion(nn.Module):
 
         # Process each scale
         scale_features = []
+        attention_summary = None
         for i in range(self.num_scales):
             feat = features[f'scale_{i}']
             if feat.dim() == 5:  # [B, N, D, H, W]
                 # Apply temporal attention
-                B, N, D, H, W = feat.shape
-                feat_attended, weights = self.temporal_attention(feat, focus_distances)
+                feat_attended, weights, attn_maps = self.temporal_attention(feat, focus_distances)
                 scale_features.append(feat_attended)
+                attention_summary = {
+                    'frame_weights': weights,
+                    'attn_maps': attn_maps
+                }
             else:
                 scale_features.append(feat)
 
@@ -140,21 +144,26 @@ class MultiScaleAdaptiveFusion(nn.Module):
         concat_features = torch.cat(aligned_features, dim=1)
         fused = self.fusion_net(concat_features)
 
-        return {
+        outputs = {
             'fused_features': fused,
             'multiscale_features': features,
-            'attention_weights': weights if 'weights' in locals() else None
         }
+
+        if attention_summary is not None:
+            outputs['attention_weights'] = attention_summary['frame_weights']
+            outputs['temporal_attention_maps'] = attention_summary['attn_maps']
+
+        return outputs
 
 
 class FocalAwareTemporalAttention(nn.Module):
-    """Temporal attention for focal stack"""
+    """Temporal attention for focal stack that preserves spatially-aware importance."""
 
     def __init__(self, feature_dim: int, num_heads: int = 8):
         super().__init__()
         self.feature_dim = feature_dim
         self.num_heads = num_heads
-        self.head_dim = feature_dim // num_heads
+        self.head_dim = feature_dim // max(1, num_heads)
 
         # Multi-head projections
         self.q_proj = nn.Conv2d(feature_dim, feature_dim, 1)
@@ -165,26 +174,46 @@ class FocalAwareTemporalAttention(nn.Module):
         # Positional encoding for focus distances
         self.focus_encoder = nn.Sequential(
             nn.Linear(1, feature_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(feature_dim, feature_dim)
+        )
+
+        # Relative position encoding between focus planes
+        self.relative_position = nn.Sequential(
+            nn.Linear(1, num_heads),
+            nn.Tanh()
+        )
+
+        # Query weights derived from focus ordering
+        self.query_weight_net = nn.Sequential(
+            nn.Linear(1, feature_dim // 2),
+            nn.SiLU(),
+            nn.Linear(feature_dim // 2, 1)
         )
 
         self.temperature = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, features: torch.Tensor, focus_distances: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
+    def forward(
+        self,
+        features: torch.Tensor,
+        focus_distances: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fuse features from a focal stack with temporally-aware attention.
+
         Args:
             features: [B, N, D, H, W]
             focus_distances: [B, N]
+
         Returns:
             fused_features: [B, D, H, W]
-            attention_weights: [B, N]
+            frame_weights: [B, N]
+            attention_maps: [B, N, H, W]
         """
         B, N, D, H, W = features.shape
 
         # Add focus-based positional encoding
         focus_encoding = self.focus_encoder(focus_distances.unsqueeze(-1))  # [B, N, D]
-        focus_encoding = focus_encoding.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, H, W)
+        focus_encoding = focus_encoding.unsqueeze(-1).unsqueeze(-1)
         features = features + 0.1 * focus_encoding
 
         # Reshape for attention computation
@@ -200,17 +229,24 @@ class FocalAwareTemporalAttention(nn.Module):
         k = k.permute(0, 2, 4, 3, 1)  # [B, heads, H*W, head_dim, N]
         v = v.permute(0, 2, 4, 1, 3)  # [B, heads, H*W, N, head_dim]
 
-        # Compute attention scores
+        # Compute attention scores with relative focus bias
         scores = torch.matmul(q, k) / (self.temperature * math.sqrt(self.head_dim))
+        relative = focus_distances[:, :, None] - focus_distances[:, None, :]
+        relative = self.relative_position(relative.unsqueeze(-1))  # [B, N, N, heads]
+        relative = relative.permute(0, 3, 1, 2).unsqueeze(2)  # [B, heads, 1, N, N]
+        scores = scores + relative
+
         attn_weights = F.softmax(scores, dim=-1)  # [B, heads, H*W, N, N]
 
-        # Apply attention
+        # Apply attention over the focal sequence
         attended = torch.matmul(attn_weights, v)  # [B, heads, H*W, N, head_dim]
 
-        # Average over focal stack dimension
-        attended = attended.mean(dim=3)  # [B, heads, H*W, head_dim]
+        # Derive adaptive weights for how much each query frame contributes
+        query_logits = self.query_weight_net(focus_distances.unsqueeze(-1)).squeeze(-1)
+        query_weights = torch.softmax(query_logits, dim=-1)  # [B, N]
+        attended = (attended * query_weights.view(B, 1, 1, N, 1)).sum(dim=3)
 
-        # Reshape back
+        # Reshape back to image grid
         attended = attended.permute(0, 2, 1, 3).contiguous()
         attended = attended.view(B, H * W, self.num_heads * self.head_dim)
         attended = attended.transpose(1, 2).view(B, D, H, W)
@@ -218,10 +254,15 @@ class FocalAwareTemporalAttention(nn.Module):
         # Output projection
         output = self.out_proj(attended)
 
-        # Global attention weights (average over spatial and heads)
-        global_weights = attn_weights.mean(dim=[1, 2]).diagonal(dim1=-2, dim2=-1).mean(dim=-1)
+        # Aggregate spatial attention maps for diagnostics
+        spatial_weights = attn_weights.mean(dim=1)  # [B, H*W, N, N]
+        spatial_weights = spatial_weights.mean(dim=-2)  # [B, H*W, N]
+        spatial_weights = spatial_weights.view(B, H, W, N).permute(0, 3, 1, 2)
 
-        return output, global_weights
+        # Global frame weights (average over spatial locations)
+        frame_weights = attn_weights.mean(dim=[1, 2, 3])  # [B, N]
+
+        return output, frame_weights, spatial_weights
 
 
 class FocalStackProcessor(nn.Module):
