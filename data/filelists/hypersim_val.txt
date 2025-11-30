@@ -9,3 +9,6 @@ ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0006.color.jpg ai_
 ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0007.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0007.depth_meters.hdf5
 ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0008.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0008.depth_meters.hdf5
 ai_001_002/ai_001_002/images/scene_cam_00_final_preview/frame.0009.color.jpg ai_001_002/ai_001_002/images/scene_cam_00_geometry_hdf5/frame.0009.depth_meters.hdf5
+
+
+
