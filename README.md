@@ -46,7 +46,7 @@ override only the dataset section.
 
 > **Important:** Edit the configuration you actually launch (or pass overrides on
 > the CLI). Tweaking `configs/base.yaml` alone will not change
-> `configs/hypersim.yaml` because that file sets its own `data_root`
+> `configs/hypersim.yaml` because that file sets its own `data_root.`
 > placeholder.
 
 Important knobs:
