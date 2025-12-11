@@ -1,79 +1,131 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 480" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 540" role="img" aria-labelledby="title desc">
   <title id="title">FocalDiffusion training pipeline</title>
-  <desc id="desc">Flow from focal stack inputs through preprocessing, Stable Diffusion 3.5 UNet, multi-task outputs, and losses.</desc>
-  <style>
-    .box { fill: #ffffff; stroke: #1f2937; stroke-width: 2; rx: 8; ry: 8; }
-    .header { font: 16px 'Arial', sans-serif; fill: #111827; font-weight: 600; }
-    .text { font: 14px 'Arial', sans-serif; fill: #111827; }
-    .muted { fill: #4b5563; }
-    .arrow { stroke: #1f2937; stroke-width: 2; marker-end: url(#arrowhead); fill: none; }
-    .loss { stroke: #dc2626; }
-    .accent { fill: #0ea5e9; stroke: #0284c7; }
-    .accent2 { fill: #22c55e; stroke: #16a34a; }
-    .accent3 { fill: #f59e0b; stroke: #d97706; }
-  </style>
+  <desc id="desc">Scientific-style diagram for focal stack conditioning, Stable Diffusion 3.5 UNet fine-tuning, and dual-task losses.</desc>
   <defs>
-    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#1f2937" />
+    <linearGradient id="panel" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc" />
+      <stop offset="100%" stop-color="#e2e8f0" />
+    </linearGradient>
+    <linearGradient id="model" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#d3e5ff" />
+      <stop offset="100%" stop-color="#e2e8ff" />
+    </linearGradient>
+    <linearGradient id="output" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#fff4d5" />
+      <stop offset="100%" stop-color="#ffe8c2" />
+    </linearGradient>
+    <linearGradient id="loss" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#ffe1e1" />
+      <stop offset="100%" stop-color="#ffd1d1" />
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="12" markerHeight="12" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f172a" />
     </marker>
-    <marker id="arrowhead-loss" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#dc2626" />
+    <marker id="arrowLoss" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="12" markerHeight="12" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b91c1c" />
     </marker>
   </defs>
+  <style>
+    .panel { fill: url(#panel); stroke: #cbd5e1; stroke-width: 2; rx: 14; ry: 14; }
+    .card { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.8; rx: 12; ry: 12; filter: drop-shadow(0px 1px 2px rgba(0,0,0,0.08)); }
+    .card-title { font: 16px 'Helvetica Neue', Arial, sans-serif; font-weight: 700; fill: #0f172a; }
+    .card-sub { font: 14px 'Helvetica Neue', Arial, sans-serif; fill: #334155; }
+    .small { font: 13px 'Helvetica Neue', Arial, sans-serif; fill: #475569; }
+    .arrow { stroke: #0f172a; stroke-width: 2.5; marker-end: url(#arrow); fill: none; }
+    .loss { stroke: #b91c1c; stroke-width: 2.5; marker-end: url(#arrowLoss); fill: none; }
+    .badge { font: 12px 'Helvetica Neue', Arial, sans-serif; font-weight: 700; fill: #0f172a; }
+    .muted { fill: #475569; }
+  </style>
 
-  <!-- Inputs -->
-  <rect class="box accent" x="40" y="80" width="180" height="100" />
-  <text class="header" x="60" y="110">Focal stack</text>
-  <text class="text" x="60" y="135">N images (z-depth sweep)</text>
-  <text class="text muted" x="60" y="160">RGB frames on disk</text>
+  <!-- Background panels -->
+  <rect class="panel" x="28" y="26" width="320" height="488" />
+  <rect class="panel" x="370" y="26" width="310" height="488" />
+  <rect class="panel" x="704" y="26" width="220" height="488" />
+  <rect class="panel" x="944" y="26" width="210" height="488" />
 
-  <rect class="box" x="40" y="220" width="180" height="100" />
-  <text class="header" x="60" y="250">Metadata</text>
-  <text class="text" x="60" y="275">Camera + focus distances</text>
-  <text class="text muted" x="60" y="300">Depth scale / intrinsics</text>
+  <!-- Section labels -->
+  <text class="badge" x="48" y="50">Inputs &amp; conditioning</text>
+  <text class="badge" x="390" y="50">Simulation &amp; encoding</text>
+  <text class="badge" x="724" y="50">Backbone</text>
+  <text class="badge" x="964" y="50">Predictions &amp; losses</text>
 
-  <!-- Preprocess / simulator -->
-  <rect class="box" x="280" y="80" width="200" height="100" />
-  <text class="header" x="300" y="110">Loader + simulator</text>
-  <text class="text" x="300" y="135">Resize / normalise stacks</text>
-  <text class="text" x="300" y="160">Optional CoC synthesis</text>
+  <!-- Focal stack card -->
+  <rect class="card" x="54" y="78" width="268" height="140" />
+  <text class="card-title" x="76" y="110">Focal stack</text>
+  <text class="card-sub" x="76" y="136">N images across focus depths</text>
+  <text class="small muted" x="76" y="160">Stabilised RGB frames, aligned</text>
+  <g transform="translate(210 120)">
+    <rect x="0" y="0" width="88" height="60" fill="#e2e8f0" stroke="#94a3b8" rx="6" ry="6" />
+    <rect x="-12" y="-10" width="88" height="60" fill="#cbd5e1" stroke="#94a3b8" rx="6" ry="6" opacity="0.8" />
+    <rect x="-24" y="-20" width="88" height="60" fill="#a5b4fc" stroke="#94a3b8" rx="6" ry="6" opacity="0.7" />
+  </g>
 
-  <!-- Conditioning merge -->
-  <rect class="box" x="280" y="220" width="200" height="100" />
-  <text class="header" x="300" y="250">Conditioning</text>
-  <text class="text" x="300" y="275">Inject camera + focus</text>
-  <text class="text" x="300" y="300">Depth-scale hints</text>
+  <!-- Metadata card -->
+  <rect class="card" x="54" y="240" width="268" height="132" />
+  <text class="card-title" x="76" y="270">Camera metadata</text>
+  <text class="card-sub" x="76" y="296">Intrinsics, focus distances</text>
+  <text class="small muted" x="76" y="320">Depth scale hints / pose</text>
 
-  <!-- Model -->
-  <rect class="box accent2" x="540" y="140" width="220" height="120" />
-  <text class="header" x="560" y="175">Stable Diffusion 3.5 UNet</text>
-  <text class="text" x="560" y="200">Focal-conditioned</text>
-  <text class="text" x="560" y="225">Joint RGB + depth head</text>
+  <!-- Conditioning fusion -->
+  <rect class="card" x="54" y="394" width="268" height="100" />
+  <text class="card-title" x="76" y="424">Condition encoding</text>
+  <text class="card-sub" x="76" y="448">Tokenises metadata for UNet</text>
+
+  <!-- Loader & simulator -->
+  <rect class="card" x="390" y="96" width="270" height="134" />
+  <text class="card-title" x="412" y="126">Loader &amp; normalisation</text>
+  <text class="card-sub" x="412" y="152">Resize, colour space, batching</text>
+  <text class="small muted" x="412" y="176">Stack → latent tokens</text>
+
+  <rect class="card" x="390" y="262" width="270" height="134" />
+  <text class="card-title" x="412" y="292">CoC simulator (optional)</text>
+  <text class="card-sub" x="412" y="318">Differentiable blur from depth</text>
+  <text class="small muted" x="412" y="342">Perturbs focus sweep for realism</text>
+
+  <!-- Model core -->
+  <rect x="724" y="114" width="180" height="210" fill="url(#model)" stroke="#64748b" stroke-width="2.4" rx="18" ry="18" />
+  <text class="card-title" x="744" y="148">Stable Diffusion 3.5</text>
+  <text class="card-sub" x="744" y="174">Focal-conditioned UNet</text>
+  <text class="small" x="744" y="200">Dual heads: RGB &amp; depth</text>
+  <text class="small" x="744" y="224">Cross-attn with camera tokens</text>
+  <text class="small" x="744" y="248">Noise schedule: SD3.5 baseline</text>
+  <text class="small" x="744" y="272">Optimiser: AdamW (1e-4)</text>
 
   <!-- Outputs -->
-  <rect class="box accent3" x="820" y="90" width="170" height="100" />
-  <text class="header" x="840" y="120">All-in-focus RGB</text>
-  <text class="text" x="840" y="145">Reconstructed image</text>
+  <rect x="964" y="110" width="170" height="110" fill="url(#output)" stroke="#f59e0b" stroke-width="2" rx="14" ry="14" />
+  <text class="card-title" x="982" y="142">All-in-focus RGB</text>
+  <text class="card-sub" x="982" y="170">Reconstruction, HDR-safe</text>
+  <text class="small muted" x="982" y="194">Eval: PSNR / SSIM</text>
 
-  <rect class="box accent3" x="820" y="230" width="170" height="100" />
-  <text class="header" x="840" y="260">Metric depth</text>
-  <text class="text" x="840" y="285">Absolute scale map</text>
+  <rect x="964" y="250" width="170" height="110" fill="url(#output)" stroke="#f59e0b" stroke-width="2" rx="14" ry="14" />
+  <text class="card-title" x="982" y="282">Metric depth</text>
+  <text class="card-sub" x="982" y="310">Absolute scale, dense</text>
+  <text class="small muted" x="982" y="334">Eval: Abs Rel / δ &lt; 1.25</text>
 
-  <!-- Losses -->
-  <rect class="box" x="540" y="310" width="220" height="90" />
-  <text class="header" x="560" y="340">Losses</text>
-  <text class="text" x="560" y="365">RGB L1 / SSIM</text>
-  <text class="text" x="560" y="390">Depth L1 / scale-aware</text>
+  <!-- Loss block -->
+  <rect x="964" y="392" width="170" height="108" fill="url(#loss)" stroke="#b91c1c" stroke-width="2" rx="14" ry="14" />
+  <text class="card-title" x="982" y="424">Training losses</text>
+  <text class="small" x="982" y="450">RGB: L1 + MS-SSIM</text>
+  <text class="small" x="982" y="472">Depth: L1 + scale-aware</text>
 
-  <!-- Arrows -->
-  <line class="arrow" x1="220" y1="130" x2="280" y2="130" />
-  <line class="arrow" x1="220" y1="270" x2="280" y2="270" />
-  <line class="arrow" x1="480" y1="130" x2="540" y2="200" />
-  <line class="arrow" x1="480" y1="270" x2="540" y2="200" />
-  <line class="arrow" x1="760" y1="200" x2="820" y2="140" />
-  <line class="arrow" x1="760" y1="200" x2="820" y2="280" />
-  <line class="arrow loss" marker-end="url(#arrowhead-loss)" x1="820" y1="320" x2="760" y2="320" />
-  <line class="arrow loss" marker-end="url(#arrowhead-loss)" x1="820" y1="140" x2="760" y2="310" />
-  <line class="arrow loss" marker-end="url(#arrowhead-loss)" x1="820" y1="280" x2="760" y2="310" />
-  <line class="arrow loss" marker-end="url(#arrowhead-loss)" x1="650" y1="310" x2="650" y2="260" />
+  <!-- Arrows forward -->
+  <path class="arrow" d="M 322 148 C 350 148 360 148 388 148" />
+  <path class="arrow" d="M 322 308 C 350 308 360 308 388 308" />
+  <path class="arrow" d="M 322 444 C 350 444 360 444 388 444" />
+  <path class="arrow" d="M 660 148 C 690 148 700 148 724 176" />
+  <path class="arrow" d="M 660 308 C 690 308 700 308 724 246" />
+  <path class="arrow" d="M 660 444 C 690 444 700 444 724 288" />
+  <path class="arrow" d="M 904 170 C 928 170 940 170 964 170" />
+  <path class="arrow" d="M 904 244 C 928 244 940 244 964 244" />
+
+  <!-- Loss arrows back -->
+  <path class="loss" d="M 964 440 C 928 420 860 392 820 350" />
+  <path class="loss" d="M 964 440 C 920 360 900 320 900 280" />
+  <path class="loss" d="M 964 440 C 920 320 900 220 900 190" />
+
+  <!-- Legends / notes -->
+  <text class="badge" x="74" y="520">Encoders</text>
+  <text class="badge" x="414" y="520">Simulation</text>
+  <text class="badge" x="760" y="520">Backbone</text>
+  <text class="badge" x="994" y="520">Supervision</text>
 </svg>
