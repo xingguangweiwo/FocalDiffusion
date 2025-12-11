@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 480" role="img" aria-labelledby="title desc">
+  <title id="title">FocalDiffusion training pipeline</title>
+  <desc id="desc">Flow from focal stack inputs through preprocessing, Stable Diffusion 3.5 UNet, multi-task outputs, and losses.</desc>
+  <style>
+    .box { fill: #ffffff; stroke: #1f2937; stroke-width: 2; rx: 8; ry: 8; }
+    .header { font: 16px 'Arial', sans-serif; fill: #111827; font-weight: 600; }
+    .text { font: 14px 'Arial', sans-serif; fill: #111827; }
+    .muted { fill: #4b5563; }
+    .arrow { stroke: #1f2937; stroke-width: 2; marker-end: url(#arrowhead); fill: none; }
+    .loss { stroke: #dc2626; }
+    .accent { fill: #0ea5e9; stroke: #0284c7; }
+    .accent2 { fill: #22c55e; stroke: #16a34a; }
+    .accent3 { fill: #f59e0b; stroke: #d97706; }
+  </style>
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#1f2937" />
+    </marker>
+    <marker id="arrowhead-loss" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#dc2626" />
+    </marker>
+  </defs>
+
+  <!-- Inputs -->
+  <rect class="box accent" x="40" y="80" width="180" height="100" />
+  <text class="header" x="60" y="110">Focal stack</text>
+  <text class="text" x="60" y="135">N images (z-depth sweep)</text>
+  <text class="text muted" x="60" y="160">RGB frames on disk</text>
+
+  <rect class="box" x="40" y="220" width="180" height="100" />
+  <text class="header" x="60" y="250">Metadata</text>
+  <text class="text" x="60" y="275">Camera + focus distances</text>
+  <text class="text muted" x="60" y="300">Depth scale / intrinsics</text>
+
+  <!-- Preprocess / simulator -->
+  <rect class="box" x="280" y="80" width="200" height="100" />
+  <text class="header" x="300" y="110">Loader + simulator</text>
+  <text class="text" x="300" y="135">Resize / normalise stacks</text>
+  <text class="text" x="300" y="160">Optional CoC synthesis</text>
+
+  <!-- Conditioning merge -->
+  <rect class="box" x="280" y="220" width="200" height="100" />
+  <text class="header" x="300" y="250">Conditioning</text>
+  <text class="text" x="300" y="275">Inject camera + focus</text>
+  <text class="text" x="300" y="300">Depth-scale hints</text>
+
+  <!-- Model -->
+  <rect class="box accent2" x="540" y="140" width="220" height="120" />
+  <text class="header" x="560" y="175">Stable Diffusion 3.5 UNet</text>
+  <text class="text" x="560" y="200">Focal-conditioned</text>
+  <text class="text" x="560" y="225">Joint RGB + depth head</text>
+
+  <!-- Outputs -->
+  <rect class="box accent3" x="820" y="90" width="170" height="100" />
+  <text class="header" x="840" y="120">All-in-focus RGB</text>
+  <text class="text" x="840" y="145">Reconstructed image</text>
+
+  <rect class="box accent3" x="820" y="230" width="170" height="100" />
+  <text class="header" x="840" y="260">Metric depth</text>
+  <text class="text" x="840" y="285">Absolute scale map</text>
+
+  <!-- Losses -->
+  <rect class="box" x="540" y="310" width="220" height="90" />
+  <text class="header" x="560" y="340">Losses</text>
+  <text class="text" x="560" y="365">RGB L1 / SSIM</text>
+  <text class="text" x="560" y="390">Depth L1 / scale-aware</text>
+
+  <!-- Arrows -->
+  <line class="arrow" x1="220" y1="130" x2="280" y2="130" />
+  <line class="arrow" x1="220" y1="270" x2="280" y2="270" />
+  <line class="arrow" x1="480" y1="130" x2="540" y2="200" />
+  <line class="arrow" x1="480" y1="270" x2="540" y2="200" />
+  <line class="arrow" x1="760" y1="200" x2="820" y2="140" />
+  <line class="arrow" x1="760" y1="200" x2="820" y2="280" />
+  <line class="arrow loss" marker-end="url(#arrowhead-loss)" x1="820" y1="320" x2="760" y2="320" />
+  <line class="arrow loss" marker-end="url(#arrowhead-loss)" x1="820" y1="140" x2="760" y2="310" />
+  <line class="arrow loss" marker-end="url(#arrowhead-loss)" x1="820" y1="280" x2="760" y2="310" />
+  <line class="arrow loss" marker-end="url(#arrowhead-loss)" x1="650" y1="310" x2="650" y2="260" />
+</svg>
