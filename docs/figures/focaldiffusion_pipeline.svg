@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 680" role="img" aria-labelledby="title desc">
+  <title id="title">FocalDiffusion training and inference schematic</title>
+  <desc id="desc">Publication-style diagram showing focal stack conditioning, Stable Diffusion 3.5 focal transformer, dual-head U-Net, and supervision.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc" />
+      <stop offset="100%" stop-color="#e2e8f0" />
+    </linearGradient>
+    <linearGradient id="model" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#dbeafe" />
+      <stop offset="100%" stop-color="#e0f2fe" />
+    </linearGradient>
+    <linearGradient id="output" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#fff4d5" />
+      <stop offset="100%" stop-color="#ffe8c2" />
+    </linearGradient>
+    <linearGradient id="loss" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#ffe1e1" />
+      <stop offset="100%" stop-color="#ffd1d1" />
+    </linearGradient>
+    <linearGradient id="stack" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#e0f7f2" />
+      <stop offset="100%" stop-color="#ccfbf1" />
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="12" markerHeight="12" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f172a" />
+    </marker>
+    <marker id="arrowLoss" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="12" markerHeight="12" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b91c1c" />
+    </marker>
+    <style>
+      text { font-family: 'Helvetica Neue', Arial, sans-serif; fill: #0f172a; }
+      .title { font-size: 22px; font-weight: 700; letter-spacing: 0.2px; }
+      .subtitle { font-size: 15px; fill: #475569; }
+      .panel { fill: url(#bg); stroke: #cbd5e1; stroke-width: 2; rx: 14; ry: 14; }
+      .card { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.6; rx: 12; ry: 12; filter: drop-shadow(0px 2px 6px rgba(0,0,0,0.08)); }
+      .card-ghost { fill: url(#stack); stroke: #5ec2a8; stroke-width: 1.6; rx: 12; ry: 12; filter: drop-shadow(0px 2px 6px rgba(0,0,0,0.08)); }
+      .card-title { font-size: 16px; font-weight: 700; }
+      .card-sub { font-size: 14px; fill: #334155; }
+      .small { font-size: 13px; fill: #475569; }
+      .arrow { stroke: #0f172a; stroke-width: 2.6; marker-end: url(#arrow); fill: none; }
+      .loss { stroke: #b91c1c; stroke-width: 2.6; marker-end: url(#arrowLoss); fill: none; }
+      .badge { font-size: 12px; font-weight: 700; fill: #0f172a; }
+      .label { font-size: 12px; fill: #0f172a; font-weight: 600; }
+    </style>
+  </defs>
+
+  <!-- Canvas framing -->
+  <rect x="20" y="20" width="1240" height="640" fill="white" stroke="#cbd5e1" stroke-width="2" rx="18" ry="18" />
+  <rect x="36" y="42" width="1208" height="590" class="panel" />
+
+  <!-- Header -->
+  <text x="56" y="86" class="title">FocalDiffusion — all-in-focus RGB + metric depth from focal stacks</text>
+  <text x="56" y="110" class="subtitle">Stable Diffusion 3.5 backbone with focal-aware conditioning, simulated stacks, and paired RGB/depth supervision</text>
+
+  <!-- Section labels -->
+  <text x="64" y="150" class="badge">A. Inputs & simulation</text>
+  <text x="432" y="150" class="badge">B. Focal-conditioned backbone</text>
+  <text x="900" y="150" class="badge">C. Outputs & supervision</text>
+
+  <!-- Input column -->
+  <rect x="60" y="170" width="300" height="420" class="card" />
+  <rect x="80" y="200" width="260" height="110" class="card-ghost" />
+  <text x="100" y="230" class="card-title">Focal stack (N views)</text>
+  <text x="100" y="255" class="small">Variable focus distances & apertures</text>
+  <text x="100" y="276" class="small">Camera metadata + optional all-in-focus RGB</text>
+
+  <rect x="80" y="330" width="260" height="110" class="card" />
+  <text x="100" y="360" class="card-title">Metadata & priors</text>
+  <text x="100" y="384" class="small">Intrinsics, focus planes, CoC radius</text>
+  <text x="100" y="405" class="small">Depth scale & unit conventions</text>
+
+  <rect x="80" y="460" width="260" height="110" class="card" />
+  <text x="100" y="490" class="card-title">CoC simulator (optional)</text>
+  <text x="100" y="514" class="small">Synthesises stacks from depth + camera</text>
+  <text x="100" y="535" class="small">Ensures consistent defocus statistics</text>
+
+  <!-- Backbone column -->
+  <rect x="420" y="170" width="360" height="420" class="card" />
+  <rect x="440" y="200" width="320" height="120" fill="url(#model)" stroke="#60a5fa" stroke-width="1.8" rx="12" ry="12" />
+  <text x="460" y="232" class="card-title">Shared encoder</text>
+  <text x="460" y="256" class="small">Multi-scale visual tokens extracted per slice</text>
+  <text x="460" y="277" class="small">Camera/focus embeddings injected</text>
+
+  <rect x="440" y="340" width="320" height="110" fill="#eef2ff" stroke="#6366f1" stroke-width="1.8" rx="12" ry="12" />
+  <text x="460" y="372" class="card-title">Focal fusion transformer</text>
+  <text x="460" y="396" class="small">Cross-slice attention aligns defocus cues</text>
+  <text x="460" y="417" class="small">Depth-aware positional priors</text>
+
+  <rect x="440" y="470" width="320" height="100" fill="#e0f2fe" stroke="#0284c7" stroke-width="1.8" rx="12" ry="12" />
+  <text x="460" y="502" class="card-title">Diffusion U-Net (SD 3.5)</text>
+  <text x="460" y="526" class="small">Dual heads for all-in-focus RGB & depth</text>
+  <text x="460" y="547" class="small">Conditioned on fused focal tokens</text>
+
+  <!-- Outputs column -->
+  <rect x="880" y="170" width="340" height="420" class="card" />
+  <rect x="902" y="200" width="298" height="110" fill="url(#output)" stroke="#f59e0b" stroke-width="1.6" rx="12" ry="12" />
+  <text x="922" y="232" class="card-title">All-in-focus RGB</text>
+  <text x="922" y="256" class="small">Sharp reconstruction at metric scale</text>
+
+  <rect x="902" y="330" width="298" height="110" fill="url(#output)" stroke="#0ea5e9" stroke-width="1.6" rx="12" ry="12" />
+  <text x="922" y="362" class="card-title">Metric depth</text>
+  <text x="922" y="386" class="small">Scale-aware depth with defocus priors</text>
+
+  <rect x="902" y="460" width="298" height="110" fill="url(#loss)" stroke="#b91c1c" stroke-width="1.6" rx="12" ry="12" />
+  <text x="922" y="492" class="card-title">Supervision</text>
+  <text x="922" y="516" class="small">RGB: L1 + SSIM | Depth: L1 + scale clamp</text>
+  <text x="922" y="537" class="small">Defocus consistency loss closes the loop</text>
+
+  <!-- Arrows -->
+  <path d="M 320 255 C 350 255 370 255 420 255" class="arrow" />
+  <path d="M 320 385 C 350 385 370 385 420 385" class="arrow" />
+  <path d="M 320 515 C 350 515 370 515 420 515" class="arrow" />
+
+  <path d="M 760 255 C 810 255 840 255 880 255" class="arrow" />
+  <path d="M 760 385 C 810 385 840 385 880 385" class="arrow" />
+  <path d="M 760 515 C 810 515 840 515 880 515" class="arrow" />
+
+  <path d="M 1070 255 C 1100 255 1100 200 750 200" class="loss" />
+  <path d="M 1070 385 C 1100 385 1100 200 750 200" class="loss" />
+
+  <!-- Insets for focal slices -->
+  <rect x="100" y="220" width="60" height="60" fill="#0ea5e9" opacity="0.12" stroke="#0ea5e9" stroke-width="1.2" rx="8" ry="8" />
+  <rect x="114" y="214" width="60" height="60" fill="#22c55e" opacity="0.12" stroke="#22c55e" stroke-width="1.2" rx="8" ry="8" />
+  <rect x="128" y="208" width="60" height="60" fill="#f59e0b" opacity="0.12" stroke="#f59e0b" stroke-width="1.2" rx="8" ry="8" />
+  <text x="140" y="255" class="label">N slices</text>
+
+  <!-- Legend -->
+  <rect x="1040" y="120" width="180" height="40" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.2" rx="10" ry="10" />
+  <rect x="1054" y="130" width="18" height="12" fill="url(#model)" stroke="#60a5fa" stroke-width="1.2" rx="3" ry="3" />
+  <text x="1078" y="141" class="small">SD3.5 backbone</text>
+  <rect x="1170" y="130" width="18" height="12" fill="#ffe8c2" stroke="#f59e0b" stroke-width="1.2" rx="3" ry="3" />
+  <text x="1040" y="162" class="small">Outputs</text>
+  <rect x="1100" y="154" width="18" height="12" fill="#ffd1d1" stroke="#b91c1c" stroke-width="1.2" rx="3" ry="3" />
+  <text x="1124" y="166" class="small">Losses</text>
+</svg>
