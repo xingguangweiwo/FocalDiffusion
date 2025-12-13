@@ -117,7 +117,7 @@ The script produces the recovered all-in-focus RGB, the metric depth map, and op
 ## Conceptual pipeline
 
 <p align="center">
-  <img src="docs/figures/focaldiffusion_pipeline.svg" alt="Publication-style schematic of FocalDiffusion: focal stacks and metadata flow through optional CoC simulation, focal fusion, and SD3.5 U-Net to produce all-in-focus RGB and depth with paired losses" width="950" />
+  <img src="docs/figures/focaldiffusion_pipeline.svg" alt="Publication-style schematic of FocalDiffusion showing focal stacks, camera priors, simulated augmentation, focal fusion + SD3.5 U-Net, and separated training/inference routes with explicit RGB/depth losses" width="950" />
 </p>
 
 Key ideas:
