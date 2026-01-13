@@ -262,6 +262,18 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
             if key in data_block:
                 data_block[key] = _resolve(data_block[key])
 
+        for sources_key in ("train_sources", "val_sources", "test_sources"):
+            sources = data_block.get(sources_key)
+            if not isinstance(sources, list):
+                continue
+            for source in sources:
+                if not isinstance(source, dict):
+                    continue
+                if "data_root" in source:
+                    source["data_root"] = _resolve(source["data_root"])
+                if "filelist" in source:
+                    source["filelist"] = _resolve(source["filelist"])
+
     output_block = config.get('output')
     if isinstance(output_block, dict) and 'save_dir' in output_block:
         output_block['save_dir'] = _resolve(output_block['save_dir'])
@@ -411,10 +423,6 @@ def validate_config(config: dict) -> None:
     required_keys = [
         'model.base_model_id',
         'data.dataset_type',
-        'data.data_root',
-        'data.train_filelist',
-        'data.val_filelist',
-        'data.test_filelist',
         'training.num_epochs',
         'training.batch_size',
         'optimizer.learning_rate',
@@ -430,6 +438,27 @@ def validate_config(config: dict) -> None:
                 raise ValueError(f"Missing required config key: {key_path}")
             value = value[key]
 
+    data_cfg = config.get('data', {})
+    has_sources = any(key in data_cfg for key in ('train_sources', 'val_sources', 'test_sources'))
+    if has_sources:
+        for split_key in ('train_sources', 'val_sources', 'test_sources'):
+            sources = data_cfg.get(split_key)
+            if sources is None:
+                raise ValueError(f"Missing required config key: data.{split_key}")
+            if not isinstance(sources, list) or not sources:
+                raise ValueError(f"data.{split_key} must be a non-empty list")
+            for source in sources:
+                if not isinstance(source, dict):
+                    raise ValueError(f"data.{split_key} entries must be mappings")
+                if 'data_root' not in source:
+                    raise ValueError(f"data.{split_key} entry is missing data_root")
+                if 'filelist' not in source:
+                    raise ValueError(f"data.{split_key} entry is missing filelist")
+    else:
+        for key in ('data_root', 'train_filelist', 'val_filelist', 'test_filelist'):
+            if key not in data_cfg:
+                raise ValueError(f"Missing required config key: data.{key}")
+
     dataset_type_raw = str(config['data'].get('dataset_type', '') or '').lower()
     if dataset_type_raw not in SUPPORTED_DATASET_TYPES:
         raise ValueError(
@@ -438,22 +467,42 @@ def validate_config(config: dict) -> None:
         )
 
     # Check paths exist
-    resolved_data_root = _resolve_data_root_spec(
-        config['data']['data_root'],
-        dataset_type=dataset_type_raw or None,
-    )
+    if has_sources:
+        for split_key in ('train_sources', 'val_sources', 'test_sources'):
+            sources = data_cfg.get(split_key) or []
+            for source in sources:
+                resolved_root = _resolve_data_root_spec(
+                    source.get('data_root'),
+                    dataset_type=dataset_type_raw or None,
+                    context=f"{split_key}.{source.get('name', 'source')}",
+                )
+                _warn_missing_data_roots(resolved_root)
+                source['data_root'] = _stringify_data_root_spec(resolved_root)
 
-    _warn_missing_data_roots(resolved_data_root)
+                filelist_path = Path(source['filelist'])
+                if not filelist_path.exists():
+                    logger.warning(
+                        "Config filelist %s entry does not exist: %s",
+                        split_key,
+                        filelist_path,
+                    )
+    else:
+        resolved_data_root = _resolve_data_root_spec(
+            config['data']['data_root'],
+            dataset_type=dataset_type_raw or None,
+        )
 
-    # Persist the resolved path back into the config so downstream components use
-    # the same location that was validated here.
-    config['data']['data_root'] = _stringify_data_root_spec(resolved_data_root)
+        _warn_missing_data_roots(resolved_data_root)
 
-    # Ensure filelists exist and give actionable warnings
-    for key in ('train_filelist', 'val_filelist', 'test_filelist'):
-        filelist_path = Path(config['data'][key])
-        if not filelist_path.exists():
-            logger.warning("Config filelist %s does not exist: %s", key, filelist_path)
+        # Persist the resolved path back into the config so downstream components use
+        # the same location that was validated here.
+        config['data']['data_root'] = _stringify_data_root_spec(resolved_data_root)
+
+        # Ensure filelists exist and give actionable warnings
+        for key in ('train_filelist', 'val_filelist', 'test_filelist'):
+            filelist_path = Path(config['data'][key])
+            if not filelist_path.exists():
+                logger.warning("Config filelist %s does not exist: %s", key, filelist_path)
 
     # Create output directory
     output_dir = Path(config['output']['save_dir'])

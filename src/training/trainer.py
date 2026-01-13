@@ -88,15 +88,20 @@ class FocalDiffusionTrainer:
             val_dataset_kwargs = dict(base_dataset_kwargs)
 
         dataset_type = dataset_cfg.get('dataset_type')
+        train_sources = dataset_cfg.get('train_sources')
+        val_sources = dataset_cfg.get('val_sources')
 
         # Training dataloader
-        train_filelist = dataset_cfg['train_filelist']
-        logger.info(f"Loading training data from: {train_filelist}")
+        train_filelist = dataset_cfg.get('train_filelist')
+        if train_sources:
+            logger.info("Loading training data from %d sources", len(train_sources))
+        else:
+            logger.info(f"Loading training data from: {train_filelist}")
 
         self.train_dataloader = create_dataloader(
             dataset_type=dataset_type,
             filelist_path=train_filelist,
-            data_root=dataset_cfg['data_root'],
+            data_root=dataset_cfg.get('data_root', "./data"),
             batch_size=self.config['training']['batch_size'],
             num_workers=dataset_cfg['num_workers'],
             image_size=tuple(dataset_cfg['image_size']),
@@ -105,17 +110,21 @@ class FocalDiffusionTrainer:
             augmentation=True,
             shuffle=True,
             max_samples=dataset_cfg.get('max_train_samples'),
+            sources=train_sources,
             **train_dataset_kwargs,
         )
 
         # Validation dataloader
-        val_filelist = dataset_cfg['val_filelist']
-        logger.info(f"Loading validation data from: {val_filelist}")
+        val_filelist = dataset_cfg.get('val_filelist')
+        if val_sources:
+            logger.info("Loading validation data from %d sources", len(val_sources))
+        else:
+            logger.info(f"Loading validation data from: {val_filelist}")
 
         self.val_dataloader = create_dataloader(
             dataset_type=dataset_type,
             filelist_path=val_filelist,
-            data_root=dataset_cfg['data_root'],
+            data_root=dataset_cfg.get('data_root', "./data"),
             batch_size=self.config['training']['batch_size'],
             num_workers=dataset_cfg['num_workers'],
             image_size=tuple(dataset_cfg['image_size']),
@@ -124,6 +133,7 @@ class FocalDiffusionTrainer:
             augmentation=False,
             shuffle=False,
             max_samples=dataset_cfg.get('max_val_samples'),
+            sources=val_sources,
             **val_dataset_kwargs,
         )
 
