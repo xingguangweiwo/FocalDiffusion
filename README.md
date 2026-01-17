@@ -66,7 +66,7 @@ Experiments are driven by YAML presets in `configs/`:
 Key options:
 
 - `model.base_model_id` — Stable Diffusion 3.5 checkpoint to adapt.
-- `data.train_sources`/`val_sources`/`test_sources` to mix datasets, or `data.data_root` + `*_filelist` for a single dataset. Use `data.dataset_kwargs` for camera defaults, `simulator_kwargs`, and per-split overrides (e.g., `generate_focal_stack`).
+- `data.train_sources`/`val_sources`/`test_sources` to mix datasets, or `data.data_root` + `*_filelist` for a single dataset. Per-source overrides such as `focal_range`, `focal_stack_size`, and `image_size` can be specified inside each source block. Use `data.dataset_kwargs` for camera defaults, `simulator_kwargs`, and per-split overrides (e.g., `generate_focal_stack`).
 - `training.batch_size`, `training.gradient_accumulation_steps`, `optimizer.learning_rate` — tune for your hardware budget.
 
 Validate a configuration without starting optimisation:
