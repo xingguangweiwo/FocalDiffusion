@@ -4,19 +4,18 @@ defaults:
 
 data:
   dataset_type: virtual_kitti
-  data_root:
-    default:
-      - /data/virtual_kitti
-      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_rgb"
-    all_in_focus:
-      - /data/virtual_kitti
-      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_rgb"
-    depth:
-      - /data/virtual_kitti
-      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_depth"
-  train_filelist: data/filelists/vkitti_train.txt
-  val_filelist: data/filelists/vkitti_val.txt
-  test_filelist: data/filelists/vkitti_test.txt
+  train_sources:
+    - name: virtual_kitti
+      data_root: /data/virtual_kitti/vkitti_2.0.3_rgb
+      filelist: data/filelists/vkitti_train.txt
+  val_sources:
+    - name: virtual_kitti
+      data_root: /data/virtual_kitti/vkitti_2.0.3_rgb
+      filelist: data/filelists/vkitti_val.txt
+  test_sources:
+    - name: virtual_kitti
+      data_root: /data/virtual_kitti/vkitti_2.0.3_rgb
+      filelist: data/filelists/vkitti_test.txt
   focal_stack_size: 7
   focal_range: [0.5, 80.0]
 
