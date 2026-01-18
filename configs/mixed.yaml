@@ -7,19 +7,13 @@ data:
   data_root:
     default:
       - /data/hypersim
-      - /data/virtual_kitti
-      - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
-      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_rgb"
+      - /data/virtual_kitti/vkitti_2.0.3_rgb
     all_in_focus:
       - /data/hypersim_focal
-      - /data/virtual_kitti
-      - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
-      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_rgb"
+      - /data/virtual_kitti/vkitti_2.0.3_rgb
     depth:
       - /data/hypersim
-      - /data/virtual_kitti
-      - "D:/Files/paper/DepthEstimation/Dataset/hypersim"
-      - "D:/Files/paper/DepthEstimation/Dataset/VirtualKITTI/vkitti_2.0.3_depth"
+      - /data/virtual_kitti/vkitti_2.0.3_depth
   train_filelist: data/filelists/train.txt
   val_filelist: data/filelists/val.txt
   test_filelist: data/filelists/test.txt
