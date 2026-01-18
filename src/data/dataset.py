@@ -928,6 +928,10 @@ def create_dataloader(
         merged_kwargs = dict(dataset_kwargs)
         merged_kwargs.update(source_kwargs.get("dataset_kwargs", {}))
 
+        focal_range_override = source_kwargs.get("focal_range", focal_range)
+        focal_stack_override = source_kwargs.get("focal_stack_size", focal_stack_size)
+        image_size_override = source_kwargs.get("image_size", image_size)
+
         root_override = _prepare_root_override(
             source_kwargs.get("data_root", data_root),
             dataset_type=dataset_type,
@@ -941,9 +945,9 @@ def create_dataloader(
         return dataset_class(
             data_root=root_override,
             filelist_path=filelist_override,
-            image_size=image_size,
-            focal_stack_size=focal_stack_size,
-            focal_range=focal_range,
+            image_size=tuple(image_size_override),
+            focal_stack_size=focal_stack_override,
+            focal_range=tuple(focal_range_override),
             transform=transform,
             max_samples=source_kwargs.get("max_samples", max_samples),
             **merged_kwargs,

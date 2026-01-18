@@ -19,8 +19,7 @@ All-in-focus image and metric depth recovery from focal stacks, powered by fine-
 5. [Inference](#inference)
 6. [Repository layout](#repository-layout)
 7. [Troubleshooting](#troubleshooting)
-8. [Conceptual pipeline](#conceptual-pipeline)
-9. [Slide-friendly sketch](#slide-friendly-sketch)
+8. [Slide-friendly sketch](#slide-friendly-sketch)
 
 ## Environment setup
 
@@ -67,7 +66,7 @@ Experiments are driven by YAML presets in `configs/`:
 Key options:
 
 - `model.base_model_id` — Stable Diffusion 3.5 checkpoint to adapt.
-- `data.data_root` and `*_filelist` entries — absolute paths to your stacks. Use `data.dataset_kwargs` for camera defaults, `simulator_kwargs`, and per-split overrides (e.g., `generate_focal_stack`).
+- `data.train_sources`/`val_sources`/`test_sources` to mix datasets, or `data.data_root` + `*_filelist` for a single dataset. Per-source overrides such as `focal_range`, `focal_stack_size`, and `image_size` can be specified inside each source block. Use `data.dataset_kwargs` for camera defaults, `simulator_kwargs`, and per-split overrides (e.g., `generate_focal_stack`).
 - `training.batch_size`, `training.gradient_accumulation_steps`, `optimizer.learning_rate` — tune for your hardware budget.
 
 Validate a configuration without starting optimisation:
@@ -113,18 +112,6 @@ The script produces the recovered all-in-focus RGB, the metric depth map, and op
 - **OOM during training:** lower `training.batch_size`, increase `gradient_accumulation_steps`, or enable FlashAttention/xFormers.
 - **Misaligned depth scale:** check `data.dataset_kwargs.depth_scale` and per-split overrides in your config; verify file list depth units.
 - **Generated stacks look wrong:** confirm focus distances and camera parameters in your JSON file lists when `generate_focal_stack` is enabled.
-
-## Conceptual pipeline
-
-<p align="center">
-  <img src="docs/figures/focaldiffusion_pipeline.svg" alt="Publication-style schematic of FocalDiffusion showing focal stacks, camera priors, simulated augmentation, focal fusion + SD3.5 U-Net, and separated training/inference routes with explicit RGB/depth losses" width="950" />
-</p>
-
-Key ideas:
-
-- The loader ingests either pre-rendered stacks or synthesises them on the fly from depth and camera metadata.
-- The Stable Diffusion 3.5 UNet is fine-tuned to jointly predict all-in-focus RGB and depth, using the stack and metadata as conditioning.
-- Losses supervise both tasks; depth-scale handling is configured via `data.dataset_kwargs`.
 
 ## Slide-friendly sketch
 
