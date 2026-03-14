@@ -45,8 +45,6 @@ Authenticate with Hugging Face so `diffusers` can download model weights on dema
 huggingface-cli login
 ```
 
-Optional accelerators such as [FlashAttention](https://github.com/Dao-AILab/flash-attention) or [xFormers](https://github.com/facebookresearch/xformers) can be installed separately to reduce memory use.
-
 ## Data preparation
 
 Training consumes focal stacks paired with ground-truth depth. File lists under `data/filelists/` document the supported formats:
