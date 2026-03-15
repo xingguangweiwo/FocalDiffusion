@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-
 class FocalDiffusionLoss(nn.Module):
     """Combined loss used during training."""
 
@@ -20,6 +19,9 @@ class FocalDiffusionLoss(nn.Module):
         rgb_weight: float = 0.1,
         consistency_weight: float = 0.05,
         perceptual_weight: float = 0.05,
+        depth_gradient_weight: float = 0.1,
+        edge_consistency_weight: float = 0.05,
+        confidence_regularization_weight: float = 0.01,
     ) -> None:
         super().__init__()
         self.diffusion_weight = diffusion_weight
@@ -27,6 +29,9 @@ class FocalDiffusionLoss(nn.Module):
         self.rgb_weight = rgb_weight
         self.consistency_weight = consistency_weight
         self.perceptual_weight = perceptual_weight
+        self.depth_gradient_weight = depth_gradient_weight
+        self.edge_consistency_weight = edge_consistency_weight
+        self.confidence_regularization_weight = confidence_regularization_weight
 
         self.depth_loss = DepthLoss()
         self.consistency_loss = ConsistencyLoss()
@@ -42,6 +47,7 @@ class FocalDiffusionLoss(nn.Module):
         rgb_target: Optional[torch.Tensor] = None,
         depth_mask: Optional[torch.Tensor] = None,
         focal_features: Optional[Dict[str, torch.Tensor]] = None,
+        confidence_map: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         losses: Dict[str, torch.Tensor] = {}
 
@@ -49,11 +55,24 @@ class FocalDiffusionLoss(nn.Module):
 
         if depth_pred is not None and depth_target is not None and self.depth_weight > 0:
             losses["depth"] = self.depth_loss(depth_pred, depth_target, mask=depth_mask)
+            if self.depth_gradient_weight > 0:
+                losses["depth_gradient"] = gradient_loss(depth_pred, depth_target, mask=depth_mask)
 
         if rgb_pred is not None and rgb_target is not None and self.rgb_weight > 0:
             losses["rgb"] = F.l1_loss(rgb_pred, rgb_target)
             if self.perceptual_loss is not None and self.perceptual_weight > 0:
                 losses["perceptual"] = self.perceptual_loss(rgb_pred, rgb_target)
+
+        if (
+            rgb_pred is not None
+            and depth_pred is not None
+            and self.edge_consistency_weight > 0
+        ):
+            losses["edge_consistency"] = edge_consistency_loss(rgb_pred, depth_pred)
+
+        if confidence_map is not None and self.confidence_regularization_weight > 0:
+            # discourage trivial all-low confidence predictions
+            losses["confidence_regularization"] = (1.0 - confidence_map).mean()
 
         if focal_features is not None and self.consistency_weight > 0:
             losses["consistency"] = self.consistency_loss(focal_features)
@@ -151,3 +170,38 @@ class PerceptualLoss(nn.Module):
             loss = loss.mean()
 
         return loss
+
+
+def gradient_loss(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    pred_dx = pred[..., :, 1:] - pred[..., :, :-1]
+    pred_dy = pred[..., 1:, :] - pred[..., :-1, :]
+    tgt_dx = target[..., :, 1:] - target[..., :, :-1]
+    tgt_dy = target[..., 1:, :] - target[..., :-1, :]
+
+    if mask is not None:
+        if mask.dim() == pred.dim() - 1:
+            mask = mask.unsqueeze(1)
+        mask_dx = mask[..., :, 1:] * mask[..., :, :-1]
+        mask_dy = mask[..., 1:, :] * mask[..., :-1, :]
+        loss_dx = (torch.abs(pred_dx - tgt_dx) * mask_dx).sum() / mask_dx.sum().clamp(min=1)
+        loss_dy = (torch.abs(pred_dy - tgt_dy) * mask_dy).sum() / mask_dy.sum().clamp(min=1)
+        return loss_dx + loss_dy
+
+    return F.l1_loss(pred_dx, tgt_dx) + F.l1_loss(pred_dy, tgt_dy)
+
+
+def edge_consistency_loss(rgb_pred: torch.Tensor, depth_pred: torch.Tensor) -> torch.Tensor:
+    if depth_pred.dim() == 3:
+        depth_pred = depth_pred.unsqueeze(1)
+
+    rgb_gray = rgb_pred.mean(dim=1, keepdim=True)
+
+    rgb_dx = rgb_gray[..., :, 1:] - rgb_gray[..., :, :-1]
+    rgb_dy = rgb_gray[..., 1:, :] - rgb_gray[..., :-1, :]
+    depth_dx = depth_pred[..., :, 1:] - depth_pred[..., :, :-1]
+    depth_dy = depth_pred[..., 1:, :] - depth_pred[..., :-1, :]
+
+    rgb_edge = torch.sqrt(rgb_dx.pow(2).mean() + rgb_dy.pow(2).mean() + 1e-6)
+    depth_edge = torch.sqrt(depth_dx.pow(2).mean() + depth_dy.pow(2).mean() + 1e-6)
+
+    return torch.abs(rgb_edge - depth_edge)

@@ -6,3 +6,8 @@ outputs/
 wandb/
 configs/local*.yaml
 
+
+.idea/
+**/__pycache__/
+
+*.egg-info/
