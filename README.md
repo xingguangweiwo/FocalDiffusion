@@ -1,6 +1,6 @@
 # FocalDiffusion
 
-All-in-focus image and metric depth recovery from focal stacks, powered by fine-tuning Stable Diffusion 3.5. This repository contains the training, evaluation, and inference pipelines released with *FocalDiffusion: Affordable Zero-shot Diffusion-Based Image and Depth Generators from Focal Stack*.
+All-in-focus image and metric depth recovery from focal stacks, powered by fine-tuning Stable Diffusion 3.5. This repository contains the training, evaluation, and inference pipelines for FocalDiffusion.
 
 ## At a glance
 
@@ -43,7 +43,7 @@ Authenticate with Hugging Face so `diffusers` can download model weights on dema
 huggingface-cli login
 ```
 
-Optional accelerators such as [FlashAttention](https://github.com/Dao-AILab/flash-attention) or [xFormers](https://github.com/facebookresearch/xformers) can be installed separately to reduce memory use.
+Optional accelerators such as [FlashAttention](https://github.com/Dao-AILab/flash-attention) or [xFormers](https://github.com/facebookresearch/xformers) can be installed separately to reduce memory use. Project dependencies are declared in `pyproject.toml`.
 
 ## Data preparation
 
@@ -105,6 +105,7 @@ The script produces the recovered all-in-focus RGB, the metric depth map, and op
 - `data/filelists/` — example lists for HyperSim, Virtual KITTI, and mixed splits.
 - `script/` — CLI entry points for training, evaluation, and utilities.
 - `src/` — dataset, simulator, pipeline, and trainer implementations.
+- `src/legacy/` — archived experimental implementations kept for reference only.
 
 ## Troubleshooting
 
