@@ -1,6 +1,6 @@
 # FocalDiffusion
 
-All-in-focus image and metric depth recovery from focal stacks, powered by fine-tuning Stable Diffusion 3.5. This repository contains the training, evaluation, and inference pipelines released with *FocalDiffusion: Affordable Zero-shot Diffusion-Based Image and Depth Generators from Focal Stack*.
+All-in-focus image and metric depth recovery from focal stacks, powered by fine-tuning Stable Diffusion 3.5. This repository contains the training, evaluation, and inference pipelines for FocalDiffusion.
 
 ## At a glance
 
@@ -193,6 +193,7 @@ For each variant/baseline, include:
 - `data/filelists/` — example lists for HyperSim, Virtual KITTI, and mixed splits.
 - `script/` — CLI entry points for training, evaluation, and utilities.
 - `src/` — dataset, simulator, pipeline, and trainer implementations.
+- `src/legacy/` — archived experimental implementations kept for reference only.
 
 ## Troubleshooting
 

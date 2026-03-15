@@ -28,8 +28,7 @@ from transformers import (
     T5TokenizerFast,
 )
 
-from .attention_modules import FocalCrossAttention
-
+from .focal_attention import FocalCrossAttention
 
 @dataclass
 class FocalDiffusionOutput(BaseOutput):

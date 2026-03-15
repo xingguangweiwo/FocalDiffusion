@@ -37,7 +37,7 @@ from transformers import (
     T5TokenizerFast,
 )
 
-from ..models.attention_modules import FocalCrossAttention
+from ..models.focal_attention import FocalCrossAttention
 from ..models.camera_invariant import CameraInvariantEncoder
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
