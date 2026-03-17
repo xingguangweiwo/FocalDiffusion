@@ -15,6 +15,7 @@ from .camera_utils import (
 )
 from .metrics import compute_metrics
 from .visualization import visualize_results
+from .env_utils import ensure_sentencepiece_installed
 
 
 __all__ = [
