@@ -1,4 +1,4 @@
-"""Focal cross-attention modules used by the SD3 conditioning path."""
+"""Attention-specific modules for focal conditioning."""
 
 from __future__ import annotations
 

@@ -1,8 +1,7 @@
-"""Compatibility shim for historical imports.
+"""Backward-compatible re-exports for legacy imports.
 
-Active modules have been split into:
-- :mod:`src.models.focal_attention`
-- :mod:`src.models.physics_modules`
+Use `focal_attention.py` for attention-specific modules and `physics_modules.py`
+for optics/physics helpers.
 """
 
 from .focal_attention import FocalCrossAttention
