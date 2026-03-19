@@ -30,6 +30,7 @@ from transformers import (
 
 from ..models.focal_attention import FocalCrossAttention
 
+
 @dataclass
 class FocalDiffusionOutput(BaseOutput):
     """Output class for FocalDiffusion Pipeline"""

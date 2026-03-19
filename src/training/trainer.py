@@ -308,10 +308,11 @@ class FocalDiffusionTrainer:
 
         # Setup EMA if enabled
         if self.config['training'].get('use_ema'):
+            ema_params = self._ema_parameters()
             self.ema = EMAModel(
-                self.focal_processor.parameters(),
+                ema_params,
                 decay=self.config['training']['ema_decay']
-            )
+            ) if ema_params else None
         else:
             self.ema = None
 
@@ -445,6 +446,12 @@ class FocalDiffusionTrainer:
             "FocalDiffusionPipeline is missing parameter accessors. "
             "Please update src/pipelines/focal_diffusion_pipeline.py."
         )
+
+
+    def _ema_parameters(self):
+        """Materialize trainable parameters tracked by EMA."""
+
+        return [param for param in self._iter_pipeline_parameters(only_trainable=True)]
 
     def setup_tracking(self):
         """Setup experiment tracking"""
@@ -776,7 +783,7 @@ class FocalDiffusionTrainer:
 
                 # Update EMA
                 if self.ema is not None:
-                    self.ema.step(self.focal_processor.parameters())
+                    self.ema.step(self._ema_parameters())
 
                 # Logging
                 epoch_loss += loss.item()

@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Optional
-import cv2
 
 
 class FocalAugmentation:
@@ -67,6 +66,12 @@ class FocalAugmentation:
             noise = torch.randn_like(focal_stack) * self.noise_std
             focal_stack = torch.clamp(focal_stack + noise, -1, 1)
 
+        # Optional blur augmentation (keeps blur_prob meaningful)
+        if self.blur_prob > 0 and np.random.rand() < self.blur_prob:
+            focal_stack = self._apply_blur(focal_stack)
+            if all_in_focus is not None:
+                all_in_focus = self._apply_blur(all_in_focus.unsqueeze(0)).squeeze(0)
+
         return focal_stack, depth, all_in_focus
 
     def _random_crop_resize(
@@ -115,3 +120,9 @@ class FocalAugmentation:
         images = (images - mean) * contrast + mean
 
         return torch.clamp(images, -1, 1)
+
+
+    def _apply_blur(self, images: torch.Tensor) -> torch.Tensor:
+        """Apply lightweight blur with average pooling."""
+
+        return F.avg_pool2d(images, kernel_size=3, stride=1, padding=1)

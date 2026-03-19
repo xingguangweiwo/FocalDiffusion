@@ -1,7 +1,4 @@
-"""
-Focal Stack Processor - Core module for processing focal stacks
-Fixed version with complete implementations
-"""
+"""Core modules for processing focal stacks."""
 
 import torch
 import torch.nn as nn

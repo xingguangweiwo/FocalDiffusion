@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument(
         '--base-model',
         type=str,
-        default='stabilityai/stable-diffusion-3.5-large-tensorrt',
+        default='stabilityai/stable-diffusion-3.5-large',
         help='Base SD3.5 model ID'
     )
     parser.add_argument(
@@ -129,12 +129,6 @@ def parse_args():
         type=float,
         default=7.0,
         help='Guidance scale for inference'
-    )
-    parser.add_argument(
-        '--ensemble-size',
-        type=int,
-        default=1,
-        help='Number of predictions to ensemble for uncertainty'
     )
     parser.add_argument(
         '--camera-invariant-mode',
@@ -299,7 +293,6 @@ def process_focal_stack(
             camera_params=camera_params,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
-            ensemble_size=args.ensemble_size,
             camera_invariant_mode=args.camera_invariant_mode,
             output_type="pil" if args.save_visualization else "pt",
             return_dict=True,
