@@ -76,6 +76,9 @@ losses:
   depth_weight: 1.0
   rgb_weight: 0.5
   consistency_weight: 0.1
+  depth_gradient_weight: 0.1
+  edge_consistency_weight: 0.05
+  confidence_regularization_weight: 0.01
 
 validation:
   num_inference_steps: 30

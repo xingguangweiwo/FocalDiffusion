@@ -1,6 +1,6 @@
 # FocalDiffusion
 
-All-in-focus image and metric depth recovery from focal stacks, powered by fine-tuning Stable Diffusion 3.5. This repository contains the training, evaluation, and inference pipelines released with *FocalDiffusion: Affordable Zero-shot Diffusion-Based Image and Depth Generators from Focal Stack*.
+All-in-focus image and metric depth recovery from focal stacks, powered by fine-tuning Stable Diffusion 3.5. This repository contains the training, evaluation, and inference pipelines released with *FocalDiffusion* for focal-stack-based all-in-focus reconstruction and depth estimation.
 
 ## At a glance
 

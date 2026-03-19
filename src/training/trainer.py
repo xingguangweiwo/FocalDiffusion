@@ -308,10 +308,11 @@ class FocalDiffusionTrainer:
 
         # Setup EMA if enabled
         if self.config['training'].get('use_ema'):
+            ema_params = self._ema_parameters()
             self.ema = EMAModel(
-                self.focal_processor.parameters(),
+                ema_params,
                 decay=self.config['training']['ema_decay']
-            )
+            ) if ema_params else None
         else:
             self.ema = None
 
@@ -446,6 +447,12 @@ class FocalDiffusionTrainer:
             "Please update src/pipelines/focal_diffusion_pipeline.py."
         )
 
+
+    def _ema_parameters(self):
+        """Materialize trainable parameters tracked by EMA."""
+
+        return [param for param in self._iter_pipeline_parameters(only_trainable=True)]
+
     def setup_tracking(self):
         """Setup experiment tracking"""
         if self.accelerator.is_main_process:
@@ -533,6 +540,9 @@ class FocalDiffusionTrainer:
             rgb_weight=self.config['losses']['rgb_weight'],
             consistency_weight=self.config['losses']['consistency_weight'],
             perceptual_weight=self.config['losses'].get('perceptual_weight', 0.05),
+            depth_gradient_weight=self.config['losses'].get('depth_gradient_weight', 0.1),
+            edge_consistency_weight=self.config['losses'].get('edge_consistency_weight', 0.05),
+            confidence_regularization_weight=self.config['losses'].get('confidence_regularization_weight', 0.01),
         ).to(self.accelerator.device)
 
         progress_bar = tqdm(
@@ -703,7 +713,7 @@ class FocalDiffusionTrainer:
                     )
 
                     # Decode auxiliary predictions for multi-task losses
-                    depth_logits, rgb_latent_pred = self.dual_decoder(clean_latent_pred)
+                    depth_logits, rgb_latent_pred, confidence_map = self.dual_decoder(clean_latent_pred)
 
                     depth_probs = torch.sigmoid(depth_logits)
                     depth_probs = F.interpolate(
@@ -750,6 +760,7 @@ class FocalDiffusionTrainer:
                         rgb_pred=rgb_recon,
                         rgb_target=rgb_target_fp32,
                         focal_features=focal_features,
+                        confidence_map=confidence_map.float(),
                     )
                     loss = loss_dict['total']
 
@@ -772,7 +783,7 @@ class FocalDiffusionTrainer:
 
                 # Update EMA
                 if self.ema is not None:
-                    self.ema.step(self.focal_processor.parameters())
+                    self.ema.step(self._ema_parameters())
 
                 # Logging
                 epoch_loss += loss.item()
@@ -870,60 +881,10 @@ class FocalDiffusionTrainer:
         )
 
     def validate(self, epoch: int) -> dict:
-        """Validation loop"""
-        from ..utils.metrics import compute_metrics
+        """Validation loop."""
+        from .validation import run_validation
 
-        self.pipeline.eval()
-        val_metrics = {'loss': 0.0, 'abs_rel': 0.0, 'rmse': 0.0}
-        num_batches = 0
-
-        with torch.no_grad():
-            for batch in tqdm(
-                    self.val_dataloader,
-                    desc="Validation",
-                    disable=not self.accelerator.is_local_main_process
-            ):
-                # Generate predictions
-                output = self.pipeline(
-                    focal_stack=batch['focal_stack'],
-                    focus_distances=batch['focus_distances'],
-                    camera_params=batch.get('camera_params'),
-                    num_inference_steps=self.config['validation']['num_inference_steps'],
-                    guidance_scale=self.config['validation']['guidance_scale'],
-                    output_type='pt',
-                    return_dict=True,
-                )
-
-                # Compute metrics
-                depth_gt = batch['depth'].to(output.depth_map.device).squeeze(1)
-                mask = batch.get('valid_mask')
-                if mask is not None:
-                    mask = mask.to(output.depth_map.device)
-
-                metrics = compute_metrics(
-                    output.depth_map,
-                    depth_gt,
-                    mask=mask,
-                )
-
-                # Accumulate
-                for k, v in metrics.items():
-                    if k in val_metrics:
-                        val_metrics[k] += v
-
-                if mask is not None:
-                    val_loss = F.l1_loss(output.depth_map[mask], depth_gt[mask])
-                else:
-                    val_loss = F.l1_loss(output.depth_map, depth_gt)
-                val_metrics['loss'] += val_loss.item()
-
-                num_batches += 1
-
-        # Average metrics
-        for k in val_metrics:
-            val_metrics[k] /= num_batches
-
-        return val_metrics
+        return run_validation(self, epoch)
 
     def save_checkpoint(
             self,
@@ -932,87 +893,19 @@ class FocalDiffusionTrainer:
             is_best: bool = False,
             is_final: bool = False
     ):
-        """Save model checkpoint"""
-        if not self.accelerator.is_main_process:
-            return
+        """Save model checkpoint."""
+        from .checkpointing import save_checkpoint
 
-        # Prepare checkpoint
-        checkpoint = {
-            'epoch': epoch,
-            'global_step': global_step,
-            'focal_processor_state_dict': self.accelerator.unwrap_model(self.focal_processor).state_dict(),
-            'camera_encoder_state_dict': self.accelerator.unwrap_model(self.camera_encoder).state_dict(),
-            'dual_decoder_state_dict': self.accelerator.unwrap_model(self.dual_decoder).state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.lr_scheduler.state_dict(),
-            'config': self.config,
-        }
-
-        # Add transformer state if training it
-        if self.config['training']['trainable_modules']['transformer'] != 'frozen':
-            checkpoint['transformer_state_dict'] = self.accelerator.unwrap_model(
-                self.pipeline.transformer
-            ).state_dict()
-
-        if self.ema is not None:
-            checkpoint['ema_state_dict'] = self.ema.state_dict()
-
-        # Determine filename
-        if is_best:
-            filename = 'best.pt'
-        elif is_final:
-            filename = 'final.pt'
-        else:
-            filename = f'checkpoint_epoch_{epoch}.pt'
-
-        # Save
-        save_path = self.checkpoint_dir / filename
-        torch.save(checkpoint, save_path)
-        logger.info(f"Saved checkpoint: {filename}")
-
-        # Keep only last N checkpoints
-        if self.config['output'].get('save_top_k'):
-            self._cleanup_checkpoints()
+        save_checkpoint(self, epoch, global_step, is_best=is_best, is_final=is_final)
 
     def _cleanup_checkpoints(self):
-        """Keep only the last N checkpoints"""
-        save_top_k = self.config['output'].get('save_top_k', 3)
+        """Keep only the last N checkpoints."""
+        from .checkpointing import cleanup_checkpoints
 
-        # List all checkpoint files
-        checkpoints = list(self.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
-        checkpoints.sort(key=lambda x: int(x.stem.split('_')[-1]))
-
-        # Remove old checkpoints
-        if len(checkpoints) > save_top_k:
-            for checkpoint in checkpoints[:-save_top_k]:
-                checkpoint.unlink()
-                logger.info(f"Removed old checkpoint: {checkpoint.name}")
+        cleanup_checkpoints(self)
 
     def load_checkpoint(self, checkpoint_path: str):
-        """Load checkpoint for resuming training"""
-        logger.info(f"Loading checkpoint from {checkpoint_path}")
+        """Load checkpoint for resuming training."""
+        from .checkpointing import load_checkpoint
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.accelerator.device)
-
-        # Load model states
-        self.focal_processor.load_state_dict(checkpoint['focal_processor_state_dict'])
-        self.camera_encoder.load_state_dict(checkpoint['camera_encoder_state_dict'])
-        self.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'])
-
-        if 'transformer_state_dict' in checkpoint:
-            self.pipeline.transformer.load_state_dict(checkpoint['transformer_state_dict'])
-
-        # Load optimizer and scheduler
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-        # Load EMA if available
-        if self.ema is not None and 'ema_state_dict' in checkpoint:
-            self.ema.load_state_dict(checkpoint['ema_state_dict'])
-
-        epoch = checkpoint['epoch']
-        global_step = checkpoint['global_step']
-
-        logger.info(f"Resumed from epoch {epoch}, global step {global_step}")
-
-        return epoch, global_step
+        return load_checkpoint(self, checkpoint_path)

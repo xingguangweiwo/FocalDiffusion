@@ -1,4 +1,4 @@
-"""FocalDiffusion - Zero-shot depth and all-in-focus generation from focal stacks."""
+"""FocalDiffusion - all-in-focus image and depth generation from focal stacks."""
 
 __version__ = "1.0.0"
 

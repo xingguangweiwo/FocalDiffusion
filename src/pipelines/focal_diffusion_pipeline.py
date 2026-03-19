@@ -37,7 +37,7 @@ from transformers import (
     T5TokenizerFast,
 )
 
-from ..models.attention_modules import FocalCrossAttention
+from ..models.focal_attention import FocalCrossAttention
 from ..models.camera_invariant import CameraInvariantEncoder
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
@@ -478,7 +478,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
-        depth_logits, rgb_latents = self.dual_decoder(latents)
+        depth_logits, rgb_latents, confidence_map = self.dual_decoder(latents)
         depth_probs = torch.sigmoid(depth_logits)
         depth_probs = F.interpolate(
             depth_probs, size=(height, width), mode="bilinear", align_corners=False
@@ -510,6 +510,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             depth_colored=depth_color,
             focal_features=focal_features,
             attention_maps=None,
+            uncertainty=1.0 - confidence_map.squeeze(1),
         )
 
     def _ensure_tensor_stack(self, stack: Union[torch.Tensor, List[Image.Image]]) -> torch.Tensor:

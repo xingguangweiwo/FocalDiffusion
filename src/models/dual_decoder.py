@@ -41,7 +41,7 @@ class _ResidualBlock(nn.Module):
 
 
 class DualOutputDecoder(nn.Module):
-    """Decode SD3.5 latents into depth logits and RGB latents."""
+    """Decode SD3.5 latents into AIF, depth and confidence with cross-task coupling."""
 
     def __init__(
         self,
@@ -88,23 +88,41 @@ class DualOutputDecoder(nn.Module):
         self.depth_branch = branch_block()
         self.rgb_branch = branch_block()
 
+        # Feature-level cross-task coupling: AIF features guide depth structure recovery.
+        self.aif_to_depth = nn.Sequential(
+            nn.Conv2d(dims[-1], dims[-1], kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(dims[-1], dims[-1], kernel_size=3, padding=1),
+        )
+        self.aif_coupling_gate = nn.Sequential(
+            nn.Conv2d(dims[-1] * 2, dims[-1], kernel_size=1),
+            nn.Sigmoid(),
+        )
+
         self.depth_head = nn.Conv2d(dims[-1], out_channels_depth, kernel_size=3, padding=1)
+        self.confidence_head = nn.Conv2d(dims[-1], 1, kernel_size=3, padding=1)
         self.rgb_head = nn.Conv2d(dims[-1], self.out_channels_rgb, kernel_size=3, padding=1)
 
-    def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return depth logits and RGB latents for the given diffusion latents."""
+        # Confidence-guided depth refinement with AIF structure.
+        self.depth_refine = nn.Sequential(
+            _ResidualBlock(dims[-1] + in_channels + 2, dims[-1], dilation=1, dropout=0.0),
+            _ResidualBlock(dims[-1], dims[-1], dilation=1, dropout=0.0),
+            nn.Conv2d(dims[-1], out_channels_depth, kernel_size=3, padding=1),
+        )
+
+    def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return refined depth logits, RGB latents, and confidence map."""
 
         features = latents
         skip: Optional[torch.Tensor] = None
         pyramid: List[torch.Tensor] = []
 
-        for idx, layer in enumerate(self.shared):
+        for layer in self.shared:
             features = layer(features)
             pyramid.append(features)
             if self.use_skip_connections:
                 skip = features if skip is None else skip + features
 
-        # Fuse multi-dilation context back into the final representation
         fused_context = torch.zeros_like(pyramid[-1])
         for feat, proj in zip(pyramid, self.context_projections):
             context = proj(feat)
@@ -114,9 +132,7 @@ class DualOutputDecoder(nn.Module):
 
         fused_context = fused_context / len(pyramid)
         global_feat = self.global_context(pyramid[-1])
-        fused_context = fused_context + global_feat
-
-        features = pyramid[-1] + fused_context
+        features = pyramid[-1] + fused_context + global_feat
 
         depth_features = self.depth_branch(features)
         rgb_features = self.rgb_branch(features)
@@ -125,10 +141,46 @@ class DualOutputDecoder(nn.Module):
             depth_features = depth_features + skip
             rgb_features = rgb_features + skip
 
-        depth_logits = self.depth_head(depth_features)
+        # Feature-level coupling from AIF to depth.
+        aif_guidance = self.aif_to_depth(rgb_features)
+        coupling_gate = self.aif_coupling_gate(torch.cat([depth_features, aif_guidance], dim=1))
+        depth_features = depth_features + coupling_gate * aif_guidance
+
+        depth_logits_coarse = self.depth_head(depth_features)
+        confidence = torch.sigmoid(self.confidence_head(depth_features))
         rgb_latents = self.rgb_head(rgb_features)
 
         if self.apply_latent_scaling:
             rgb_latents = rgb_latents * 0.18215
 
-        return depth_logits, rgb_latents
+        # Confidence-guided refinement: low confidence => stronger AIF-structure reliance.
+        aif_edges = self._compute_edges(rgb_latents)
+        refine_input = torch.cat(
+            [
+                depth_features,
+                rgb_latents,
+                aif_edges,
+                1.0 - confidence,
+            ],
+            dim=1,
+        )
+        depth_delta = self.depth_refine(refine_input)
+        depth_logits = depth_logits_coarse + (1.0 - confidence) * depth_delta
+
+        return depth_logits, rgb_latents, confidence
+
+    @staticmethod
+    def _compute_edges(image_like: torch.Tensor) -> torch.Tensor:
+        """Compute normalized edge magnitude maps from multi-channel feature maps."""
+
+        gray = image_like.mean(dim=1, keepdim=True)
+        grad_x = gray[:, :, :, 1:] - gray[:, :, :, :-1]
+        grad_y = gray[:, :, 1:, :] - gray[:, :, :-1, :]
+        grad_x = F.pad(grad_x, (0, 1, 0, 0), mode="replicate")
+        grad_y = F.pad(grad_y, (0, 0, 0, 1), mode="replicate")
+        magnitude = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+
+        mean = magnitude.mean(dim=(-2, -1), keepdim=True)
+        std = magnitude.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        normalized = (magnitude - mean) / std
+        return torch.cat([grad_x, grad_y], dim=1) * 0.5 + normalized
