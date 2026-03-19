@@ -19,7 +19,9 @@ All-in-focus image and metric depth recovery from focal stacks, powered by fine-
 5. [Inference](#inference)
 6. [Repository layout](#repository-layout)
 7. [Troubleshooting](#troubleshooting)
-8. [Slide-friendly sketch](#slide-friendly-sketch)
+8. [Paper-facing method notes](#paper-facing-method-notes)
+9. [Reviewer-readiness checklist](#reviewer-readiness-checklist)
+10. [Slide-friendly sketch](#slide-friendly-sketch)
 
 ## Environment setup
 
@@ -42,8 +44,6 @@ Authenticate with Hugging Face so `diffusers` can download model weights on dema
 ```bash
 huggingface-cli login
 ```
-
-Optional accelerators such as [FlashAttention](https://github.com/Dao-AILab/flash-attention) or [xFormers](https://github.com/facebookresearch/xformers) can be installed separately to reduce memory use.
 
 ## Data preparation
 
@@ -99,12 +99,31 @@ python -m script.inference \
 
 The script produces the recovered all-in-focus RGB, the metric depth map, and optional visualisations. Run `python -m script.inference --help` for the complete argument list.
 
+## Paper-facing method notes
+
+If you are preparing a manuscript, here is the implementation-grounded summary of what is actually modified:
+
+- **Focal conditioning path:** focal-stack features are injected into the SD3.5 transformer **before and after** the backbone call through dedicated focal cross-attention blocks (`pre_focal_attn`, `focal_attn`) inside `FocalInjectedSD3Transformer`.
+- **Feature extraction/fusion:** `FocalStackProcessor` aggregates stack-level cues into the conditioning features consumed by the transformer wrapper.
+- **Camera metadata path:** `CameraInvariantEncoder` provides camera-parameter embeddings that can be fused with focal features.
+- **Dual-task decoding:** `DualOutputDecoder` predicts both all-in-focus RGB and metric depth from latent features.
+- **Objective terms:** training combines diffusion noise prediction with depth, RGB, consistency, and optional perceptual losses (`FocalDiffusionLoss`).
+
+These modules are the primary places to cite when describing the method in equation form.
+
+## Current limitations to acknowledge in a paper draft
+
+- CoC-based blur simulation may still be simplified versus real lens aberrations/ISP pipelines.
+- Present public configs focus on HyperSim/Virtual KITTI, so broader DFF benchmark coverage should be expanded.
+- "Zero-shot" claims should be narrowed to the exact validated regime to avoid overstatement.
+
 ## Repository layout
 
 - `configs/` — experiment presets.
 - `data/filelists/` — example lists for HyperSim, Virtual KITTI, and mixed splits.
 - `script/` — CLI entry points for training, evaluation, and utilities.
 - `src/` — dataset, simulator, pipeline, and trainer implementations.
+- `src/legacy/` — archived experimental implementations kept for reference only.
 
 ## Troubleshooting
 
