@@ -122,22 +122,6 @@ predicted depth map
 optional visualizations and metadata
 ```
 
-## Method Overview
-
-FocalDiffusion consists of three main components:
-
-### Focal-Stack Feature Extraction
-
-The focal-stack processor extracts multi-scale focus-aware features from differently focused images. These features capture spatial sharpness, defocus patterns, and cross-focus consistency.
-
-### Focal-Conditioned Diffusion Backbone
-
-Focal-stack features are injected into a Stable Diffusion 3.5 MMDiT backbone through focal conditioning modules. This allows a pretrained diffusion prior to be adapted for focal-stack reconstruction and depth estimation.
-
-### Dual-Output Prediction
-
-The model predicts both all-in-focus RGB reconstruction and depth from the conditioned latent representation. Joint prediction encourages the model to learn a shared representation of appearance, focus, and scene geometry.
-
 ## Training Objective
 
 The training objective combines diffusion supervision with task-specific reconstruction losses:
