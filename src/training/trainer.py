@@ -691,6 +691,11 @@ class FocalDiffusionTrainer:
 
                 model_input = model_input.to(self.pipeline.transformer.dtype)
                 noise = noise.to(self.pipeline.transformer.dtype)
+                batch_prompt_embeds, batch_pooled_prompt_embeds = self._repeat_prompt_embeddings(
+                    prompt_embeds,
+                    pooled_prompt_embeds,
+                    batch_size=model_input.shape[0],
+                )
 
                 # Forward pass
                 with autocast(enabled=self.scaler is not None):
@@ -698,8 +703,8 @@ class FocalDiffusionTrainer:
                     noise_pred = self.pipeline.transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
-                        encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=batch_prompt_embeds,
+                        pooled_projections=batch_pooled_prompt_embeds,
                         focal_features=focal_features,
                         return_dict=False,
                     )[0]
@@ -833,6 +838,31 @@ class FocalDiffusionTrainer:
         }
 
         return prompt_embeds, pooled_prompt_embeds
+
+    @staticmethod
+    def _repeat_prompt_embeddings(
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Repeat cached prompt embeddings so their batch matches the current data batch."""
+
+        if prompt_embeds.shape[0] == batch_size and pooled_prompt_embeds.shape[0] == batch_size:
+            return prompt_embeds, pooled_prompt_embeds
+
+        if prompt_embeds.shape[0] != 1 or pooled_prompt_embeds.shape[0] != 1:
+            raise ValueError(
+                "Cached empty prompt embeddings must have batch size 1 or match the current "
+                f"training batch size ({batch_size}); got prompt batch {prompt_embeds.shape[0]} "
+                f"and pooled prompt batch {pooled_prompt_embeds.shape[0]}."
+            )
+
+        repeat_shape = (batch_size,) + (1,) * (prompt_embeds.ndim - 1)
+        pooled_repeat_shape = (batch_size,) + (1,) * (pooled_prompt_embeds.ndim - 1)
+        return (
+            prompt_embeds.repeat(repeat_shape),
+            pooled_prompt_embeds.repeat(pooled_repeat_shape),
+        )
 
     def _predict_clean_latents(
         self,
