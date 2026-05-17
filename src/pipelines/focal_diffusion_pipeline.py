@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -58,9 +58,10 @@ class FocalDiffusionOutput(BaseOutput):
 class FocalInjectedSD3Transformer(nn.Module):
     """Wrapper around the SD3.5 transformer that accepts focal features."""
 
-    def __init__(self, base_transformer: SD3Transformer2DModel) -> None:
+    def __init__(self, base_transformer: SD3Transformer2DModel, condition_channels: int = 512) -> None:
         super().__init__()
         self.base_transformer = base_transformer
+        self.condition_channels = condition_channels
         base = self.base_transformer
         self.config = base.config
         hidden_size = self.config.attention_head_dim * self.config.num_attention_heads
@@ -81,8 +82,12 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.pre_scale = nn.Parameter(torch.tensor(0.5))
         self.post_scale = nn.Parameter(torch.tensor(1.0))
 
-        self._condition_adapters = nn.ModuleDict()
+        self.condition_adapter = nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
         self.dtype = getattr(base, "dtype", torch.float32)
+
+        base_param = next(base.parameters(), None)
+        if base_param is not None:
+            self.to(device=base_param.device, dtype=base_param.dtype)
 
     @property
     def base_transformer(self) -> SD3Transformer2DModel:
@@ -121,10 +126,12 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.base_transformer = module
 
     def __getattr__(self, name: str) -> Any:
-        # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
-        if name in {"base_transformer", "focal_attn", "config", "_base_transformer_ref"}:
-            return super().__getattribute__(name)
-        return getattr(self.base_transformer, name)
+        # Resolve this wrapper's parameters/modules first, then delegate base-only
+        # attributes (e.g. device helpers) to the wrapped SD3 transformer.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_transformer, name)
 
     def forward(
         self,
@@ -159,13 +166,6 @@ class FocalInjectedSD3Transformer(nn.Module):
 
         return (result,)
 
-    def _get_condition_adapter(self, channels: int) -> nn.Conv2d:
-        key = str(channels)
-        if key not in self._condition_adapters:
-            adapter = nn.Conv2d(channels, self.config.attention_head_dim * self.config.num_attention_heads, kernel_size=1)
-            self._condition_adapters[key] = adapter
-        return self._condition_adapters[key]
-
     def _extract_condition(
         self,
         focal_features: Optional[Dict[str, torch.Tensor]],
@@ -181,8 +181,14 @@ class FocalInjectedSD3Transformer(nn.Module):
         if fused.shape[-2:] != spatial_size:
             fused = F.interpolate(fused, size=spatial_size, mode="bilinear", align_corners=False)
 
-        adapter = self._get_condition_adapter(fused.shape[1])
-        conditioned = adapter(fused)
+        if fused.shape[1] != self.condition_channels:
+            raise ValueError(
+                "Focal condition channel mismatch: "
+                f"expected {self.condition_channels}, got {fused.shape[1]}. "
+                "Instantiate FocalInjectedSD3Transformer with the focal processor feature_dim."
+            )
+
+        conditioned = self.condition_adapter(fused)
 
         spatial_maps = focal_features.get("temporal_attention_maps")
         if spatial_maps is not None:
@@ -204,6 +210,20 @@ class FocalInjectedSD3Transformer(nn.Module):
         cond_seq = condition.flatten(2).transpose(1, 2)
         hidden_seq = hidden_seq + scale * attn(norm(hidden_seq), cond_seq)
         return hidden_seq.transpose(1, 2).reshape_as(hidden_states)
+
+
+def duplicate_focal_features_for_cfg(focal_features: Mapping[str, Any]) -> Dict[str, Any]:
+    """Duplicate batch-first focal feature tensors for classifier-free guidance."""
+
+    duplicated: Dict[str, Any] = {}
+    for key, value in focal_features.items():
+        if isinstance(value, torch.Tensor):
+            duplicated[key] = torch.cat([value, value], dim=0)
+        elif isinstance(value, Mapping):
+            duplicated[key] = duplicate_focal_features_for_cfg(value)
+        else:
+            duplicated[key] = value
+    return duplicated
 
 
 class FocalDiffusionPipeline(StableDiffusion3Pipeline):
@@ -281,10 +301,19 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             out_channels_rgb=self.vae.config.latent_channels,
         )
 
+        condition_channels = getattr(self.focal_processor, "feature_dim", 512)
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
-            self.transformer = FocalInjectedSD3Transformer(self.transformer)
+            self.transformer = FocalInjectedSD3Transformer(
+                self.transformer,
+                condition_channels=condition_channels,
+            )
         else:
             _ = self.transformer.base_transformer
+            if self.transformer.condition_channels != condition_channels:
+                raise ValueError(
+                    "Existing transformer condition channels do not match focal processor "
+                    f"feature_dim ({self.transformer.condition_channels} != {condition_channels})."
+                )
 
         # Ensure diffusers tracks the newly attached modules so that calls to
         # `pipeline.to(device)` migrate them alongside the base SD components.
@@ -448,6 +477,11 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        focal_features_input = (
+            duplicate_focal_features_for_cfg(focal_features)
+            if guidance_scale > 1.0
+            else focal_features
+        )
 
         for timestep in timesteps:
             latent_model_input = (
@@ -468,7 +502,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
                     if guidance_scale > 1.0
                     else pooled_prompt_embeds
                 ),
-                focal_features=focal_features,
+                focal_features=focal_features_input,
                 return_dict=False,
             )[0]
 

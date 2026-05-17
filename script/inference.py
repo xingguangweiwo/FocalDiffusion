@@ -127,8 +127,8 @@ def parse_args():
     parser.add_argument(
         '--guidance-scale',
         type=float,
-        default=7.0,
-        help='Guidance scale for inference'
+        default=1.0,
+        help='Guidance scale for inference (1.0 disables text classifier-free guidance)'
     )
     parser.add_argument(
         '--camera-invariant-mode',
