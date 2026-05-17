@@ -11,6 +11,8 @@ from typing import Union
 
 logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
+
 def load_pipeline(
         checkpoint_path: Union[str, Path],
         base_model_id: str = "stabilityai/stable-diffusion-3.5-large",

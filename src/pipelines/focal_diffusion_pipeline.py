@@ -42,6 +42,8 @@ from ..models.camera_invariant import CameraInvariantEncoder
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class FocalDiffusionOutput(BaseOutput):
@@ -144,7 +146,7 @@ class FocalInjectedSD3Transformer(nn.Module):
         return_dict: bool = True,
     ) -> Union[Transformer2DModelOutput, Tuple[torch.Tensor]]:
         base = self.base_transformer
-        condition_pre = self._extract_condition(focal_features, hidden_states.shape[-2:])
+        condition_pre = self._extract_condition(focal_features, hidden_states.shape[-2:], hidden_states.shape[0])
         if condition_pre is not None:
             hidden_states = self._apply_condition(hidden_states, condition_pre, self.pre_focal_attn, self.pre_norm, self.pre_scale)
 
@@ -157,7 +159,7 @@ class FocalInjectedSD3Transformer(nn.Module):
             return_dict=False,
         )[0]
 
-        condition_post = self._extract_condition(focal_features, result.shape[-2:])
+        condition_post = self._extract_condition(focal_features, result.shape[-2:], result.shape[0])
         if condition_post is not None:
             result = self._apply_condition(result, condition_post, self.focal_attn, self.post_norm, self.post_scale)
 
@@ -169,7 +171,8 @@ class FocalInjectedSD3Transformer(nn.Module):
     def _extract_condition(
         self,
         focal_features: Optional[Dict[str, torch.Tensor]],
-        spatial_size: Tuple[int, int]
+        spatial_size: Tuple[int, int],
+        batch_size: int,
     ) -> Optional[torch.Tensor]:
         if not focal_features or "fused_features" not in focal_features:
             return None
@@ -194,6 +197,7 @@ class FocalInjectedSD3Transformer(nn.Module):
         if spatial_maps is not None:
             spatial = spatial_maps.mean(dim=1, keepdim=True)
             spatial = F.interpolate(spatial, size=spatial_size, mode="bilinear", align_corners=False)
+            spatial = self._match_batch(spatial, batch_size)
             conditioned = conditioned * (1 + self.condition_scale * spatial)
 
         return conditioned
@@ -314,6 +318,11 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
                     "Existing transformer condition channels do not match focal processor "
                     f"feature_dim ({self.transformer.condition_channels} != {condition_channels})."
                 )
+
+        feature_dim = getattr(self.focal_processor, "feature_dim", None)
+        if isinstance(feature_dim, int):
+            self.transformer._get_condition_adapter(feature_dim)
+            self.transformer._get_camera_adapter(feature_dim)
 
         # Ensure diffusers tracks the newly attached modules so that calls to
         # `pipeline.to(device)` migrate them alongside the base SD components.
@@ -523,6 +532,11 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             depth_min = camera_params["depth_min"].to(depth_map.dtype).view(-1, 1, 1)
             depth_max = camera_params["depth_max"].to(depth_map.dtype).view(-1, 1, 1)
             depth_map = depth_min + depth_map * (depth_max - depth_min)
+        else:
+            logger.warning(
+                "No depth_min/depth_max provided at inference time; returning normalized "
+                "depth probabilities instead of metric depth."
+            )
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
