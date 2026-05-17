@@ -70,6 +70,11 @@ Validate a configuration without starting training:
 python -m script.train --config configs/hypersim.yaml --dry-run
 ```
 
+`--dry-run` is intentionally configuration-only: it validates YAML, CLI overrides,
+and path resolution without loading the SD3 backbone, constructing dataloaders, or
+running forward/loss/backward. Run a short real training job after dry-run when
+you need end-to-end runtime validation.
+
 ## Training
 
 Train on HyperSim:
