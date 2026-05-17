@@ -368,6 +368,41 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         return self.train(False)
 
+
+    @staticmethod
+    def _expand_focal_features_for_model(
+        focal_features: Dict[str, Any],
+        num_images_per_prompt: int,
+        do_classifier_free_guidance: bool,
+    ) -> Dict[str, Any]:
+        """Repeat focal conditioning to match the model input batch.
+
+        SD3 classifier-free guidance doubles the latent and text-conditioning
+        batches by concatenating unconditional and conditional inputs. Focal
+        conditioning is batch-first as well, so it must be expanded in lockstep
+        before being passed to the injected transformer.
+        """
+
+        repeat_count = max(1, num_images_per_prompt)
+
+        def expand(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                expanded = value
+                if repeat_count > 1:
+                    expanded = expanded.repeat_interleave(repeat_count, dim=0)
+                if do_classifier_free_guidance:
+                    expanded = torch.cat([expanded, expanded], dim=0)
+                return expanded
+            if isinstance(value, dict):
+                return {key: expand(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [expand(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(expand(item) for item in value)
+            return value
+
+        return {key: expand(value) for key, value in focal_features.items()}
+
     @torch.no_grad()
     def __call__(
         self,
@@ -446,6 +481,12 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             latents=latents,
         )
 
+        model_focal_features = self._expand_focal_features_for_model(
+            focal_features,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=guidance_scale > 1.0,
+        )
+
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
@@ -468,7 +509,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
                     if guidance_scale > 1.0
                     else pooled_prompt_embeds
                 ),
-                focal_features=focal_features,
+                focal_features=model_focal_features,
                 return_dict=False,
             )[0]
 
