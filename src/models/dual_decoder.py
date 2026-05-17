@@ -72,6 +72,9 @@ class DualOutputDecoder(nn.Module):
         self.context_projections = nn.ModuleList([
             nn.Conv2d(dims[i + 1], dims[-1], kernel_size=1) for i in range(len(dims) - 1)
         ])
+        self.skip_projections = nn.ModuleList([
+            nn.Conv2d(dims[i + 1], dims[-1], kernel_size=1) for i in range(len(dims) - 1)
+        ])
 
         self.global_context = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -104,8 +107,9 @@ class DualOutputDecoder(nn.Module):
         self.rgb_head = nn.Conv2d(dims[-1], self.out_channels_rgb, kernel_size=3, padding=1)
 
         # Confidence-guided depth refinement with AIF structure.
+        refine_in_channels = dims[-1] + self.out_channels_rgb + 2 + 1
         self.depth_refine = nn.Sequential(
-            _ResidualBlock(dims[-1] + in_channels + 2, dims[-1], dilation=1, dropout=0.0),
+            _ResidualBlock(refine_in_channels, dims[-1], dilation=1, dropout=0.0),
             _ResidualBlock(dims[-1], dims[-1], dilation=1, dropout=0.0),
             nn.Conv2d(dims[-1], out_channels_depth, kernel_size=3, padding=1),
         )
@@ -117,11 +121,15 @@ class DualOutputDecoder(nn.Module):
         skip: Optional[torch.Tensor] = None
         pyramid: List[torch.Tensor] = []
 
-        for layer in self.shared:
+        for layer, proj in zip(self.shared, self.skip_projections):
             features = layer(features)
             pyramid.append(features)
             if self.use_skip_connections:
-                skip = features if skip is None else skip + features
+                projected = proj(features)
+                skip = projected if skip is None else skip + projected
+
+        if skip is not None:
+            skip = skip / len(pyramid)
 
         fused_context = torch.zeros_like(pyramid[-1])
         for feat, proj in zip(pyramid, self.context_projections):

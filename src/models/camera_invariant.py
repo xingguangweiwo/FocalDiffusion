@@ -269,9 +269,11 @@ class CameraInvariantEncoder(nn.Module):
 
 class InvariantCostVolume(nn.Module):
     """
-    Camera-invariant cost volume representation
-    Inspired by "Deep depth from focal stack with defocus model"
-    but with improvements for better generalization
+    Experimental camera-invariant cost volume representation.
+
+    This module is retained for research use through CameraInvariantFocalProcessor
+    but is not wired into the default training or inference pipeline. Keep any
+    production path explicit instead of assuming it participates automatically.
     """
 
     def __init__(

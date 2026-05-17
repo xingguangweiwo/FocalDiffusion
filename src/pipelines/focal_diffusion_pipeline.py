@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -42,6 +42,8 @@ from ..models.camera_invariant import CameraInvariantEncoder
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class FocalDiffusionOutput(BaseOutput):
@@ -58,9 +60,10 @@ class FocalDiffusionOutput(BaseOutput):
 class FocalInjectedSD3Transformer(nn.Module):
     """Wrapper around the SD3.5 transformer that accepts focal features."""
 
-    def __init__(self, base_transformer: SD3Transformer2DModel) -> None:
+    def __init__(self, base_transformer: SD3Transformer2DModel, condition_channels: int) -> None:
         super().__init__()
         self.base_transformer = base_transformer
+        self.condition_channels = condition_channels
         base = self.base_transformer
         self.config = base.config
         hidden_size = self.config.attention_head_dim * self.config.num_attention_heads
@@ -84,6 +87,11 @@ class FocalInjectedSD3Transformer(nn.Module):
         self._condition_adapters = nn.ModuleDict()
         self._camera_condition_adapters = nn.ModuleDict()
         self.dtype = getattr(base, "dtype", torch.float32)
+        self.condition_adapter.to(device=self._base_device, dtype=self.dtype)
+
+        base_param = next(base.parameters(), None)
+        if base_param is not None:
+            self.to(device=base_param.device, dtype=base_param.dtype)
 
     @property
     def base_transformer(self) -> SD3Transformer2DModel:
@@ -121,11 +129,24 @@ class FocalInjectedSD3Transformer(nn.Module):
 
         self.base_transformer = module
 
+    @property
+    def _base_device(self) -> torch.device:
+        try:
+            return next(self.base_transformer.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
     def __getattr__(self, name: str) -> Any:
-        # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
-        if name in {"base_transformer", "focal_attn", "config", "_base_transformer_ref"}:
-            return super().__getattribute__(name)
-        return getattr(self.base_transformer, name)
+        # Look up this wrapper's registered parameters/modules first, then delegate
+        # attribute access (e.g. device, config helpers, etc.) to the wrapped module.
+        try:
+            return super().__getattr__(name)
+        except AttributeError as err:
+            try:
+                base = self.base_transformer
+            except AttributeError:
+                raise err
+            return getattr(base, name)
 
     def forward(
         self,
@@ -218,6 +239,7 @@ class FocalInjectedSD3Transformer(nn.Module):
         if spatial_maps is not None:
             spatial = spatial_maps.mean(dim=1, keepdim=True)
             spatial = F.interpolate(spatial, size=spatial_size, mode="bilinear", align_corners=False)
+            spatial = spatial.to(device=conditioned.device, dtype=conditioned.dtype)
             conditioned = conditioned * (1 + self.condition_scale * spatial)
 
         return self._match_condition_batch(conditioned, target_batch)
@@ -234,6 +256,20 @@ class FocalInjectedSD3Transformer(nn.Module):
         cond_seq = condition.flatten(2).transpose(1, 2)
         hidden_seq = hidden_seq + scale * attn(norm(hidden_seq), cond_seq)
         return hidden_seq.transpose(1, 2).reshape_as(hidden_states)
+
+
+def duplicate_focal_features_for_cfg(focal_features: Mapping[str, Any]) -> Dict[str, Any]:
+    """Duplicate batch-first focal feature tensors for classifier-free guidance."""
+
+    duplicated: Dict[str, Any] = {}
+    for key, value in focal_features.items():
+        if isinstance(value, torch.Tensor):
+            duplicated[key] = torch.cat([value, value], dim=0)
+        elif isinstance(value, Mapping):
+            duplicated[key] = duplicate_focal_features_for_cfg(value)
+        else:
+            duplicated[key] = value
+    return duplicated
 
 
 class FocalDiffusionPipeline(StableDiffusion3Pipeline):
@@ -311,10 +347,27 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             out_channels_rgb=self.vae.config.latent_channels,
         )
 
+        condition_channels = getattr(self.focal_processor, "feature_dim", None)
+        if condition_channels is None:
+            raise ValueError(
+                "focal_processor must expose a feature_dim attribute so the focal "
+                "condition adapter can be created before training starts."
+            )
+        condition_channels = int(condition_channels)
+
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
-            self.transformer = FocalInjectedSD3Transformer(self.transformer)
+            self.transformer = FocalInjectedSD3Transformer(
+                self.transformer,
+                condition_channels=condition_channels,
+            )
         else:
             _ = self.transformer.base_transformer
+            if self.transformer.condition_channels != condition_channels:
+                raise ValueError(
+                    "Existing FocalInjectedSD3Transformer condition_channels "
+                    f"({self.transformer.condition_channels}) does not match focal_processor.feature_dim "
+                    f"({condition_channels})."
+                )
 
         # Ensure diffusers tracks the newly attached modules so that calls to
         # `pipeline.to(device)` migrate them alongside the base SD components.
@@ -398,6 +451,41 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         return self.train(False)
 
+
+    @staticmethod
+    def _expand_focal_features_for_model(
+        focal_features: Dict[str, Any],
+        num_images_per_prompt: int,
+        do_classifier_free_guidance: bool,
+    ) -> Dict[str, Any]:
+        """Repeat focal conditioning to match the model input batch.
+
+        SD3 classifier-free guidance doubles the latent and text-conditioning
+        batches by concatenating unconditional and conditional inputs. Focal
+        conditioning is batch-first as well, so it must be expanded in lockstep
+        before being passed to the injected transformer.
+        """
+
+        repeat_count = max(1, num_images_per_prompt)
+
+        def expand(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                expanded = value
+                if repeat_count > 1:
+                    expanded = expanded.repeat_interleave(repeat_count, dim=0)
+                if do_classifier_free_guidance:
+                    expanded = torch.cat([expanded, expanded], dim=0)
+                return expanded
+            if isinstance(value, dict):
+                return {key: expand(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [expand(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(expand(item) for item in value)
+            return value
+
+        return {key: expand(value) for key, value in focal_features.items()}
+
     @torch.no_grad()
     def __call__(
         self,
@@ -478,8 +566,19 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             latents=latents,
         )
 
+        model_focal_features = self._expand_focal_features_for_model(
+            focal_features,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=guidance_scale > 1.0,
+        )
+
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        focal_features_input = (
+            duplicate_focal_features_for_cfg(focal_features)
+            if guidance_scale > 1.0
+            else focal_features
+        )
 
         for timestep in timesteps:
             latent_model_input = (
@@ -500,7 +599,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
                     if guidance_scale > 1.0
                     else pooled_prompt_embeds
                 ),
-                focal_features=focal_features,
+                focal_features=model_focal_features,
                 return_dict=False,
             )[0]
 
@@ -521,6 +620,11 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             depth_min = camera_params["depth_min"].to(depth_map.dtype).view(-1, 1, 1)
             depth_max = camera_params["depth_max"].to(depth_map.dtype).view(-1, 1, 1)
             depth_map = depth_min + depth_map * (depth_max - depth_min)
+        else:
+            logger.warning(
+                "No depth_min/depth_max provided at inference time; returning normalized "
+                "depth probabilities instead of metric depth."
+            )
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
