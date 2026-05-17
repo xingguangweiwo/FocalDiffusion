@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
@@ -41,6 +42,8 @@ from ..models.focal_attention import FocalCrossAttention
 from ..models.camera_invariant import CameraInvariantEncoder
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,6 +85,8 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.post_scale = nn.Parameter(torch.tensor(1.0))
 
         self._condition_adapters = nn.ModuleDict()
+        self._camera_adapters = nn.ModuleDict()
+        self.camera_condition_scale = nn.Parameter(torch.tensor(0.5))
         self.dtype = getattr(base, "dtype", torch.float32)
 
     @property
@@ -121,10 +126,12 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.base_transformer = module
 
     def __getattr__(self, name: str) -> Any:
-        # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
-        if name in {"base_transformer", "focal_attn", "config", "_base_transformer_ref"}:
-            return super().__getattribute__(name)
-        return getattr(self.base_transformer, name)
+        # First let nn.Module resolve registered parameters, buffers, and submodules.
+        # Only delegate unknown attributes (e.g. dtype/device helpers) to the wrapped module.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_transformer, name)
 
     def forward(
         self,
@@ -137,7 +144,7 @@ class FocalInjectedSD3Transformer(nn.Module):
         return_dict: bool = True,
     ) -> Union[Transformer2DModelOutput, Tuple[torch.Tensor]]:
         base = self.base_transformer
-        condition_pre = self._extract_condition(focal_features, hidden_states.shape[-2:])
+        condition_pre = self._extract_condition(focal_features, hidden_states.shape[-2:], hidden_states.shape[0])
         if condition_pre is not None:
             hidden_states = self._apply_condition(hidden_states, condition_pre, self.pre_focal_attn, self.pre_norm, self.pre_scale)
 
@@ -150,7 +157,7 @@ class FocalInjectedSD3Transformer(nn.Module):
             return_dict=False,
         )[0]
 
-        condition_post = self._extract_condition(focal_features, result.shape[-2:])
+        condition_post = self._extract_condition(focal_features, result.shape[-2:], result.shape[0])
         if condition_post is not None:
             result = self._apply_condition(result, condition_post, self.focal_attn, self.post_norm, self.post_scale)
 
@@ -166,10 +173,28 @@ class FocalInjectedSD3Transformer(nn.Module):
             self._condition_adapters[key] = adapter
         return self._condition_adapters[key]
 
+    def _get_camera_adapter(self, channels: int) -> nn.Linear:
+        key = str(channels)
+        if key not in self._camera_adapters:
+            hidden_size = self.config.attention_head_dim * self.config.num_attention_heads
+            self._camera_adapters[key] = nn.Linear(channels, hidden_size)
+        return self._camera_adapters[key]
+
+    @staticmethod
+    def _match_batch(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if tensor.shape[0] == batch_size:
+            return tensor
+        if batch_size % tensor.shape[0] == 0:
+            return tensor.repeat(batch_size // tensor.shape[0], *([1] * (tensor.dim() - 1)))
+        raise ValueError(
+            f"Cannot expand focal conditioning batch {tensor.shape[0]} to transformer batch {batch_size}."
+        )
+
     def _extract_condition(
         self,
         focal_features: Optional[Dict[str, torch.Tensor]],
-        spatial_size: Tuple[int, int]
+        spatial_size: Tuple[int, int],
+        batch_size: int,
     ) -> Optional[torch.Tensor]:
         if not focal_features or "fused_features" not in focal_features:
             return None
@@ -183,11 +208,25 @@ class FocalInjectedSD3Transformer(nn.Module):
 
         adapter = self._get_condition_adapter(fused.shape[1])
         conditioned = adapter(fused)
+        conditioned = self._match_batch(conditioned, batch_size)
+
+        camera_features = focal_features.get("camera_features")
+        if camera_features is not None:
+            if camera_features.dim() != 2:
+                raise ValueError(
+                    "camera_features must have shape [batch, channels], "
+                    f"but received {tuple(camera_features.shape)}."
+                )
+            camera_features = self._match_batch(camera_features, batch_size)
+            camera_adapter = self._get_camera_adapter(camera_features.shape[1])
+            camera_condition = camera_adapter(camera_features).unsqueeze(-1).unsqueeze(-1)
+            conditioned = conditioned + self.camera_condition_scale * camera_condition
 
         spatial_maps = focal_features.get("temporal_attention_maps")
         if spatial_maps is not None:
             spatial = spatial_maps.mean(dim=1, keepdim=True)
             spatial = F.interpolate(spatial, size=spatial_size, mode="bilinear", align_corners=False)
+            spatial = self._match_batch(spatial, batch_size)
             conditioned = conditioned * (1 + self.condition_scale * spatial)
 
         return conditioned
@@ -285,6 +324,11 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             self.transformer = FocalInjectedSD3Transformer(self.transformer)
         else:
             _ = self.transformer.base_transformer
+
+        feature_dim = getattr(self.focal_processor, "feature_dim", None)
+        if isinstance(feature_dim, int):
+            self.transformer._get_condition_adapter(feature_dim)
+            self.transformer._get_camera_adapter(feature_dim)
 
         # Ensure diffusers tracks the newly attached modules so that calls to
         # `pipeline.to(device)` migrate them alongside the base SD components.
@@ -489,6 +533,11 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             depth_min = camera_params["depth_min"].to(depth_map.dtype).view(-1, 1, 1)
             depth_max = camera_params["depth_max"].to(depth_map.dtype).view(-1, 1, 1)
             depth_map = depth_min + depth_map * (depth_max - depth_min)
+        else:
+            logger.warning(
+                "No depth_min/depth_max provided at inference time; returning normalized "
+                "depth probabilities instead of metric depth."
+            )
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)

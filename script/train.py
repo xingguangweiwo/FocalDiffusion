@@ -97,7 +97,7 @@ def parse_args():
     parser.add_argument(
         '--dry-run',
         action='store_true',
-        help='Run without actually training (for testing setup)'
+        help='Validate config and paths only; does not load models, data, or run forward/backward'
     )
 
     parser.add_argument(
@@ -544,10 +544,13 @@ def main():
     logger.info(f"Saved configuration to {config_save_path}")
 
     if args.dry_run:
-        logger.info("Dry run mode - verifying pipeline setup")
+        logger.info(
+            "Dry run mode - validating configuration and path resolution only; "
+            "model loading, dataloader construction, forward, loss, and backward are not executed."
+        )
         pipeline = _build_stub_pipeline()
         pipeline.to("cpu")
-        logger.info("Dry run successful")
+        logger.info("Dry run successful (configuration-only)")
         return
 
     # Create trainer

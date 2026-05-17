@@ -6,8 +6,11 @@ import torch
 from pathlib import Path
 from typing import Dict, Optional, Union
 import json
+import logging
 
 from ..utils import ensure_sentencepiece_installed
+
+logger = logging.getLogger(__name__)
 
 def load_pipeline(
         checkpoint_path: Union[str, Path],
@@ -35,6 +38,18 @@ def load_pipeline(
         pipeline.camera_encoder.load_state_dict(checkpoint['camera_encoder_state_dict'])
     if 'dual_decoder_state_dict' in checkpoint:
         pipeline.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'])
+    if 'transformer_state_dict' in checkpoint:
+        missing, unexpected = pipeline.transformer.load_state_dict(
+            checkpoint['transformer_state_dict'],
+            strict=False,
+        )
+        if missing or unexpected:
+            logger.warning(
+                "Loaded transformer_state_dict with non-strict key differences: "
+                "missing=%s, unexpected=%s",
+                missing,
+                unexpected,
+            )
 
     # Load config if available
     if 'config' in checkpoint:
