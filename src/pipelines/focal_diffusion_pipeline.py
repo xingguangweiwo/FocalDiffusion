@@ -58,7 +58,7 @@ class FocalDiffusionOutput(BaseOutput):
 class FocalInjectedSD3Transformer(nn.Module):
     """Wrapper around the SD3.5 transformer that accepts focal features."""
 
-    def __init__(self, base_transformer: SD3Transformer2DModel) -> None:
+    def __init__(self, base_transformer: SD3Transformer2DModel, condition_channels: int) -> None:
         super().__init__()
         self.base_transformer = base_transformer
         base = self.base_transformer
@@ -81,8 +81,10 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.pre_scale = nn.Parameter(torch.tensor(0.5))
         self.post_scale = nn.Parameter(torch.tensor(1.0))
 
-        self._condition_adapters = nn.ModuleDict()
+        self.condition_channels = condition_channels
+        self.condition_adapter = nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
         self.dtype = getattr(base, "dtype", torch.float32)
+        self.condition_adapter.to(device=self._base_device, dtype=self.dtype)
 
     @property
     def base_transformer(self) -> SD3Transformer2DModel:
@@ -120,11 +122,24 @@ class FocalInjectedSD3Transformer(nn.Module):
 
         self.base_transformer = module
 
+    @property
+    def _base_device(self) -> torch.device:
+        try:
+            return next(self.base_transformer.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
     def __getattr__(self, name: str) -> Any:
-        # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
-        if name in {"base_transformer", "focal_attn", "config", "_base_transformer_ref"}:
-            return super().__getattribute__(name)
-        return getattr(self.base_transformer, name)
+        # Look up this wrapper's registered parameters/modules first, then delegate
+        # attribute access (e.g. device, config helpers, etc.) to the wrapped module.
+        try:
+            return super().__getattr__(name)
+        except AttributeError as err:
+            try:
+                base = self.base_transformer
+            except AttributeError:
+                raise err
+            return getattr(base, name)
 
     def forward(
         self,
@@ -159,13 +174,6 @@ class FocalInjectedSD3Transformer(nn.Module):
 
         return (result,)
 
-    def _get_condition_adapter(self, channels: int) -> nn.Conv2d:
-        key = str(channels)
-        if key not in self._condition_adapters:
-            adapter = nn.Conv2d(channels, self.config.attention_head_dim * self.config.num_attention_heads, kernel_size=1)
-            self._condition_adapters[key] = adapter
-        return self._condition_adapters[key]
-
     def _extract_condition(
         self,
         focal_features: Optional[Dict[str, torch.Tensor]],
@@ -181,13 +189,20 @@ class FocalInjectedSD3Transformer(nn.Module):
         if fused.shape[-2:] != spatial_size:
             fused = F.interpolate(fused, size=spatial_size, mode="bilinear", align_corners=False)
 
-        adapter = self._get_condition_adapter(fused.shape[1])
-        conditioned = adapter(fused)
+        if fused.shape[1] != self.condition_channels:
+            raise ValueError(
+                "fused_features channel count does not match the preconfigured "
+                f"condition adapter: expected {self.condition_channels}, got {fused.shape[1]}."
+            )
+
+        fused = fused.to(device=self.condition_adapter.weight.device, dtype=self.condition_adapter.weight.dtype)
+        conditioned = self.condition_adapter(fused)
 
         spatial_maps = focal_features.get("temporal_attention_maps")
         if spatial_maps is not None:
             spatial = spatial_maps.mean(dim=1, keepdim=True)
             spatial = F.interpolate(spatial, size=spatial_size, mode="bilinear", align_corners=False)
+            spatial = spatial.to(device=conditioned.device, dtype=conditioned.dtype)
             conditioned = conditioned * (1 + self.condition_scale * spatial)
 
         return conditioned
@@ -281,10 +296,27 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             out_channels_rgb=self.vae.config.latent_channels,
         )
 
+        condition_channels = getattr(self.focal_processor, "feature_dim", None)
+        if condition_channels is None:
+            raise ValueError(
+                "focal_processor must expose a feature_dim attribute so the focal "
+                "condition adapter can be created before training starts."
+            )
+        condition_channels = int(condition_channels)
+
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
-            self.transformer = FocalInjectedSD3Transformer(self.transformer)
+            self.transformer = FocalInjectedSD3Transformer(
+                self.transformer,
+                condition_channels=condition_channels,
+            )
         else:
             _ = self.transformer.base_transformer
+            if self.transformer.condition_channels != condition_channels:
+                raise ValueError(
+                    "Existing FocalInjectedSD3Transformer condition_channels "
+                    f"({self.transformer.condition_channels}) does not match focal_processor.feature_dim "
+                    f"({condition_channels})."
+                )
 
         # Ensure diffusers tracks the newly attached modules so that calls to
         # `pipeline.to(device)` migrate them alongside the base SD components.
