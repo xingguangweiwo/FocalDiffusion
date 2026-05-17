@@ -3,75 +3,66 @@ Pipeline utilities for FocalDiffusion
 """
 
 import logging
-import torch
 from pathlib import Path
-from typing import Union
+from typing import Any, Dict, Optional, Union
 
+import torch
 
-logger = logging.getLogger(__name__)
-
-logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
 
 def _get_transformer_training_mode(config: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Return the checkpoint transformer training mode, if it is recorded."""
+    """Return the checkpoint transformer training mode, if present."""
     if not isinstance(config, dict):
         return None
 
-    training_config = config.get("training")
+    training_config = config.get('training')
     if not isinstance(training_config, dict):
         return None
 
-    trainable_modules = training_config.get("trainable_modules")
+    trainable_modules = training_config.get('trainable_modules')
     if not isinstance(trainable_modules, dict):
         return None
 
-    transformer_mode = trainable_modules.get("transformer")
-    return transformer_mode if isinstance(transformer_mode, str) else None
+    return trainable_modules.get('transformer')
 
 
-def _checkpoint_uses_lora(checkpoint: Dict[str, Any]) -> bool:
-    """Detect whether a checkpoint was saved from a LoRA-wrapped transformer."""
-    transformer_state_dict = checkpoint.get("transformer_state_dict")
-    if not isinstance(transformer_state_dict, dict):
-        return False
-
-    if _get_transformer_training_mode(checkpoint.get("config")) == "lora":
-        return True
-
-    return any("lora_" in key for key in transformer_state_dict)
+def _state_dict_has_lora(state_dict: Dict[str, torch.Tensor]) -> bool:
+    """Check whether a transformer state dict contains PEFT LoRA weights."""
+    return any('lora_' in key for key in state_dict)
 
 
-def _configure_lora_from_checkpoint(pipeline: "FocalDiffusionPipeline", checkpoint: Dict[str, Any]) -> None:
-    """Rebuild the checkpoint's LoRA adapter structure before loading weights."""
-    if not _checkpoint_uses_lora(checkpoint):
+def _ensure_transformer_lora(
+        pipeline: 'FocalDiffusionPipeline',
+        config: Optional[Dict[str, Any]],
+        transformer_state_dict: Dict[str, torch.Tensor],
+) -> None:
+    """Rebuild the checkpoint LoRA adapter structure before loading weights."""
+    transformer_mode = _get_transformer_training_mode(config)
+    if transformer_mode != 'lora' and not _state_dict_has_lora(transformer_state_dict):
         return
 
-    config = checkpoint.get("config") or {}
-    training_config = config.get("training", {}) if isinstance(config, dict) else {}
-
-    from peft import LoraConfig, PeftModel, get_peft_model
-
-    if isinstance(pipeline.transformer, PeftModel):
-        logger.info("Transformer already has a PEFT adapter; skipping LoRA reconfiguration")
+    if hasattr(pipeline.transformer, 'peft_config'):
         return
+
+    from peft import LoraConfig, get_peft_model
+
+    training_config = {}
+    if isinstance(config, dict) and isinstance(config.get('training'), dict):
+        training_config = config['training']
 
     lora_config = LoraConfig(
-        r=training_config.get("lora_rank", 8),
-        lora_alpha=training_config.get("lora_alpha", 16),
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
-        lora_dropout=training_config.get("lora_dropout", 0.1),
+        r=training_config.get('lora_rank', 8),
+        lora_alpha=training_config.get('lora_alpha', 16),
+        target_modules=training_config.get(
+            'lora_target_modules',
+            ['to_q', 'to_k', 'to_v', 'to_out.0'],
+        ),
+        lora_dropout=training_config.get('lora_dropout', 0.1),
     )
     pipeline.transformer = get_peft_model(pipeline.transformer, lora_config)
-    pipeline.register_modules(transformer=pipeline.transformer)
-    logger.info(
-        "Configured transformer LoRA before checkpoint load: rank=%s alpha=%s dropout=%s",
-        lora_config.r,
-        lora_config.lora_alpha,
-        lora_config.lora_dropout,
-    )
+    logger.info("Rebuilt transformer LoRA adapters before loading checkpoint")
 
 
 def load_pipeline(
@@ -94,8 +85,10 @@ def load_pipeline(
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    # Rebuild train-time adapter structures such as LoRA before restoring weights.
-    _configure_lora_from_checkpoint(pipeline, checkpoint)
+    # Load config before model weights so adapter structure can be restored.
+    checkpoint_config = checkpoint.get('config')
+    if checkpoint_config is not None:
+        pipeline.config = checkpoint_config
 
     # Load component weights
     if 'focal_processor_state_dict' in checkpoint:
@@ -111,9 +104,18 @@ def load_pipeline(
         )
         logger.info("Loaded transformer: missing=%s unexpected=%s", missing, unexpected)
 
-    # Load config if available after module registration is complete.
-    if 'config' in checkpoint:
-        pipeline.config = checkpoint['config']
+    if 'transformer_state_dict' in checkpoint:
+        transformer_state_dict = checkpoint['transformer_state_dict']
+        _ensure_transformer_lora(pipeline, checkpoint_config, transformer_state_dict)
+        missing, unexpected = pipeline.transformer.load_state_dict(
+            transformer_state_dict,
+            strict=False,
+        )
+        logger.info(
+            "Loaded transformer: missing=%s unexpected=%s",
+            missing,
+            unexpected,
+        )
 
     return pipeline
 
