@@ -589,12 +589,21 @@ class FocalDiffusionTrainer:
                 focal_stack = (focal_stack * 2.0) - 1.0
                 rgb_target = (rgb_gt * 2.0) - 1.0
 
-                # Extract focal features
+                # Extract focal features and camera-invariant conditioning.  FocalStackProcessor
+                # accepts camera_params for API compatibility, but camera metadata only reaches
+                # the transformer when encoded explicitly and attached to focal_features.
                 focal_features = self.focal_processor(
                     focal_stack,
                     focus_distances,
                     camera_params
                 )
+
+                if camera_params is not None:
+                    focal_features["camera_features"] = self.camera_encoder(
+                        camera_params,
+                        mode="relative",
+                        focus_distances=focus_distances,
+                    )
 
                 focal_features = {
                     key: value.to(self.pipeline.transformer.dtype)

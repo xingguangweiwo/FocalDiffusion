@@ -111,14 +111,47 @@ class CameraInvariantEncoder(nn.Module):
         # 1. Hyperfocal distance (scale-invariant when normalized)
         hyperfocal = (focal_length ** 2) / (aperture * 0.03)  # 0.03mm = typical CoC limit
         hyperfocal_norm = hyperfocal.unsqueeze(1) / (focus_distances + 1e-6)  # [B, N]
-        features.append(self._embed_fourier(hyperfocal_norm) if self.use_fourier_features
-                        else hyperfocal_norm.unsqueeze(-1))
+        hyperfocal_features = (
+            self._embed_fourier(hyperfocal_norm)
+            if self.use_fourier_features
+            else hyperfocal_norm.unsqueeze(-1)
+        )
 
-        # 2. Relative aperture (f-number relative to focal length is already normalized)
-        aperture_features = self._embed_fourier(aperture.unsqueeze(1).expand(-1, N))
+        # 2. Per-focus relative spacing summary.  The original implementation
+        # appended all pairwise focus-distance ratios as [B, N*(N-1)/2, D],
+        # which cannot be concatenated with per-focus [B, N, D] features for
+        # focal stacks larger than two frames.  Summarize each focus plane's
+        # ratio to the rest of the stack so the tensor remains [B, N, D].
+        if N > 1:
+            pairwise_log_ratios = torch.log(
+                focus_distances.unsqueeze(2) / (focus_distances.unsqueeze(1) + 1e-6)
+                + 1e-6
+            )
+            ratio_mask = ~torch.eye(
+                N, dtype=torch.bool, device=focus_distances.device
+            ).unsqueeze(0)
+            ratio_summary = (
+                pairwise_log_ratios.masked_fill(~ratio_mask, 0).sum(dim=2) / (N - 1)
+            )
+        else:
+            ratio_summary = torch.zeros_like(focus_distances)
+
+        ratio_features = (
+            self._embed_fourier(ratio_summary)
+            if self.use_fourier_features
+            else ratio_summary.unsqueeze(-1)
+        )
+        features.append(hyperfocal_features + ratio_features)
+
+        # 3. Relative aperture (f-number relative to focal length is already normalized)
+        aperture_features = (
+            self._embed_fourier(aperture.unsqueeze(1).expand(-1, N))
+            if self.use_fourier_features
+            else aperture.unsqueeze(1).expand(-1, N).unsqueeze(-1)
+        )
         features.append(aperture_features)
 
-        # 3. Depth of field indicators
+        # 4. Depth of field indicators
         near_dof = []
         far_dof = []
 
@@ -143,19 +176,16 @@ class CameraInvariantEncoder(nn.Module):
         near_dof = torch.stack(near_dof, dim=1)  # [B, N]
         far_dof = torch.stack(far_dof, dim=1)  # [B, N]
 
-        features.append(self._embed_fourier(near_dof))
-        features.append(self._embed_fourier(far_dof))
-
-        # 4. Focus distance ratios (pairwise)
-        if N > 1:
-            ratios = []
-            for i in range(N):
-                for j in range(i + 1, N):
-                    ratio = focus_distances[:, i] / (focus_distances[:, j] + 1e-6)
-                    ratios.append(ratio)
-
-            ratios = torch.stack(ratios, dim=1)  # [B, N*(N-1)/2]
-            features.append(self._embed_fourier(ratios))
+        features.append(
+            self._embed_fourier(near_dof)
+            if self.use_fourier_features
+            else near_dof.unsqueeze(-1)
+        )
+        features.append(
+            self._embed_fourier(far_dof)
+            if self.use_fourier_features
+            else far_dof.unsqueeze(-1)
+        )
 
         # Concatenate and encode
         features = torch.cat(features, dim=-1)  # [B, N, D]

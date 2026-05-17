@@ -58,7 +58,11 @@ class FocalDiffusionOutput(BaseOutput):
 class FocalInjectedSD3Transformer(nn.Module):
     """Wrapper around the SD3.5 transformer that accepts focal features."""
 
-    def __init__(self, base_transformer: SD3Transformer2DModel) -> None:
+    def __init__(
+        self,
+        base_transformer: SD3Transformer2DModel,
+        camera_feature_dim: int = 512,
+    ) -> None:
         super().__init__()
         self.base_transformer = base_transformer
         base = self.base_transformer
@@ -82,6 +86,8 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.post_scale = nn.Parameter(torch.tensor(1.0))
 
         self._condition_adapters = nn.ModuleDict()
+        self.camera_feature_dim = camera_feature_dim
+        self.camera_condition_adapter = nn.Linear(camera_feature_dim, hidden_size)
         self.dtype = getattr(base, "dtype", torch.float32)
 
     @property
@@ -92,7 +98,7 @@ class FocalInjectedSD3Transformer(nn.Module):
         if base is not None:
             return cast(SD3Transformer2DModel, base)
 
-        base = getattr(self, "_base_transformer_ref", None)
+        base = self.__dict__.get("_base_transformer_ref")
         if base is None:
             raise AttributeError(
                 "FocalInjectedSD3Transformer is missing its base transformer. "
@@ -121,10 +127,18 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.base_transformer = module
 
     def __getattr__(self, name: str) -> Any:
-        # Delegate attribute access (e.g. to(), device, dtype, etc.) to the wrapped module.
-        if name in {"base_transformer", "focal_attn", "config", "_base_transformer_ref"}:
-            return super().__getattribute__(name)
-        return getattr(self.base_transformer, name)
+        # First preserve nn.Module's standard parameter/submodule lookup.  Only
+        # delegate unresolved attributes (e.g. transformer helper methods) to
+        # the wrapped SD3 transformer.
+        try:
+            return nn.Module.__getattr__(self, name)
+        except AttributeError as exc:
+            base = self._modules.get("base_transformer")
+            if base is None:
+                base = self.__dict__.get("_base_transformer_ref")
+            if base is None:
+                raise exc
+            return getattr(base, name)
 
     def forward(
         self,
@@ -137,9 +151,13 @@ class FocalInjectedSD3Transformer(nn.Module):
         return_dict: bool = True,
     ) -> Union[Transformer2DModelOutput, Tuple[torch.Tensor]]:
         base = self.base_transformer
-        condition_pre = self._extract_condition(focal_features, hidden_states.shape[-2:])
+        condition_pre = self._extract_condition(
+            focal_features, hidden_states.shape[-2:], hidden_states.shape[0]
+        )
         if condition_pre is not None:
-            hidden_states = self._apply_condition(hidden_states, condition_pre, self.pre_focal_attn, self.pre_norm, self.pre_scale)
+            hidden_states = self._apply_condition(
+                hidden_states, condition_pre, self.pre_focal_attn, self.pre_norm, self.pre_scale
+            )
 
         result = base.forward(
             hidden_states=hidden_states,
@@ -150,9 +168,13 @@ class FocalInjectedSD3Transformer(nn.Module):
             return_dict=False,
         )[0]
 
-        condition_post = self._extract_condition(focal_features, result.shape[-2:])
+        condition_post = self._extract_condition(
+            focal_features, result.shape[-2:], result.shape[0]
+        )
         if condition_post is not None:
-            result = self._apply_condition(result, condition_post, self.focal_attn, self.post_norm, self.post_scale)
+            result = self._apply_condition(
+                result, condition_post, self.focal_attn, self.post_norm, self.post_scale
+            )
 
         if return_dict:
             return Transformer2DModelOutput(sample=result)
@@ -162,14 +184,29 @@ class FocalInjectedSD3Transformer(nn.Module):
     def _get_condition_adapter(self, channels: int) -> nn.Conv2d:
         key = str(channels)
         if key not in self._condition_adapters:
-            adapter = nn.Conv2d(channels, self.config.attention_head_dim * self.config.num_attention_heads, kernel_size=1)
+            adapter = nn.Conv2d(
+                channels,
+                self.config.attention_head_dim * self.config.num_attention_heads,
+                kernel_size=1,
+            )
             self._condition_adapters[key] = adapter
         return self._condition_adapters[key]
+
+    def configure_camera_conditioning(self, camera_feature_dim: int) -> None:
+        """Ensure the trainable camera adapter matches the encoder output size."""
+
+        if camera_feature_dim == self.camera_feature_dim:
+            return
+
+        hidden_size = self.config.attention_head_dim * self.config.num_attention_heads
+        self.camera_feature_dim = camera_feature_dim
+        self.camera_condition_adapter = nn.Linear(camera_feature_dim, hidden_size)
 
     def _extract_condition(
         self,
         focal_features: Optional[Dict[str, torch.Tensor]],
-        spatial_size: Tuple[int, int]
+        spatial_size: Tuple[int, int],
+        batch_size: int,
     ) -> Optional[torch.Tensor]:
         if not focal_features or "fused_features" not in focal_features:
             return None
@@ -179,15 +216,66 @@ class FocalInjectedSD3Transformer(nn.Module):
             fused = fused.mean(dim=1)
 
         if fused.shape[-2:] != spatial_size:
-            fused = F.interpolate(fused, size=spatial_size, mode="bilinear", align_corners=False)
+            fused = F.interpolate(
+                fused, size=spatial_size, mode="bilinear", align_corners=False
+            )
 
-        adapter = self._get_condition_adapter(fused.shape[1])
+        adapter = self._get_condition_adapter(fused.shape[1]).to(
+            device=fused.device, dtype=fused.dtype
+        )
         conditioned = adapter(fused)
+        if conditioned.shape[0] != batch_size:
+            if batch_size % conditioned.shape[0] != 0:
+                raise ValueError(
+                    f"Focal condition batch {conditioned.shape[0]} cannot be broadcast "
+                    f"to transformer batch {batch_size}."
+                )
+            conditioned = conditioned.repeat_interleave(
+                batch_size // conditioned.shape[0], dim=0
+            )
+
+        camera_features = focal_features.get("camera_features")
+        if camera_features is not None:
+            if camera_features.dim() > 2:
+                camera_features = camera_features.flatten(1)
+            camera_features = camera_features.to(
+                device=conditioned.device, dtype=conditioned.dtype
+            )
+            if camera_features.shape[0] != conditioned.shape[0]:
+                if conditioned.shape[0] % camera_features.shape[0] != 0:
+                    raise ValueError(
+                        f"Camera feature batch {camera_features.shape[0]} cannot be broadcast "
+                        f"to condition batch {conditioned.shape[0]}."
+                    )
+                camera_features = camera_features.repeat_interleave(
+                    conditioned.shape[0] // camera_features.shape[0], dim=0
+                )
+            if camera_features.shape[-1] != self.camera_feature_dim:
+                raise ValueError(
+                    f"Camera feature dim {camera_features.shape[-1]} does not match "
+                    f"configured adapter dim {self.camera_feature_dim}."
+                )
+            camera_adapter = self.camera_condition_adapter.to(
+                device=conditioned.device, dtype=conditioned.dtype
+            )
+            camera_condition = camera_adapter(camera_features).unsqueeze(-1).unsqueeze(-1)
+            conditioned = conditioned + self.condition_scale * camera_condition
 
         spatial_maps = focal_features.get("temporal_attention_maps")
         if spatial_maps is not None:
             spatial = spatial_maps.mean(dim=1, keepdim=True)
-            spatial = F.interpolate(spatial, size=spatial_size, mode="bilinear", align_corners=False)
+            spatial = F.interpolate(
+                spatial, size=spatial_size, mode="bilinear", align_corners=False
+            )
+            if spatial.shape[0] != conditioned.shape[0]:
+                if conditioned.shape[0] % spatial.shape[0] != 0:
+                    raise ValueError(
+                        f"Temporal attention batch {spatial.shape[0]} cannot be broadcast "
+                        f"to condition batch {conditioned.shape[0]}."
+                    )
+                spatial = spatial.repeat_interleave(
+                    conditioned.shape[0] // spatial.shape[0], dim=0
+                )
             conditioned = conditioned * (1 + self.condition_scale * spatial)
 
         return conditioned
@@ -281,10 +369,15 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             out_channels_rgb=self.vae.config.latent_channels,
         )
 
+        camera_feature_dim = getattr(self.camera_encoder, "output_dim", 512)
         if not isinstance(self.transformer, FocalInjectedSD3Transformer):
-            self.transformer = FocalInjectedSD3Transformer(self.transformer)
+            self.transformer = FocalInjectedSD3Transformer(
+                self.transformer,
+                camera_feature_dim=camera_feature_dim,
+            )
         else:
             _ = self.transformer.base_transformer
+            self.transformer.configure_camera_conditioning(camera_feature_dim)
 
         # Ensure diffusers tracks the newly attached modules so that calls to
         # `pipeline.to(device)` migrate them alongside the base SD components.
