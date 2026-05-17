@@ -598,7 +598,7 @@ class FocalDiffusionTrainer:
                 focal_stack = (focal_stack * 2.0) - 1.0
                 rgb_target = (rgb_gt * 2.0) - 1.0
 
-                # Extract focal features and make camera encoding an active conditioning path.
+                # Extract focal features and explicitly attach camera metadata embeddings.
                 focal_features = self.focal_processor(
                     focal_stack,
                     focus_distances,

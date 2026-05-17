@@ -84,8 +84,8 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.pre_scale = nn.Parameter(torch.tensor(0.5))
         self.post_scale = nn.Parameter(torch.tensor(1.0))
 
-        self.condition_channels = condition_channels
-        self.condition_adapter = nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
+        self._condition_adapters = nn.ModuleDict()
+        self._camera_condition_adapters = nn.ModuleDict()
         self.dtype = getattr(base, "dtype", torch.float32)
         self.condition_adapter.to(device=self._base_device, dtype=self.dtype)
 
@@ -181,11 +181,36 @@ class FocalInjectedSD3Transformer(nn.Module):
 
         return (result,)
 
+    def _get_condition_adapter(self, channels: int) -> nn.Conv2d:
+        key = str(channels)
+        if key not in self._condition_adapters:
+            adapter = nn.Conv2d(channels, self.config.attention_head_dim * self.config.num_attention_heads, kernel_size=1)
+            self._condition_adapters[key] = adapter
+        return self._condition_adapters[key]
+
+    def _get_camera_condition_adapter(self, channels: int) -> nn.Linear:
+        key = str(channels)
+        if key not in self._camera_condition_adapters:
+            adapter = nn.Linear(channels, self.config.attention_head_dim * self.config.num_attention_heads)
+            self._camera_condition_adapters[key] = adapter
+        return self._camera_condition_adapters[key]
+
+    @staticmethod
+    def _match_condition_batch(condition: torch.Tensor, target_batch: int) -> torch.Tensor:
+        if condition.shape[0] == target_batch:
+            return condition
+        if target_batch % condition.shape[0] != 0:
+            raise ValueError(
+                f"Cannot broadcast focal condition batch {condition.shape[0]} to transformer batch {target_batch}."
+            )
+        repeat_factor = target_batch // condition.shape[0]
+        return condition.repeat(repeat_factor, *([1] * (condition.dim() - 1)))
+
     def _extract_condition(
         self,
         focal_features: Optional[Dict[str, torch.Tensor]],
         spatial_size: Tuple[int, int],
-        batch_size: int,
+        target_batch: int,
     ) -> Optional[torch.Tensor]:
         if not focal_features or "fused_features" not in focal_features:
             return None
@@ -197,14 +222,18 @@ class FocalInjectedSD3Transformer(nn.Module):
         if fused.shape[-2:] != spatial_size:
             fused = F.interpolate(fused, size=spatial_size, mode="bilinear", align_corners=False)
 
-        if fused.shape[1] != self.condition_channels:
-            raise ValueError(
-                "fused_features channel count does not match the preconfigured "
-                f"condition adapter: expected {self.condition_channels}, got {fused.shape[1]}."
-            )
+        adapter = self._get_condition_adapter(fused.shape[1]).to(device=fused.device, dtype=fused.dtype)
+        conditioned = adapter(fused)
 
-        fused = fused.to(device=self.condition_adapter.weight.device, dtype=self.condition_adapter.weight.dtype)
-        conditioned = self.condition_adapter(fused)
+        camera_features = focal_features.get("camera_features")
+        if camera_features is not None:
+            camera_features = camera_features.to(device=conditioned.device, dtype=conditioned.dtype)
+            camera_adapter = self._get_camera_condition_adapter(camera_features.shape[-1]).to(
+                device=conditioned.device,
+                dtype=conditioned.dtype,
+            )
+            camera_condition = camera_adapter(camera_features).unsqueeze(-1).unsqueeze(-1)
+            conditioned = conditioned + self.condition_scale * camera_condition
 
         spatial_maps = focal_features.get("temporal_attention_maps")
         if spatial_maps is not None:
@@ -213,7 +242,7 @@ class FocalInjectedSD3Transformer(nn.Module):
             spatial = spatial.to(device=conditioned.device, dtype=conditioned.dtype)
             conditioned = conditioned * (1 + self.condition_scale * spatial)
 
-        return conditioned
+        return self._match_condition_batch(conditioned, target_batch)
 
     def _apply_condition(
         self,
@@ -510,6 +539,8 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         )
         if camera_features is not None:
             focal_features["camera_features"] = camera_features
+        if num_images_per_prompt > 1:
+            focal_features = self._repeat_focal_features(focal_features, num_images_per_prompt)
 
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = self.encode_prompt(
             prompt=prompt,
@@ -617,6 +648,14 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             attention_maps=None,
             uncertainty=1.0 - confidence_map.squeeze(1),
         )
+
+
+    def _repeat_focal_features(self, value: Any, repeats: int) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.repeat_interleave(repeats, dim=0)
+        if isinstance(value, dict):
+            return {key: self._repeat_focal_features(item, repeats) for key, item in value.items()}
+        return value
 
     def _ensure_tensor_stack(self, stack: Union[torch.Tensor, List[Image.Image]]) -> torch.Tensor:
         if isinstance(stack, torch.Tensor):
