@@ -126,12 +126,24 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.base_transformer = module
 
     def __getattr__(self, name: str) -> Any:
-        # First let nn.Module resolve registered parameters, buffers, and submodules.
-        # Only delegate unknown attributes (e.g. dtype/device helpers) to the wrapped module.
+        """Resolve wrapper modules first, then proxy unknown attributes to the base transformer.
+
+        ``nn.Module`` stores registered submodules, parameters, and buffers in
+        internal dictionaries instead of ``__dict__``.  Calling
+        ``object.__getattribute__`` (or ``super().__getattribute__`` here) from a
+        custom ``__getattr__`` bypasses that lookup and can make wrapper-owned
+        modules such as ``pre_focal_attn`` or ``post_norm`` appear to be missing.
+        Preserve PyTorch's module lookup before falling back to the wrapped SD3
+        transformer for compatibility attributes.
+        """
+
         try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.base_transformer, name)
+            return nn.Module.__getattr__(self, name)
+        except AttributeError as module_error:
+            if name in {"base_transformer", "_base_transformer_ref"}:
+                raise module_error
+
+        return getattr(self.base_transformer, name)
 
     def forward(
         self,
