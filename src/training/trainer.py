@@ -335,8 +335,15 @@ class FocalDiffusionTrainer:
         elif train_config['transformer'] == 'lora':
             self._add_lora_to_transformer()
         elif train_config['transformer'] == 'attention_only':
+            trainable_transformer_tokens = (
+                'attn',
+                'condition_adapter',
+                'condition_scale',
+                'pre_scale',
+                'post_scale',
+            )
             for name, param in self.pipeline.transformer.named_parameters():
-                if 'attn' not in name:
+                if not any(token in name for token in trainable_transformer_tokens):
                     param.requires_grad_(False)
         elif train_config['transformer'] == 'full':
             self.pipeline.transformer.requires_grad_(True)
