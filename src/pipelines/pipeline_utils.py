@@ -2,13 +2,14 @@
 Pipeline utilities for FocalDiffusion
 """
 
-import torch
-from pathlib import Path
-from typing import Dict, Optional, Union
-import json
 import logging
 
-from ..utils import ensure_sentencepiece_installed
+import torch
+from pathlib import Path
+from typing import Union
+
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ def load_pipeline(
 ) -> 'FocalDiffusionPipeline':
     """Load FocalDiffusion pipeline from checkpoint"""
     from .focal_diffusion_pipeline import FocalDiffusionPipeline
+    from ..utils.env_utils import ensure_sentencepiece_installed
 
     # Load base pipeline
     ensure_sentencepiece_installed()
@@ -43,13 +45,9 @@ def load_pipeline(
             checkpoint['transformer_state_dict'],
             strict=False,
         )
-        if missing or unexpected:
-            logger.warning(
-                "Loaded transformer_state_dict with non-strict key differences: "
-                "missing=%s, unexpected=%s",
-                missing,
-                unexpected,
-            )
+        logger.info("Loaded transformer state_dict from checkpoint")
+        logger.info("Missing transformer keys: %s", missing)
+        logger.info("Unexpected transformer keys: %s", unexpected)
 
     # Load config if available
     if 'config' in checkpoint:
@@ -61,7 +59,7 @@ def load_pipeline(
 def save_pipeline(
         pipeline: 'FocalDiffusionPipeline',
         save_path: Union[str, Path],
-        save_full_model: bool = False,
+        save_full_model: bool = True,
 ) -> None:
     """Save FocalDiffusion pipeline to checkpoint"""
     save_path = Path(save_path)

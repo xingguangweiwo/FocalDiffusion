@@ -39,8 +39,8 @@ class FocalDiffusionLoss(nn.Module):
 
     def forward(
         self,
-        noise_pred: torch.Tensor,
-        noise_target: torch.Tensor,
+        diffusion_pred: torch.Tensor,
+        diffusion_target: torch.Tensor,
         depth_pred: Optional[torch.Tensor] = None,
         depth_target: Optional[torch.Tensor] = None,
         rgb_pred: Optional[torch.Tensor] = None,
@@ -51,7 +51,7 @@ class FocalDiffusionLoss(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         losses: Dict[str, torch.Tensor] = {}
 
-        losses["diffusion"] = F.mse_loss(noise_pred, noise_target)
+        losses["diffusion"] = F.mse_loss(diffusion_pred, diffusion_target)
 
         if depth_pred is not None and depth_target is not None and self.depth_weight > 0:
             losses["depth"] = self.depth_loss(depth_pred, depth_target, mask=depth_mask)
