@@ -3,12 +3,14 @@ Pipeline utilities for FocalDiffusion
 """
 
 import logging
-from pathlib import Path
-from typing import Any, Dict, Optional, Union
-
 import torch
+from pathlib import Path
+from typing import Union
 
-from ..utils import ensure_sentencepiece_installed
+
+logger = logging.getLogger(__name__)
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,7 @@ def load_pipeline(
 ) -> 'FocalDiffusionPipeline':
     """Load FocalDiffusion pipeline from checkpoint"""
     from .focal_diffusion_pipeline import FocalDiffusionPipeline
+    from ..utils.env_utils import ensure_sentencepiece_installed
 
     # Load base pipeline
     ensure_sentencepiece_installed()
@@ -118,7 +121,7 @@ def load_pipeline(
 def save_pipeline(
         pipeline: 'FocalDiffusionPipeline',
         save_path: Union[str, Path],
-        save_full_model: bool = False,
+        save_full_model: bool = True,
 ) -> None:
     """Save FocalDiffusion pipeline to checkpoint"""
     save_path = Path(save_path)
