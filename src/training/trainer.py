@@ -638,7 +638,12 @@ class FocalDiffusionTrainer:
                     model_input = noisy_latents
 
                 model_input = model_input.to(self.pipeline.transformer.dtype)
-                flow_target = flow_target.to(self.pipeline.transformer.dtype)
+                noise = noise.to(self.pipeline.transformer.dtype)
+                batch_prompt_embeds, batch_pooled_prompt_embeds = self._repeat_prompt_embeddings(
+                    prompt_embeds,
+                    pooled_prompt_embeds,
+                    batch_size=model_input.shape[0],
+                )
 
                 # Forward pass
                 with autocast(enabled=self.scaler is not None):
@@ -646,8 +651,8 @@ class FocalDiffusionTrainer:
                     diffusion_pred = self.pipeline.transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
-                        encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=batch_prompt_embeds,
+                        pooled_projections=batch_pooled_prompt_embeds,
                         focal_features=focal_features,
                         return_dict=False,
                     )[0]
@@ -779,6 +784,77 @@ class FocalDiffusionTrainer:
         }
 
         return prompt_embeds, pooled_prompt_embeds
+
+    @staticmethod
+    def _repeat_prompt_embeddings(
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Repeat cached prompt embeddings so their batch matches the current data batch."""
+
+        if prompt_embeds.shape[0] == batch_size and pooled_prompt_embeds.shape[0] == batch_size:
+            return prompt_embeds, pooled_prompt_embeds
+
+        if prompt_embeds.shape[0] != 1 or pooled_prompt_embeds.shape[0] != 1:
+            raise ValueError(
+                "Cached empty prompt embeddings must have batch size 1 or match the current "
+                f"training batch size ({batch_size}); got prompt batch {prompt_embeds.shape[0]} "
+                f"and pooled prompt batch {pooled_prompt_embeds.shape[0]}."
+            )
+
+        repeat_shape = (batch_size,) + (1,) * (prompt_embeds.ndim - 1)
+        pooled_repeat_shape = (batch_size,) + (1,) * (pooled_prompt_embeds.ndim - 1)
+        return (
+            prompt_embeds.repeat(repeat_shape),
+            pooled_prompt_embeds.repeat(pooled_repeat_shape),
+        )
+
+    def _predict_clean_latents(
+        self,
+        noisy_latents: torch.Tensor,
+        noise_pred: torch.Tensor,
+        timesteps: torch.Tensor,
+        noise_levels: Optional[torch.Tensor] = None,
+        reference_latents: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Reconstruct the clean latent sample from the model's noise prediction."""
+
+        scheduler = self.pipeline.scheduler
+        latent_dtype = noisy_latents.dtype
+        device = noisy_latents.device
+
+        noise_pred = noise_pred.to(dtype=latent_dtype)
+
+        if noise_levels is not None:
+            sigma = noise_levels.to(device=device, dtype=latent_dtype)
+            sigma = sigma.view(-1, *[1] * (noisy_latents.ndim - 1))
+            denom = 1.0 - sigma
+            near_zero = denom.abs() < 1e-6
+            denom = denom.clamp(min=1e-6)
+            clean = (noisy_latents - sigma * noise_pred) / denom
+
+            if reference_latents is not None and torch.any(near_zero):
+                fallback = reference_latents.to(device=device, dtype=latent_dtype).detach()
+                clean = torch.where(near_zero, fallback, clean)
+
+            return clean
+
+        if hasattr(scheduler, "alphas_cumprod"):
+            alphas_cumprod = scheduler.alphas_cumprod.to(device=device, dtype=latent_dtype)
+            timestep_indices = timesteps.to(device=device)
+            if timestep_indices.dtype not in (torch.int32, torch.int64, torch.int16, torch.uint8):
+                timestep_indices = timestep_indices.long()
+            timestep_indices = timestep_indices.clamp(min=0, max=alphas_cumprod.shape[0] - 1)
+            alpha_prod_t = alphas_cumprod.index_select(0, timestep_indices)
+            alpha = alpha_prod_t.sqrt().view(-1, *[1] * (noisy_latents.ndim - 1))
+            sigma = (1 - alpha_prod_t).sqrt().view(-1, *[1] * (noisy_latents.ndim - 1))
+            clean = (noisy_latents - sigma * noise_pred) / alpha.clamp(min=1e-6)
+            return clean
+
+        raise RuntimeError(
+            "Unable to recover clean latents for the active scheduler."
+        )
 
     def validate(self, epoch: int) -> dict:
         """Validation loop."""
