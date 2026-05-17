@@ -44,9 +44,12 @@ class CameraInvariantEncoder(nn.Module):
         self.aperture_encoder = self._build_encoder("aperture")
         self.sensor_encoder = self._build_encoder("sensor")
 
-        # Relative relationship encoder
+        # Relative relationship encoder.  Relative mode concatenates five
+        # Fourier-embedded groups: hyperfocal ratio, aperture, near DoF, far DoF,
+        # and a per-focus summary of pairwise focus-distance ratios.
+        relation_input_dim = self.fourier_dim * 5 if use_fourier_features else 5
         self.relation_encoder = nn.Sequential(
-            nn.Linear(256, hidden_dim),
+            nn.Linear(relation_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -115,7 +118,9 @@ class CameraInvariantEncoder(nn.Module):
                         else hyperfocal_norm.unsqueeze(-1))
 
         # 2. Relative aperture (f-number relative to focal length is already normalized)
-        aperture_features = self._embed_fourier(aperture.unsqueeze(1).expand(-1, N))
+        aperture_values = aperture.unsqueeze(1).expand(-1, N)
+        aperture_features = self._embed_fourier(aperture_values) if self.use_fourier_features \
+            else aperture_values.unsqueeze(-1)
         features.append(aperture_features)
 
         # 3. Depth of field indicators
@@ -143,19 +148,22 @@ class CameraInvariantEncoder(nn.Module):
         near_dof = torch.stack(near_dof, dim=1)  # [B, N]
         far_dof = torch.stack(far_dof, dim=1)  # [B, N]
 
-        features.append(self._embed_fourier(near_dof))
-        features.append(self._embed_fourier(far_dof))
+        features.append(self._embed_fourier(near_dof) if self.use_fourier_features else near_dof.unsqueeze(-1))
+        features.append(self._embed_fourier(far_dof) if self.use_fourier_features else far_dof.unsqueeze(-1))
 
-        # 4. Focus distance ratios (pairwise)
+        # 4. Focus distance ratios. Keep this as a per-focus-position feature so
+        # every entry in ``features`` has shape [B, N, D] before concatenation.
+        # The previous pair-list representation was [B, N*(N-1)/2, D], which
+        # fails for common focal stack sizes (for example N=5, 8, or 9).
         if N > 1:
-            ratios = []
-            for i in range(N):
-                for j in range(i + 1, N):
-                    ratio = focus_distances[:, i] / (focus_distances[:, j] + 1e-6)
-                    ratios.append(ratio)
+            pair_ratios = focus_distances.unsqueeze(2) / (focus_distances.unsqueeze(1) + 1e-6)
+            off_diagonal = ~torch.eye(N, dtype=torch.bool, device=focus_distances.device)
+            ratio_summary = pair_ratios[:, off_diagonal].view(B, N, N - 1).mean(dim=-1)
+        else:
+            ratio_summary = torch.ones_like(focus_distances)
 
-            ratios = torch.stack(ratios, dim=1)  # [B, N*(N-1)/2]
-            features.append(self._embed_fourier(ratios))
+        features.append(self._embed_fourier(ratio_summary) if self.use_fourier_features
+                        else ratio_summary.unsqueeze(-1))
 
         # Concatenate and encode
         features = torch.cat(features, dim=-1)  # [B, N, D]
@@ -261,9 +269,11 @@ class CameraInvariantEncoder(nn.Module):
 
 class InvariantCostVolume(nn.Module):
     """
-    Camera-invariant cost volume representation
-    Inspired by "Deep depth from focal stack with defocus model"
-    but with improvements for better generalization
+    Experimental camera-invariant cost volume representation.
+
+    This module is retained for research use through CameraInvariantFocalProcessor
+    but is not wired into the default training or inference pipeline. Keep any
+    production path explicit instead of assuming it participates automatically.
     """
 
     def __init__(

@@ -20,13 +20,15 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers import StableDiffusion3Pipeline
-from huggingface_hub import HfFolder
+from huggingface_hub import get_token as hf_get_token
 from huggingface_hub.errors import GatedRepoError
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 import wandb
 
 from typing import Any, Dict, List, Optional, Tuple
+
+from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
 
 
 logger = logging.getLogger(__name__)
@@ -62,7 +64,7 @@ class FocalDiffusionTrainer:
         if env_token:
             return env_token, "environment variables"
 
-        cached_token = HfFolder.get_token()
+        cached_token = hf_get_token()
         if cached_token:
             return cached_token, "huggingface-cli cache"
 
@@ -333,8 +335,15 @@ class FocalDiffusionTrainer:
         elif train_config['transformer'] == 'lora':
             self._add_lora_to_transformer()
         elif train_config['transformer'] == 'attention_only':
+            trainable_transformer_tokens = (
+                'attn',
+                'condition_adapter',
+                'condition_scale',
+                'pre_scale',
+                'post_scale',
+            )
             for name, param in self.pipeline.transformer.named_parameters():
-                if 'attn' not in name:
+                if not any(token in name for token in trainable_transformer_tokens):
                     param.requires_grad_(False)
         elif train_config['transformer'] == 'full':
             self.pipeline.transformer.requires_grad_(True)
@@ -589,12 +598,19 @@ class FocalDiffusionTrainer:
                 focal_stack = (focal_stack * 2.0) - 1.0
                 rgb_target = (rgb_gt * 2.0) - 1.0
 
-                # Extract focal features
+                # Extract focal features and explicitly attach camera metadata embeddings.
                 focal_features = self.focal_processor(
                     focal_stack,
                     focus_distances,
                     camera_params
                 )
+
+                if camera_params is not None:
+                    focal_features['camera_features'] = self.camera_encoder(
+                        camera_params,
+                        mode="relative",
+                        focus_distances=focus_distances,
+                    )
 
                 focal_features = {
                     key: value.to(self.pipeline.transformer.dtype)
@@ -608,82 +624,14 @@ class FocalDiffusionTrainer:
                 latents_dist = self.pipeline.vae.encode(rgb_latent_input).latent_dist
                 latents = latents_dist.sample() * self.pipeline.vae.config.scaling_factor
 
-                # Sample noise for diffusion training
-                noise = torch.randn_like(latents)
-
+                # Sample the SD3 flow-matching training objective.  The transformer
+                # predicts the flow direction (noise - clean_latents), not DDPM epsilon.
                 scheduler = self.pipeline.scheduler
+                flow_batch = sample_sd3_flow_matching_batch(scheduler, latents)
+                timesteps = flow_batch.timesteps
+                noisy_latents = flow_batch.noisy_latents
+                flow_target = flow_batch.target
 
-                noise_levels = None
-
-                if hasattr(scheduler, "add_noise"):
-                    timesteps = torch.randint(
-                        0,
-                        scheduler.config.num_train_timesteps,
-                        (latents.shape[0],),
-                        device=device,
-                        dtype=torch.long,
-                    )
-                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-                elif hasattr(scheduler, "scale_noise"):
-                    timesteps_attr = getattr(scheduler, "timesteps", None)
-                    needs_timesteps = timesteps_attr is None
-                    if not needs_timesteps:
-                        try:
-                            needs_timesteps = len(timesteps_attr) == 0  # type: ignore[arg-type]
-                        except TypeError:
-                            needs_timesteps = False
-
-                    if needs_timesteps:
-                        if not hasattr(scheduler, "set_timesteps"):
-                            raise AttributeError(
-                                "The active scheduler exposes `scale_noise` but does not provide"
-                                " `set_timesteps`, preventing training-time noise scaling."
-                            )
-
-                        num_train_timesteps = getattr(scheduler.config, "num_train_timesteps", None)
-                        if num_train_timesteps is None:
-                            raise AttributeError(
-                                "Scheduler is missing `config.num_train_timesteps`, which is required"
-                                " to initialize the training timestep schedule."
-                            )
-
-                        scheduler.set_timesteps(num_train_timesteps, device=device)
-                        timesteps_attr = getattr(scheduler, "timesteps", None)
-
-                    if timesteps_attr is None:
-                        raise RuntimeError(
-                            "Failed to initialize scheduler timesteps for scale_noise training."
-                        )
-
-                    if not torch.is_tensor(timesteps_attr):
-                        schedule_timesteps = torch.as_tensor(timesteps_attr, device=device)
-                    else:
-                        schedule_timesteps = timesteps_attr.to(device=device)
-
-                    if schedule_timesteps.ndim != 1 or schedule_timesteps.numel() == 0:
-                        raise RuntimeError(
-                            "Scheduler timesteps must be a 1D tensor with at least one entry to"
-                            " perform scale_noise training."
-                        )
-
-                    step_indices = torch.randint(
-                        0,
-                        schedule_timesteps.shape[0],
-                        (latents.shape[0],),
-                        device=device,
-                        dtype=torch.long,
-                    )
-                    timesteps = schedule_timesteps.index_select(0, step_indices)
-                    noisy_latents = scheduler.scale_noise(latents, timesteps, noise)
-                    if hasattr(scheduler, "sigmas"):
-                        sigma_schedule = scheduler.sigmas.to(device=device, dtype=latents.dtype)
-                        sigma_indices = step_indices.clamp(max=sigma_schedule.shape[0] - 1)
-                        noise_levels = sigma_schedule.index_select(0, sigma_indices)
-                else:
-                    raise AttributeError(
-                        "The active scheduler does not implement `add_noise` or `scale_noise`,"
-                        " which are required for forward diffusion during training."
-                    )
                 if hasattr(self.pipeline.scheduler, "scale_model_input"):
                     model_input = self.pipeline.scheduler.scale_model_input(noisy_latents, timesteps)
                 else:
@@ -691,25 +639,28 @@ class FocalDiffusionTrainer:
 
                 model_input = model_input.to(self.pipeline.transformer.dtype)
                 noise = noise.to(self.pipeline.transformer.dtype)
+                batch_prompt_embeds, batch_pooled_prompt_embeds = self._repeat_prompt_embeddings(
+                    prompt_embeds,
+                    pooled_prompt_embeds,
+                    batch_size=model_input.shape[0],
+                )
 
                 # Forward pass
                 with autocast(enabled=self.scaler is not None):
-                    # Predict noise
-                    noise_pred = self.pipeline.transformer(
+                    # Predict the SD3 flow direction.
+                    diffusion_pred = self.pipeline.transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
-                        encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=batch_prompt_embeds,
+                        pooled_projections=batch_pooled_prompt_embeds,
                         focal_features=focal_features,
                         return_dict=False,
                     )[0]
 
-                    clean_latent_pred = self._predict_clean_latents(
+                    clean_latent_pred = predict_clean_latents_from_flow(
                         noisy_latents=noisy_latents,
-                        noise_pred=noise_pred,
-                        timesteps=timesteps,
-                        noise_levels=noise_levels,
-                        reference_latents=latents,
+                        model_pred=diffusion_pred,
+                        sigmas=flow_batch.sigmas,
                     )
 
                     # Decode auxiliary predictions for multi-task losses
@@ -743,8 +694,8 @@ class FocalDiffusionTrainer:
                     rgb_recon = rgb_recon.clamp(-1, 1)
 
                     # Cast tensors for stable loss computation
-                    noise_pred = noise_pred.float()
-                    noise_target = noise.float()
+                    diffusion_pred = diffusion_pred.float()
+                    diffusion_target = flow_target.float()
                     depth_pred = depth_pred.float()
                     depth_target = depth_gt.float()
                     rgb_recon = rgb_recon.float()
@@ -752,8 +703,8 @@ class FocalDiffusionTrainer:
 
                     # Compute losses
                     loss_dict = loss_fn(
-                        noise_pred=noise_pred,
-                        noise_target=noise_target,
+                        diffusion_pred=diffusion_pred,
+                        diffusion_target=diffusion_target,
                         depth_pred=depth_pred,
                         depth_target=depth_target,
                         depth_mask=depth_mask,
@@ -833,6 +784,31 @@ class FocalDiffusionTrainer:
         }
 
         return prompt_embeds, pooled_prompt_embeds
+
+    @staticmethod
+    def _repeat_prompt_embeddings(
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Repeat cached prompt embeddings so their batch matches the current data batch."""
+
+        if prompt_embeds.shape[0] == batch_size and pooled_prompt_embeds.shape[0] == batch_size:
+            return prompt_embeds, pooled_prompt_embeds
+
+        if prompt_embeds.shape[0] != 1 or pooled_prompt_embeds.shape[0] != 1:
+            raise ValueError(
+                "Cached empty prompt embeddings must have batch size 1 or match the current "
+                f"training batch size ({batch_size}); got prompt batch {prompt_embeds.shape[0]} "
+                f"and pooled prompt batch {pooled_prompt_embeds.shape[0]}."
+            )
+
+        repeat_shape = (batch_size,) + (1,) * (prompt_embeds.ndim - 1)
+        pooled_repeat_shape = (batch_size,) + (1,) * (pooled_prompt_embeds.ndim - 1)
+        return (
+            prompt_embeds.repeat(repeat_shape),
+            pooled_prompt_embeds.repeat(pooled_repeat_shape),
+        )
 
     def _predict_clean_latents(
         self,
