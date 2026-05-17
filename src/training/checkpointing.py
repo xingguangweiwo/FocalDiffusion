@@ -78,7 +78,13 @@ def load_checkpoint(trainer: "FocalDiffusionTrainer", checkpoint_path: str) -> T
     trainer.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'])
 
     if 'transformer_state_dict' in checkpoint:
-        trainer.pipeline.transformer.load_state_dict(checkpoint['transformer_state_dict'])
+        missing, unexpected = trainer.pipeline.transformer.load_state_dict(
+            checkpoint['transformer_state_dict'],
+            strict=False,
+        )
+        logger.info("Loaded transformer state_dict")
+        logger.info("Missing transformer keys: %s", missing)
+        logger.info("Unexpected transformer keys: %s", unexpected)
 
     trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     trainer.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

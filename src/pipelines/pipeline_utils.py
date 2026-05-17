@@ -2,12 +2,16 @@
 Pipeline utilities for FocalDiffusion
 """
 
+import logging
+
 import torch
 from pathlib import Path
-from typing import Dict, Optional, Union
-import json
+from typing import Union
 
-from ..utils import ensure_sentencepiece_installed
+
+logger = logging.getLogger(__name__)
+
+logger = logging.getLogger(__name__)
 
 def load_pipeline(
         checkpoint_path: Union[str, Path],
@@ -17,6 +21,7 @@ def load_pipeline(
 ) -> 'FocalDiffusionPipeline':
     """Load FocalDiffusion pipeline from checkpoint"""
     from .focal_diffusion_pipeline import FocalDiffusionPipeline
+    from ..utils.env_utils import ensure_sentencepiece_installed
 
     # Load base pipeline
     ensure_sentencepiece_installed()
@@ -35,6 +40,14 @@ def load_pipeline(
         pipeline.camera_encoder.load_state_dict(checkpoint['camera_encoder_state_dict'])
     if 'dual_decoder_state_dict' in checkpoint:
         pipeline.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'])
+    if 'transformer_state_dict' in checkpoint:
+        missing, unexpected = pipeline.transformer.load_state_dict(
+            checkpoint['transformer_state_dict'],
+            strict=False,
+        )
+        logger.info("Loaded transformer state_dict from checkpoint")
+        logger.info("Missing transformer keys: %s", missing)
+        logger.info("Unexpected transformer keys: %s", unexpected)
 
     # Load config if available
     if 'config' in checkpoint:
@@ -46,7 +59,7 @@ def load_pipeline(
 def save_pipeline(
         pipeline: 'FocalDiffusionPipeline',
         save_path: Union[str, Path],
-        save_full_model: bool = False,
+        save_full_model: bool = True,
 ) -> None:
     """Save FocalDiffusion pipeline to checkpoint"""
     save_path = Path(save_path)
