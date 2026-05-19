@@ -1,4 +1,4 @@
-# FocalDiffusion: Efficient Zero-Shot Focal-Stack Diffusion for Joint Appearance and Depth Recovery
+# FocalDiffusion: Unified Physics-Grounded Focal-Stack Diffusion for Joint Appearance and Depth Recovery
 
 **FocalDiffusion** is a focal-stack-conditioned diffusion framework for joint all-in-focus image reconstruction and depth estimation. It adapts a Stable Diffusion 3.5 MMDiT backbone with focal-stack conditioning modules to recover appearance and depth from focal stacks.
 
