@@ -29,6 +29,7 @@ import wandb
 from typing import Any, Dict, List, Optional, Tuple
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
+from ..training.losses import FocusConsistencyCritic
 
 
 logger = logging.getLogger(__name__)
@@ -394,6 +395,9 @@ class FocalDiffusionTrainer:
         # Get trainable parameters
         trainable_params = list(self._iter_pipeline_parameters(only_trainable=True))
 
+        if getattr(self, 'focus_consistency_critic', None) is not None:
+            trainable_params += [p for p in self.focus_consistency_critic.parameters() if p.requires_grad]
+
         # Create optimizer
         self.optimizer = get_optimizer(
             trainable_params,
@@ -417,12 +421,14 @@ class FocalDiffusionTrainer:
         # Prepare with accelerator
         (
             self.pipeline,
+            self.focus_consistency_critic,
             self.optimizer,
             self.train_dataloader,
             self.val_dataloader,
             self.lr_scheduler
         ) = self.accelerator.prepare(
             self.pipeline,
+            self.focus_consistency_critic,
             self.optimizer,
             self.train_dataloader,
             self.val_dataloader,
@@ -561,6 +567,9 @@ class FocalDiffusionTrainer:
             confidence_regularization_weight=self.config['losses'].get('confidence_regularization_weight', 0.01),
             focus_energy_weight=self.config['losses'].get('focus_energy_weight', 0.5),
             tau_contrast_weight=self.config['losses'].get('tau_contrast_weight', 0.2),
+            stack_contrast_weight=self.config['losses'].get('stack_contrast_weight', 0.2),
+            mismatch_contrast_weight=self.config['losses'].get('mismatch_contrast_weight', 0.2),
+            shape_candidate_contrast_weight=self.config['losses'].get('shape_candidate_contrast_weight', 0.2),
             uncertainty_weight=self.config['losses'].get('uncertainty_weight', 0.05),
             aif_highpass_weight=self.config['losses'].get('aif_highpass_weight', 0.2),
         ).to(self.accelerator.device)

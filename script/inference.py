@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument(
         '--model-path',
         type=str,
-        help='Path to model checkpoint (uses pretrained if not specified)'
+        help='Path to trained FocalDiffusion checkpoint (required for meaningful inference)'
     )
     parser.add_argument(
         '--config',
@@ -266,8 +266,8 @@ def extract_focus_distances(
 
         if len(distances) != num_images:
             # Fallback to estimation
-            logger.info("Estimating focus distances...")
-            distances = estimate_focus_distances(num_images)
+            logger.warning("using evenly spaced focus positions.")
+            distances = list(np.linspace(0.0, float(num_images-1), num_images))
 
     return torch.tensor(distances, dtype=torch.float32)
 

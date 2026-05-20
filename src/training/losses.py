@@ -86,21 +86,27 @@ class FocusConsistencyCritic(nn.Module):
 
 
 class FocalDiffusionLoss(nn.Module):
-    def __init__(self, diffusion_weight: float = 1.0, depth_weight: float = 0.1, rgb_weight: float = 0.1, focus_energy_weight: float = 0.5, tau_contrast_weight: float = 0.2, stack_contrast_weight: float = 0.2, shape_candidate_contrast_weight: float = 0.2, uncertainty_weight: float = 0.05, aif_highpass_weight: float = 0.2):
+    def __init__(self, diffusion_weight: float = 1.0, depth_weight: float = 0.0, rgb_weight: float = 0.0, focus_energy_weight: float = 0.5, tau_contrast_weight: float = 0.2, stack_contrast_weight: float = 0.2, mismatch_contrast_weight: float = 0.2, shape_candidate_contrast_weight: float = 0.2, uncertainty_weight: float = 0.05, aif_highpass_weight: float = 0.2, **kwargs):
         super().__init__()
         self.diffusion_weight=diffusion_weight; self.depth_weight=depth_weight; self.rgb_weight=rgb_weight
         self.focus_energy_weight=focus_energy_weight; self.tau_contrast_weight=tau_contrast_weight
-        self.stack_contrast_weight=stack_contrast_weight; self.shape_candidate_contrast_weight=shape_candidate_contrast_weight
+        self.stack_contrast_weight=stack_contrast_weight; self.mismatch_contrast_weight=mismatch_contrast_weight; self.shape_candidate_contrast_weight=shape_candidate_contrast_weight
         self.uncertainty_weight=uncertainty_weight; self.aif_highpass_weight=aif_highpass_weight
 
-    def forward(self, diffusion_pred, diffusion_target, depth_pred=None, depth_target=None, rgb_pred=None, rgb_target=None, shape_norm=None, uncertainty=None, focal_stack=None, critic_outputs=None):
+    def forward(self, diffusion_pred, diffusion_target, depth_pred=None, depth_target=None, rgb_pred=None, rgb_target=None, shape_norm=None, uncertainty=None, focal_stack=None, critic_outputs=None, depth_mask=None, focal_features=None, confidence_map=None, **kwargs):
         losses={'diffusion': F.mse_loss(diffusion_pred, diffusion_target)}
-        if depth_pred is not None and depth_target is not None: losses['depth']=F.l1_loss(depth_pred, depth_target)
+        if depth_pred is not None and depth_target is not None:
+            if depth_mask is not None:
+                mask = depth_mask.unsqueeze(1) if depth_mask.dim() == depth_pred.dim()-1 else depth_mask
+                losses['depth']= (torch.abs(depth_pred-depth_target)*mask).sum()/mask.sum().clamp(min=1)
+            else:
+                losses['depth']=F.l1_loss(depth_pred, depth_target)
         if rgb_pred is not None and rgb_target is not None: losses['rgb']=F.l1_loss(rgb_pred, rgb_target)
         if critic_outputs is not None:
             losses['focus_energy']=critic_outputs['focus_energy']
             losses['tau_contrast']=critic_outputs['tau_contrast']
-            losses['stack_contrast']=critic_outputs['stack_contrast'] + critic_outputs['mismatch_contrast']
+            losses['stack_contrast']=critic_outputs['stack_contrast']
+            losses['mismatch_contrast']=critic_outputs['mismatch_contrast']
             losses['shape_candidate_contrast']=critic_outputs['shape_candidate_contrast']
             if uncertainty is not None:
                 u=uncertainty.squeeze(1)

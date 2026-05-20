@@ -521,7 +521,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             focus_distances = focus_distances.unsqueeze(0)
         focus_distances = focus_distances.to(device=device, dtype=dtype)
 
-        if camera_params is not None:
+        if camera_params is not None and self.camera_encoder is not None:
             camera_params = {
                 key: value.to(device=device, dtype=dtype)
                 if isinstance(value, torch.Tensor)
