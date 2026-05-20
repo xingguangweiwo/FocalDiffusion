@@ -5,7 +5,6 @@ Image processing utilities for Focal-Depth Diffusion
 import torch
 import numpy as np
 from PIL import Image
-import cv2
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional, Union
 from pathlib import Path
@@ -334,94 +333,3 @@ def visualize_focal_stack(
         return fig
 
 
-def apply_depth_blur(
-        image: np.ndarray,
-        depth: np.ndarray,
-        focus_distance: float,
-        aperture: float,
-        focal_length: float,
-        max_blur: float = 20.0,
-) -> np.ndarray:
-    """
-    Apply depth-based blur to simulate defocus
-
-    Args:
-        image: Sharp image [H, W, 3]
-        depth: Depth map [H, W] in meters
-        focus_distance: Focus distance in meters
-        aperture: Aperture f-number
-        focal_length: Focal length in meters
-        max_blur: Maximum blur radius in pixels
-
-    Returns:
-        Blurred image
-    """
-    # Compute Circle of Confusion
-    coc = compute_coc_map(depth, focus_distance, aperture, focal_length)
-
-    # Convert to blur radius in pixels
-    # This is a simplification - proper implementation would consider sensor size
-    blur_radius = np.abs(coc) * 1000 * max_blur  # Scale factor is arbitrary
-    blur_radius = np.clip(blur_radius, 0, max_blur)
-
-    # Apply spatially-varying blur
-    # This is a simplified implementation - proper one would use integral images
-    blurred = image.copy()
-
-    # Discretize blur levels
-    n_levels = 10
-    for level in range(n_levels):
-        blur_min = level * max_blur / n_levels
-        blur_max = (level + 1) * max_blur / n_levels
-
-        # Create mask for this blur level
-        mask = (blur_radius >= blur_min) & (blur_radius < blur_max)
-
-        if mask.any():
-            # Apply Gaussian blur
-            kernel_size = int(2 * blur_max + 1)
-            if kernel_size % 2 == 0:
-                kernel_size += 1
-
-            blurred_level = cv2.GaussianBlur(
-                image,
-                (kernel_size, kernel_size),
-                blur_max / 3  # Sigma = radius / 3
-            )
-
-            # Blend
-            mask_3d = mask[:, :, np.newaxis]
-            blurred = blurred * (1 - mask_3d) + blurred_level * mask_3d
-
-    return blurred.astype(np.uint8)
-
-
-def compute_coc_map(
-        depth: np.ndarray,
-        focus_distance: float,
-        aperture: float,
-        focal_length: float,
-) -> np.ndarray:
-    """
-    Compute Circle of Confusion map
-
-    Args:
-        depth: Depth map in meters
-        focus_distance: Focus distance in meters
-        aperture: Aperture f-number
-        focal_length: Focal length in meters
-
-    Returns:
-        CoC map
-    """
-    # Compute image distances
-    image_distance = (focal_length * depth) / (depth - focal_length)
-    focus_image_distance = (focal_length * focus_distance) / (focus_distance - focal_length)
-
-    # Entrance pupil diameter
-    pupil_diameter = focal_length / aperture
-
-    # Circle of Confusion
-    coc = np.abs(image_distance - focus_image_distance) * pupil_diameter / focus_image_distance
-
-    return coc

@@ -5,6 +5,10 @@ model:
   feature_dim: 128
   num_scales: 3
   max_focal_stack_size: 12
+  focal_encoder_type: "focal_sweep"
+  patch_size: 8
+  focal_attention_heads: 8
+  focal_attention_depth: 2
 
 data:
   dataset_type: filelist
@@ -60,6 +64,9 @@ training:
     transformer: attention_only
   lora_rank: 8
   lora_alpha: 16
+  use_focus_consistency: true
+  use_tau_contrast: true
+  use_aif_highpass: true
 
 optimizer:
   type: adamw
@@ -79,6 +86,10 @@ losses:
   depth_gradient_weight: 0.1
   edge_consistency_weight: 0.05
   confidence_regularization_weight: 0.01
+  focus_energy_weight: 0.5
+  tau_contrast_weight: 0.2
+  uncertainty_weight: 0.05
+  aif_highpass_weight: 0.2
 
 validation:
   num_inference_steps: 30

@@ -552,6 +552,10 @@ class FocalDiffusionTrainer:
             depth_gradient_weight=self.config['losses'].get('depth_gradient_weight', 0.1),
             edge_consistency_weight=self.config['losses'].get('edge_consistency_weight', 0.05),
             confidence_regularization_weight=self.config['losses'].get('confidence_regularization_weight', 0.01),
+            focus_energy_weight=self.config['losses'].get('focus_energy_weight', 0.5),
+            tau_contrast_weight=self.config['losses'].get('tau_contrast_weight', 0.2),
+            uncertainty_weight=self.config['losses'].get('uncertainty_weight', 0.05),
+            aif_highpass_weight=self.config['losses'].get('aif_highpass_weight', 0.2),
         ).to(self.accelerator.device)
 
         progress_bar = tqdm(
@@ -664,9 +668,13 @@ class FocalDiffusionTrainer:
                     )
 
                     # Decode auxiliary predictions for multi-task losses
-                    depth_logits, rgb_latent_pred, confidence_map = self.dual_decoder(clean_latent_pred)
+                    decoder_outputs = self.dual_decoder(clean_latent_pred)
+                    shape_norm = decoder_outputs["shape_norm"]
+                    uncertainty = decoder_outputs["uncertainty"]
+                    rgb_latent_pred = decoder_outputs["aif_latents"]
+                    confidence_map = decoder_outputs.get("confidence_map", 1.0 - uncertainty)
 
-                    depth_probs = torch.sigmoid(depth_logits)
+                    depth_probs = shape_norm
                     depth_probs = F.interpolate(
                         depth_probs,
                         size=depth_gt.shape[-2:],
@@ -712,6 +720,12 @@ class FocalDiffusionTrainer:
                         rgb_target=rgb_target_fp32,
                         focal_features=focal_features,
                         confidence_map=confidence_map.float(),
+                        shape_norm=shape_norm.float(),
+                        uncertainty=uncertainty.float(),
+                        focal_stack=focal_stack.float(),
+                        focus_distances=focus_distances.float(),
+                        use_tau_contrast=self.config["training"].get("use_tau_contrast", True),
+                        use_aif_highpass=self.config["training"].get("use_aif_highpass", True),
                     )
                     loss = loss_dict['total']
 

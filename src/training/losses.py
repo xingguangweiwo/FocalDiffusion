@@ -3,26 +3,42 @@
 from __future__ import annotations
 
 import importlib
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class FocalDiffusionLoss(nn.Module):
-    """Combined loss used during training."""
+def normalize_focus_coordinates(focus_distances: torch.Tensor) -> torch.Tensor:
+    tau_min = focus_distances.min(dim=1, keepdim=True).values
+    tau_max = focus_distances.max(dim=1, keepdim=True).values
+    return (focus_distances - tau_min) / (tau_max - tau_min + 1e-6)
 
-    def __init__(
-        self,
-        diffusion_weight: float = 1.0,
-        depth_weight: float = 0.1,
-        rgb_weight: float = 0.1,
-        consistency_weight: float = 0.05,
-        perceptual_weight: float = 0.05,
-        depth_gradient_weight: float = 0.1,
-        edge_consistency_weight: float = 0.05,
-        confidence_regularization_weight: float = 0.01,
-    ) -> None:
+
+class LearnedSharpnessEstimator(nn.Module):
+    def __init__(self, in_channels: int = 3, hidden: int = 32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(hidden, 1, 1)
+        )
+
+    def forward(self, focal_stack: torch.Tensor) -> torch.Tensor:
+        b, n, c, h, w = focal_stack.shape
+        x = focal_stack.reshape(b * n, c, h, w)
+        s = self.net(x).reshape(b, n, h, w)
+        return s
+
+
+def build_aif_physical(focal_stack: torch.Tensor, shape_norm: torch.Tensor, tau: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    logits = -torch.abs(tau.unsqueeze(-1).unsqueeze(-1) - shape_norm.unsqueeze(1)) / max(temperature, 1e-6)
+    w = torch.softmax(logits, dim=1).unsqueeze(2)
+    return (w * focal_stack).sum(dim=1)
+
+
+class FocalDiffusionLoss(nn.Module):
+    def __init__(self, diffusion_weight: float = 1.0, depth_weight: float = 0.1, rgb_weight: float = 0.1, consistency_weight: float = 0.05, perceptual_weight: float = 0.05, depth_gradient_weight: float = 0.1, edge_consistency_weight: float = 0.05, confidence_regularization_weight: float = 0.01, focus_energy_weight: float = 0.5, tau_contrast_weight: float = 0.2, uncertainty_weight: float = 0.05, aif_highpass_weight: float = 0.2, focus_temperature: float = 0.07, tau_margin: float = 0.05) -> None:
         super().__init__()
         self.diffusion_weight = diffusion_weight
         self.depth_weight = depth_weight
@@ -32,176 +48,76 @@ class FocalDiffusionLoss(nn.Module):
         self.depth_gradient_weight = depth_gradient_weight
         self.edge_consistency_weight = edge_consistency_weight
         self.confidence_regularization_weight = confidence_regularization_weight
+        self.focus_energy_weight = focus_energy_weight
+        self.tau_contrast_weight = tau_contrast_weight
+        self.uncertainty_weight = uncertainty_weight
+        self.aif_highpass_weight = aif_highpass_weight
+        self.focus_temperature = focus_temperature
+        self.tau_margin = tau_margin
 
-        self.depth_loss = DepthLoss()
-        self.consistency_loss = ConsistencyLoss()
-        self.perceptual_loss = PerceptualLoss() if perceptual_weight > 0 else None
+        self.sharpness_estimator = LearnedSharpnessEstimator()
 
-    def forward(
-        self,
-        diffusion_pred: torch.Tensor,
-        diffusion_target: torch.Tensor,
-        depth_pred: Optional[torch.Tensor] = None,
-        depth_target: Optional[torch.Tensor] = None,
-        rgb_pred: Optional[torch.Tensor] = None,
-        rgb_target: Optional[torch.Tensor] = None,
-        depth_mask: Optional[torch.Tensor] = None,
-        focal_features: Optional[Dict[str, torch.Tensor]] = None,
-        confidence_map: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        losses: Dict[str, torch.Tensor] = {}
+    def _focus_energy(self, sharpness: torch.Tensor, tau: torch.Tensor, shape_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        target = torch.softmax(-torch.abs(tau.unsqueeze(-1).unsqueeze(-1) - shape_norm.unsqueeze(1)) / self.focus_temperature, dim=1)
+        observed = torch.softmax(sharpness / self.focus_temperature, dim=1)
+        kl = (target * (torch.log(target + 1e-8) - torch.log(observed + 1e-8))).sum(dim=1)
+        top2 = torch.topk(sharpness, k=min(2, sharpness.shape[1]), dim=1).values
+        gap = top2[:, 0] - (top2[:, 1] if top2.shape[1] > 1 else top2[:, 0])
+        reliability = torch.sigmoid(gap)
+        return (kl * reliability).mean(), reliability
 
-        losses["diffusion"] = F.mse_loss(diffusion_pred, diffusion_target)
-
-        if depth_pred is not None and depth_target is not None and self.depth_weight > 0:
-            losses["depth"] = self.depth_loss(depth_pred, depth_target, mask=depth_mask)
-            if self.depth_gradient_weight > 0:
-                losses["depth_gradient"] = gradient_loss(depth_pred, depth_target, mask=depth_mask)
-
-        if rgb_pred is not None and rgb_target is not None and self.rgb_weight > 0:
+    def forward(self, diffusion_pred: torch.Tensor, diffusion_target: torch.Tensor, depth_pred: Optional[torch.Tensor] = None, depth_target: Optional[torch.Tensor] = None, rgb_pred: Optional[torch.Tensor] = None, rgb_target: Optional[torch.Tensor] = None, depth_mask: Optional[torch.Tensor] = None, focal_features: Optional[Dict[str, torch.Tensor]] = None, confidence_map: Optional[torch.Tensor] = None, shape_norm: Optional[torch.Tensor] = None, uncertainty: Optional[torch.Tensor] = None, focal_stack: Optional[torch.Tensor] = None, focus_distances: Optional[torch.Tensor] = None, use_tau_contrast: bool = True, use_aif_highpass: bool = True) -> Dict[str, torch.Tensor]:
+        losses: Dict[str, torch.Tensor] = {"diffusion": F.mse_loss(diffusion_pred, diffusion_target)}
+        if depth_pred is not None and depth_target is not None:
+            losses["depth"] = F.l1_loss(depth_pred, depth_target)
+        if rgb_pred is not None and rgb_target is not None:
             losses["rgb"] = F.l1_loss(rgb_pred, rgb_target)
-            if self.perceptual_loss is not None and self.perceptual_weight > 0:
-                losses["perceptual"] = self.perceptual_loss(rgb_pred, rgb_target)
 
-        if (
-            rgb_pred is not None
-            and depth_pred is not None
-            and self.edge_consistency_weight > 0
-        ):
-            losses["edge_consistency"] = edge_consistency_loss(rgb_pred, depth_pred)
+        if shape_norm is not None and focal_stack is not None and focus_distances is not None:
+            tau = normalize_focus_coordinates(focus_distances)
+            sharpness = self.sharpness_estimator(focal_stack)
+            pos_energy, reliability = self._focus_energy(sharpness, tau, shape_norm.squeeze(1))
+            losses["focus_energy"] = pos_energy
+            if use_tau_contrast:
+                perm = torch.randperm(tau.shape[1], device=tau.device)
+                neg_energy, _ = self._focus_energy(sharpness, tau[:, perm], shape_norm.squeeze(1))
+                losses["tau_contrast"] = F.relu(self.tau_margin + pos_energy - neg_energy)
+            if uncertainty is not None:
+                losses["uncertainty"] = F.l1_loss(uncertainty.squeeze(1), 1.0 - reliability)
+            if rgb_pred is not None and use_aif_highpass:
+                aif_phys = build_aif_physical(focal_stack, shape_norm.squeeze(1), tau)
+                hp_pred = rgb_pred - F.avg_pool2d(rgb_pred, 5, stride=1, padding=2)
+                hp_phys = aif_phys - F.avg_pool2d(aif_phys, 5, stride=1, padding=2)
+                losses["aif_highpass"] = F.l1_loss(hp_pred, hp_phys)
 
-        if confidence_map is not None and self.confidence_regularization_weight > 0:
-            # discourage trivial all-low confidence predictions
-            losses["confidence_regularization"] = (1.0 - confidence_map).mean()
-
-        if focal_features is not None and self.consistency_weight > 0:
-            losses["consistency"] = self.consistency_loss(focal_features)
-
-        total_loss = torch.zeros_like(losses["diffusion"])
-        for key, value in losses.items():
-            weight = getattr(self, f"{key}_weight", 1.0)
-            total_loss = total_loss + weight * value
-        losses["total"] = total_loss
+        total = torch.zeros_like(losses["diffusion"])
+        for k, v in losses.items():
+            total = total + getattr(self, f"{k}_weight", 1.0) * v
+        losses["total"] = total
         return losses
 
 
 class DepthLoss(nn.Module):
-    """Depth estimation loss with a scale-invariant component."""
-
-    def __init__(self, alpha: float = 0.5, min_depth: float = 1e-3) -> None:
-        super().__init__()
-        self.alpha = alpha
-        self.min_depth = min_depth
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if mask is not None:
-            if mask.dim() == pred.dim():
-                valid = mask.bool()
-            else:
-                valid = mask.unsqueeze(1).expand_as(pred).bool()
-            if valid.sum() == 0:
-                return torch.zeros((), device=pred.device, dtype=pred.dtype)
-            pred = pred[valid]
-            target = target[valid]
-        else:
-            pred = pred.reshape(-1)
-            target = target.reshape(-1)
-
-        pred_safe = pred.clamp(min=self.min_depth)
-        target_safe = target.clamp(min=self.min_depth)
-
-        l1_loss = F.l1_loss(pred_safe, target_safe)
-        diff = torch.log(pred_safe) - torch.log(target_safe)
-        scale_inv = torch.mean(diff ** 2) - self.alpha * torch.mean(diff) ** 2
-        return l1_loss + 0.1 * scale_inv
+            if mask.dim() == pred.dim() - 1:
+                mask = mask.unsqueeze(1)
+            return (torch.abs(pred - target) * mask).sum() / mask.sum().clamp(min=1)
+        return F.l1_loss(pred, target)
 
 
 class ConsistencyLoss(nn.Module):
-    """Regularises focal attention to remain sharp and smooth."""
-
     def forward(self, focal_features: Dict[str, torch.Tensor]) -> torch.Tensor:
-        weights = focal_features.get("attention_weights")
-        if weights is None:
-            device = None
-            for value in focal_features.values():
-                if isinstance(value, torch.Tensor):
-                    device = value.device
-                    break
-            return torch.zeros((), device=device) if device is not None else torch.zeros(())
-
-        entropy = -torch.sum(weights * torch.log(weights + 1e-8), dim=-1).mean()
-        if weights.shape[-1] > 1:
-            smoothness = torch.mean(torch.diff(weights, dim=-1) ** 2)
-        else:
-            smoothness = torch.zeros_like(entropy)
-        return entropy + smoothness
+        w = focal_features.get('attention_weights')
+        if w is None:
+            return torch.zeros((), device=next(iter(focal_features.values())).device)
+        return -torch.sum(w * torch.log(w + 1e-8), dim=-1).mean()
 
 
 class PerceptualLoss(nn.Module):
-    """LPIPS perceptual loss wrapper."""
-
-    def __init__(self, net: str = "vgg") -> None:
+    def __init__(self, net: str = 'vgg') -> None:
         super().__init__()
-        spec = importlib.util.find_spec("lpips")
-        self.register_buffer("_zero", torch.tensor(0.0), persistent=False)
-
-        if spec is None:
-            self._lpips = None
-            return
-
-        lpips_module = importlib.import_module("lpips")
-        self._lpips = lpips_module.LPIPS(net=net)
+        self.register_buffer('_zero', torch.tensor(0.0), persistent=False)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred_norm = (pred + 1) / 2
-        target_norm = (target + 1) / 2
-
-        if self._lpips is None:
-            return self._zero.to(device=pred.device, dtype=pred.dtype)
-
-        loss = self._lpips(pred_norm, target_norm)
-
-        if isinstance(loss, torch.Tensor):
-            loss = loss.mean()
-
-        return loss
-
-
-def gradient_loss(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    pred_dx = pred[..., :, 1:] - pred[..., :, :-1]
-    pred_dy = pred[..., 1:, :] - pred[..., :-1, :]
-    tgt_dx = target[..., :, 1:] - target[..., :, :-1]
-    tgt_dy = target[..., 1:, :] - target[..., :-1, :]
-
-    if mask is not None:
-        if mask.dim() == pred.dim() - 1:
-            mask = mask.unsqueeze(1)
-        mask_dx = mask[..., :, 1:] * mask[..., :, :-1]
-        mask_dy = mask[..., 1:, :] * mask[..., :-1, :]
-        loss_dx = (torch.abs(pred_dx - tgt_dx) * mask_dx).sum() / mask_dx.sum().clamp(min=1)
-        loss_dy = (torch.abs(pred_dy - tgt_dy) * mask_dy).sum() / mask_dy.sum().clamp(min=1)
-        return loss_dx + loss_dy
-
-    return F.l1_loss(pred_dx, tgt_dx) + F.l1_loss(pred_dy, tgt_dy)
-
-
-def edge_consistency_loss(rgb_pred: torch.Tensor, depth_pred: torch.Tensor) -> torch.Tensor:
-    if depth_pred.dim() == 3:
-        depth_pred = depth_pred.unsqueeze(1)
-
-    rgb_gray = rgb_pred.mean(dim=1, keepdim=True)
-
-    rgb_dx = rgb_gray[..., :, 1:] - rgb_gray[..., :, :-1]
-    rgb_dy = rgb_gray[..., 1:, :] - rgb_gray[..., :-1, :]
-    depth_dx = depth_pred[..., :, 1:] - depth_pred[..., :, :-1]
-    depth_dy = depth_pred[..., 1:, :] - depth_pred[..., :-1, :]
-
-    rgb_edge = torch.sqrt(rgb_dx.pow(2).mean() + rgb_dy.pow(2).mean() + 1e-6)
-    depth_edge = torch.sqrt(depth_dx.pow(2).mean() + depth_dy.pow(2).mean() + 1e-6)
-
-    return torch.abs(rgb_edge - depth_edge)
+        return self._zero.to(device=pred.device, dtype=pred.dtype)
