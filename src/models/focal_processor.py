@@ -313,7 +313,7 @@ class FocalSweepEncoder(nn.Module):
         attn = attn.squeeze(1).view(B, h, w, N).permute(0, 3, 1, 2).contiguous()
         frame_weights = attn.mean(dim=(-2, -1))
 
-        return {"fused_features": fused, "tau": tau, "focal_tokens": tokens, "attention_weights": frame_weights, "temporal_attention_maps": attn}
+        return {"fused_features": fused, "tau": tau, "attention_weights": frame_weights, "temporal_attention_maps": attn}
 class FocalStackProcessor(nn.Module):
     """Main Focal Stack Processor with all components integrated"""
 
@@ -321,8 +321,12 @@ class FocalStackProcessor(nn.Module):
         self,
         feature_dim: int = 512,
         num_scales: int = 4,
-        max_sequence_length: int = 200,
+        max_sequence_length: int = 20,
         dropout: float = 0.1,
+        focal_encoder_type: str = "focal_sweep",
+        patch_size: int = 8,
+        focal_attention_heads: int = 8,
+        focal_attention_depth: int = 2,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -344,8 +348,8 @@ class FocalStackProcessor(nn.Module):
 
         # Dropout for regularization
         self.dropout = nn.Dropout(dropout)
-        self.focal_encoder_type = "focal_sweep"
-        self.focal_sweep_encoder = FocalSweepEncoder(feature_dim=feature_dim)
+        self.focal_encoder_type = focal_encoder_type
+        self.focal_sweep_encoder = FocalSweepEncoder(feature_dim=feature_dim, patch_size=patch_size, num_heads=focal_attention_heads, depth=focal_attention_depth)
 
     def forward(
         self,
@@ -373,9 +377,9 @@ class FocalStackProcessor(nn.Module):
         if N > self.max_sequence_length:
             raise ValueError(f"Sequence length {N} exceeds maximum {self.max_sequence_length}")
 
-        sweep_results = self.focal_sweep_encoder(focal_stack, focus_distances)
+        if self.focal_encoder_type == "focal_sweep":
+            return self.focal_sweep_encoder(focal_stack, focus_distances)
 
-        # Backward compatible outputs
         all_frames = focal_stack.view(B * N, C, H, W)
         multiscale_features = self.multiscale_encoder(all_frames)
         enhanced_features = {}
@@ -384,7 +388,5 @@ class FocalStackProcessor(nn.Module):
             enhanced_features[scale_name] = features.view(B, N, D, H_feat, W_feat)
         focus_features = self.focus_feature_net(focus_distances)
         fused_results = self.adaptive_fusion(enhanced_features, focus_distances)
-
-        fused_results.update(sweep_results)
         fused_results['focus_features'] = focus_features
         return fused_results

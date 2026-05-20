@@ -4,11 +4,12 @@ model:
   base_model_id: "stabilityai/stable-diffusion-3.5-large"
   feature_dim: 128
   num_scales: 3
-  max_focal_stack_size: 12
+  max_focal_stack_size: 20
   focal_encoder_type: "focal_sweep"
   patch_size: 8
   focal_attention_heads: 8
   focal_attention_depth: 2
+  use_camera_encoder: false
 
 data:
   dataset_type: filelist
@@ -67,6 +68,8 @@ training:
   use_focus_consistency: true
   use_tau_contrast: true
   use_aif_highpass: true
+  use_focus_consistency_critic: true
+  train_focus_critic: true
 
 optimizer:
   type: adamw
@@ -88,6 +91,8 @@ losses:
   confidence_regularization_weight: 0.01
   focus_energy_weight: 0.5
   tau_contrast_weight: 0.2
+  stack_contrast_weight: 0.2
+  shape_candidate_contrast_weight: 0.2
   uncertainty_weight: 0.05
   aif_highpass_weight: 0.2
 

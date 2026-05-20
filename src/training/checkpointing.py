@@ -25,8 +25,8 @@ def save_checkpoint(
         'epoch': epoch,
         'global_step': global_step,
         'focal_processor_state_dict': trainer.accelerator.unwrap_model(trainer.focal_processor).state_dict(),
-        'camera_encoder_state_dict': trainer.accelerator.unwrap_model(trainer.camera_encoder).state_dict(),
         'dual_decoder_state_dict': trainer.accelerator.unwrap_model(trainer.dual_decoder).state_dict(),
+        'focus_consistency_critic_state_dict': trainer.accelerator.unwrap_model(trainer.focus_consistency_critic).state_dict(),
         'optimizer_state_dict': trainer.optimizer.state_dict(),
         'scheduler_state_dict': trainer.lr_scheduler.state_dict(),
         'config': trainer.config,
@@ -74,8 +74,11 @@ def load_checkpoint(trainer: "FocalDiffusionTrainer", checkpoint_path: str) -> T
     checkpoint = torch.load(checkpoint_path, map_location=trainer.accelerator.device)
 
     trainer.focal_processor.load_state_dict(checkpoint['focal_processor_state_dict'])
-    trainer.camera_encoder.load_state_dict(checkpoint['camera_encoder_state_dict'])
-    trainer.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'])
+    if trainer.camera_encoder is not None and 'camera_encoder_state_dict' in checkpoint:
+        trainer.camera_encoder.load_state_dict(checkpoint['camera_encoder_state_dict'], strict=False)
+    trainer.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
+    if 'focus_consistency_critic_state_dict' in checkpoint:
+        trainer.focus_consistency_critic.load_state_dict(checkpoint['focus_consistency_critic_state_dict'], strict=False)
 
     if 'transformer_state_dict' in checkpoint:
         missing, unexpected = trainer.pipeline.transformer.load_state_dict(
