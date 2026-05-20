@@ -173,9 +173,18 @@ class DualOutputDecoder(nn.Module):
             dim=1,
         )
         depth_delta = self.depth_refine(refine_input)
-        depth_logits = depth_logits_coarse + (1.0 - confidence) * depth_delta
+        shape_norm = torch.sigmoid(depth_logits_coarse + (1.0 - confidence) * depth_delta)
+        uncertainty = torch.sigmoid(1.5 * (1.0 - confidence))
 
-        return depth_logits, rgb_latents, confidence
+        return {
+            "shape_norm": shape_norm,
+            "uncertainty": uncertainty,
+            "aif_latents": rgb_latents,
+            # backward-compatible aliases
+            "depth_logits": shape_norm,
+            "rgb_latent_pred": rgb_latents,
+            "confidence_map": 1.0 - uncertainty,
+        }
 
     @staticmethod
     def _compute_edges(image_like: torch.Tensor) -> torch.Tensor:

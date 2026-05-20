@@ -39,7 +39,6 @@ from transformers import (
 )
 
 from ..models.focal_attention import FocalCrossAttention
-from ..models.camera_invariant import CameraInvariantEncoder
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
 
@@ -85,6 +84,7 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.pre_scale = nn.Parameter(torch.tensor(0.5))
         self.post_scale = nn.Parameter(torch.tensor(1.0))
 
+        self.condition_adapter = nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
         self._condition_adapters = nn.ModuleDict()
         self._camera_condition_adapters = nn.ModuleDict()
         self.dtype = getattr(base, "dtype", torch.float32)
@@ -223,8 +223,11 @@ class FocalInjectedSD3Transformer(nn.Module):
         if fused.shape[-2:] != spatial_size:
             fused = F.interpolate(fused, size=spatial_size, mode="bilinear", align_corners=False)
 
-        adapter = self._get_condition_adapter(fused.shape[1]).to(device=fused.device, dtype=fused.dtype)
-        conditioned = adapter(fused)
+        if fused.shape[1] == self.condition_channels:
+            conditioned = self.condition_adapter.to(device=fused.device, dtype=fused.dtype)(fused)
+        else:
+            adapter = self._get_condition_adapter(fused.shape[1]).to(device=fused.device, dtype=fused.dtype)
+            conditioned = adapter(fused)
 
         camera_features = focal_features.get("camera_features")
         if camera_features is not None:
@@ -341,7 +344,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         )
 
         self.focal_processor = focal_processor or FocalStackProcessor()
-        self.camera_encoder = camera_encoder or CameraInvariantEncoder()
+        self.camera_encoder = camera_encoder
         self.dual_decoder = dual_decoder or DualOutputDecoder(
             in_channels=self.vae.config.latent_channels,
             out_channels_depth=1,
@@ -540,8 +543,6 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         )
         if camera_features is not None:
             focal_features["camera_features"] = camera_features
-        if num_images_per_prompt > 1:
-            focal_features = self._repeat_focal_features(focal_features, num_images_per_prompt)
 
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = self.encode_prompt(
             prompt=prompt,
@@ -575,12 +576,6 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
-        focal_features_input = (
-            duplicate_focal_features_for_cfg(focal_features)
-            if guidance_scale > 1.0
-            else focal_features
-        )
-
         for timestep in timesteps:
             latent_model_input = (
                 torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
@@ -610,8 +605,10 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
-        depth_logits, rgb_latents, confidence_map = self.dual_decoder(latents)
-        depth_probs = torch.sigmoid(depth_logits)
+        decoder_outputs = self.dual_decoder(latents)
+        depth_probs = decoder_outputs["shape_norm"]
+        rgb_latents = decoder_outputs["aif_latents"]
+        confidence_map = decoder_outputs.get("confidence_map", 1.0 - decoder_outputs["uncertainty"])
         depth_probs = F.interpolate(
             depth_probs, size=(height, width), mode="bilinear", align_corners=False
         )
@@ -660,8 +657,10 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
     def _ensure_tensor_stack(self, stack: Union[torch.Tensor, List[Image.Image]]) -> torch.Tensor:
         if isinstance(stack, torch.Tensor):
-            if stack.dim() == 4:  # [N, C, H, W]
+            if stack.dim() == 4:
                 stack = stack.unsqueeze(0)
+            if stack.min() >= 0 and stack.max() <= 1:
+                stack = stack * 2.0 - 1.0
             return stack
 
         tensors = []

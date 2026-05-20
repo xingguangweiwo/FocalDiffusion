@@ -183,7 +183,7 @@ class FocalDiffusionTrainer:
 
         # Import here to avoid circular imports
         from ..pipelines import FocalDiffusionPipeline
-        from ..models import FocalStackProcessor, CameraInvariantEncoder
+        from ..models import FocalStackProcessor
         from ..models.dual_decoder import DualOutputDecoder
 
         # Load base SD3.5 pipeline
@@ -266,17 +266,21 @@ class FocalDiffusionTrainer:
             feature_dim=self.config['model']['feature_dim'],
             num_scales=self.config['model']['num_scales'],
             max_sequence_length=self.config['model']['max_focal_stack_size'],
+            focal_encoder_type=self.config['model'].get('focal_encoder_type','focal_sweep'),
+            patch_size=self.config['model'].get('patch_size',8),
+            focal_attention_heads=self.config['model'].get('focal_attention_heads',8),
+            focal_attention_depth=self.config['model'].get('focal_attention_depth',2),
         )
 
-        self.camera_encoder = CameraInvariantEncoder(
-            output_dim=self.config['model']['feature_dim'],
-        )
+        self.camera_encoder = None
 
         self.dual_decoder = DualOutputDecoder(
             in_channels=pipe.vae.config.latent_channels,
             out_channels_depth=1,
             out_channels_rgb=pipe.vae.config.latent_channels,
         )
+
+        self.focus_consistency_critic = FocusConsistencyCritic()
 
         # Create FocalDiffusion pipeline
         self.pipeline = FocalDiffusionPipeline(
@@ -304,6 +308,7 @@ class FocalDiffusionTrainer:
         self.focal_processor = self.pipeline.focal_processor
         self.camera_encoder = self.pipeline.camera_encoder
         self.dual_decoder = self.pipeline.dual_decoder
+        self.focus_consistency_critic = self.focus_consistency_critic.to(target_device)
 
         # Configure trainable parameters
         self._configure_trainable_params()
@@ -350,8 +355,10 @@ class FocalDiffusionTrainer:
 
         # Always train focal components
         self.focal_processor.requires_grad_(True)
-        self.camera_encoder.requires_grad_(True)
+        if self.camera_encoder is not None and self.config['model'].get('use_camera_encoder', False):
+            self.camera_encoder.requires_grad_(True)
         self.dual_decoder.requires_grad_(True)
+        self.focus_consistency_critic.requires_grad_(self.config['training'].get('train_focus_critic', True))
 
         # Log trainable parameters
         pipeline_params = list(self._iter_pipeline_parameters())
@@ -552,6 +559,10 @@ class FocalDiffusionTrainer:
             depth_gradient_weight=self.config['losses'].get('depth_gradient_weight', 0.1),
             edge_consistency_weight=self.config['losses'].get('edge_consistency_weight', 0.05),
             confidence_regularization_weight=self.config['losses'].get('confidence_regularization_weight', 0.01),
+            focus_energy_weight=self.config['losses'].get('focus_energy_weight', 0.5),
+            tau_contrast_weight=self.config['losses'].get('tau_contrast_weight', 0.2),
+            uncertainty_weight=self.config['losses'].get('uncertainty_weight', 0.05),
+            aif_highpass_weight=self.config['losses'].get('aif_highpass_weight', 0.2),
         ).to(self.accelerator.device)
 
         progress_bar = tqdm(
@@ -577,7 +588,7 @@ class FocalDiffusionTrainer:
                 if depth_mask is not None:
                     depth_mask = depth_mask.to(device=device)
 
-                camera_params = batch.get('camera_params')
+                camera_params = batch.get('camera_params') if self.config['model'].get('use_camera_encoder', False) else None
 
                 if camera_params is not None:
                     batch_size = focal_stack.shape[0]
@@ -594,8 +605,9 @@ class FocalDiffusionTrainer:
                             )
                     camera_params = converted_params
 
-                # Normalize inputs to match pipeline preprocessing
-                focal_stack = (focal_stack * 2.0) - 1.0
+                # Normalize inputs
+                if focal_stack.min() >= 0 and focal_stack.max() <= 1:
+                    focal_stack = (focal_stack * 2.0) - 1.0
                 rgb_target = (rgb_gt * 2.0) - 1.0
 
                 # Extract focal features and explicitly attach camera metadata embeddings.
@@ -605,7 +617,7 @@ class FocalDiffusionTrainer:
                     camera_params
                 )
 
-                if camera_params is not None:
+                if camera_params is not None and self.camera_encoder is not None:
                     focal_features['camera_features'] = self.camera_encoder(
                         camera_params,
                         mode="relative",
@@ -638,7 +650,7 @@ class FocalDiffusionTrainer:
                     model_input = noisy_latents
 
                 model_input = model_input.to(self.pipeline.transformer.dtype)
-                noise = noise.to(self.pipeline.transformer.dtype)
+                flow_target = flow_target.to(self.pipeline.transformer.dtype)
                 batch_prompt_embeds, batch_pooled_prompt_embeds = self._repeat_prompt_embeddings(
                     prompt_embeds,
                     pooled_prompt_embeds,
@@ -664,9 +676,13 @@ class FocalDiffusionTrainer:
                     )
 
                     # Decode auxiliary predictions for multi-task losses
-                    depth_logits, rgb_latent_pred, confidence_map = self.dual_decoder(clean_latent_pred)
+                    decoder_outputs = self.dual_decoder(clean_latent_pred)
+                    shape_norm = decoder_outputs["shape_norm"]
+                    uncertainty = decoder_outputs["uncertainty"]
+                    rgb_latent_pred = decoder_outputs["aif_latents"]
+                    confidence_map = decoder_outputs.get("confidence_map", 1.0 - uncertainty)
 
-                    depth_probs = torch.sigmoid(depth_logits)
+                    depth_probs = shape_norm
                     depth_probs = F.interpolate(
                         depth_probs,
                         size=depth_gt.shape[-2:],
@@ -702,6 +718,7 @@ class FocalDiffusionTrainer:
                     rgb_target_fp32 = rgb_target.float()
 
                     # Compute losses
+                    critic_outputs = self.focus_consistency_critic(focal_stack.float(), focus_distances.float(), shape_norm.float())
                     loss_dict = loss_fn(
                         diffusion_pred=diffusion_pred,
                         diffusion_target=diffusion_target,
@@ -712,6 +729,10 @@ class FocalDiffusionTrainer:
                         rgb_target=rgb_target_fp32,
                         focal_features=focal_features,
                         confidence_map=confidence_map.float(),
+                        shape_norm=shape_norm.float(),
+                        uncertainty=uncertainty.float(),
+                        focal_stack=focal_stack.float(),
+                        critic_outputs=critic_outputs,
                     )
                     loss = loss_dict['total']
 
