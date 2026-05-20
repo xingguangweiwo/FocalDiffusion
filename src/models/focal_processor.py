@@ -262,6 +262,58 @@ class FocalAwareTemporalAttention(nn.Module):
         return output, frame_weights, spatial_weights
 
 
+
+
+class FocalSweepEncoder(nn.Module):
+    """Learned focal-axis encoder using patch tokens and attention across focal sweep."""
+
+    def __init__(self, feature_dim: int = 512, patch_size: int = 8, num_heads: int = 8, depth: int = 2):
+        super().__init__()
+        self.patch_size = patch_size
+        self.feature_dim = feature_dim
+        self.patch_embed = nn.Conv2d(3, feature_dim, kernel_size=patch_size, stride=patch_size)
+        self.tau_embed = nn.Sequential(nn.Linear(16, feature_dim), nn.SiLU(), nn.Linear(feature_dim, feature_dim))
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model=feature_dim, nhead=num_heads, dim_feedforward=feature_dim * 4, batch_first=True)
+            for _ in range(depth)
+        ])
+        self.surface_query = nn.Parameter(torch.randn(1, 1, feature_dim) * 0.02)
+        self.query_attn = nn.MultiheadAttention(feature_dim, num_heads, batch_first=True)
+
+    @staticmethod
+    def normalize_focus_distances(focus_distances: torch.Tensor) -> torch.Tensor:
+        tau_min = focus_distances.min(dim=1, keepdim=True).values
+        tau_max = focus_distances.max(dim=1, keepdim=True).values
+        return (focus_distances - tau_min) / (tau_max - tau_min + 1e-6)
+
+    @staticmethod
+    def fourier_embed(tau: torch.Tensor, bands: int = 8) -> torch.Tensor:
+        freq = (2.0 ** torch.arange(bands, device=tau.device, dtype=tau.dtype)).view(1, 1, -1)
+        x = tau.unsqueeze(-1) * freq * math.pi
+        return torch.cat([torch.sin(x), torch.cos(x)], dim=-1)
+
+    def forward(self, focal_stack: torch.Tensor, focus_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
+        B, N, _, H, W = focal_stack.shape
+        x = focal_stack.reshape(B * N, 3, H, W)
+        tokens_2d = self.patch_embed(x)
+        h, w = tokens_2d.shape[-2:]
+        tokens = tokens_2d.flatten(2).transpose(1, 2).view(B, N, h * w, self.feature_dim)
+
+        tau = self.normalize_focus_distances(focus_distances)
+        tau_tokens = self.tau_embed(self.fourier_embed(tau)).unsqueeze(2)
+        tokens = tokens + tau_tokens
+
+        tokens = tokens.permute(0, 2, 1, 3).contiguous().view(B * h * w, N, self.feature_dim)
+        for layer in self.layers:
+            tokens = layer(tokens)
+
+        query = self.surface_query.expand(tokens.shape[0], -1, -1)
+        fused, attn = self.query_attn(query, tokens, tokens, need_weights=True)
+        fused = fused.squeeze(1).view(B, h, w, self.feature_dim).permute(0, 3, 1, 2).contiguous()
+        attn = attn.squeeze(1).view(B, h, w, N).permute(0, 3, 1, 2).contiguous()
+        frame_weights = attn.mean(dim=(-2, -1))
+
+        return {"fused_features": fused, "tau": tau, "focal_tokens": tokens, "attention_weights": frame_weights, "temporal_attention_maps": attn}
 class FocalStackProcessor(nn.Module):
     """Main Focal Stack Processor with all components integrated"""
 
@@ -292,6 +344,8 @@ class FocalStackProcessor(nn.Module):
 
         # Dropout for regularization
         self.dropout = nn.Dropout(dropout)
+        self.focal_encoder_type = "focal_sweep"
+        self.focal_sweep_encoder = FocalSweepEncoder(feature_dim=feature_dim)
 
     def forward(
         self,
@@ -319,27 +373,18 @@ class FocalStackProcessor(nn.Module):
         if N > self.max_sequence_length:
             raise ValueError(f"Sequence length {N} exceeds maximum {self.max_sequence_length}")
 
-        # Flatten batch and sequence for encoding
+        sweep_results = self.focal_sweep_encoder(focal_stack, focus_distances)
+
+        # Backward compatible outputs
         all_frames = focal_stack.view(B * N, C, H, W)
-
-        # Extract multi-scale features
         multiscale_features = self.multiscale_encoder(all_frames)
-
-        # Reorganize features
         enhanced_features = {}
         for scale_name, features in multiscale_features.items():
             _, D, H_feat, W_feat = features.shape
-            # Reshape to [B, N, D, H, W]
-            scale_features = features.view(B, N, D, H_feat, W_feat)
-            enhanced_features[scale_name] = scale_features
-
-        # Extract focus features
+            enhanced_features[scale_name] = features.view(B, N, D, H_feat, W_feat)
         focus_features = self.focus_feature_net(focus_distances)
-
-        # Multi-scale adaptive fusion
         fused_results = self.adaptive_fusion(enhanced_features, focus_distances)
 
-        # Add focus features to output
+        fused_results.update(sweep_results)
         fused_results['focus_features'] = focus_features
-
         return fused_results

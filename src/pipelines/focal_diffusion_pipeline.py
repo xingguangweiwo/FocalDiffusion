@@ -610,8 +610,10 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
-        depth_logits, rgb_latents, confidence_map = self.dual_decoder(latents)
-        depth_probs = torch.sigmoid(depth_logits)
+        decoder_outputs = self.dual_decoder(latents)
+        depth_probs = decoder_outputs["shape_norm"]
+        rgb_latents = decoder_outputs["aif_latents"]
+        confidence_map = decoder_outputs.get("confidence_map", 1.0 - decoder_outputs["uncertainty"])
         depth_probs = F.interpolate(
             depth_probs, size=(height, width), mode="bilinear", align_corners=False
         )
