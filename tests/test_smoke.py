@@ -17,6 +17,27 @@ def test_core_smoke():
     critic_out = critic(focal_stack * 2 - 1, focus_distances, out["shape_norm"])
     assert "focus_energy" in critic_out and "tau_contrast" in critic_out and "stack_contrast" in critic_out and "shape_candidate_contrast" in critic_out
 
-    loss_fn = FocalDiffusionLoss(diffusion_weight=1.0, depth_weight=0.0, rgb_weight=0.0)
-    loss_dict = loss_fn(diffusion_pred=torch.randn(1,16,32,32), diffusion_target=torch.randn(1,16,32,32), shape_norm=out["shape_norm"], uncertainty=out["uncertainty"], focal_stack=focal_stack * 2 - 1, critic_outputs=critic_out)
+    loss_fn = FocalDiffusionLoss(
+        diffusion_weight=1.0,
+        depth_weight=1.0,
+        rgb_weight=0.0,
+        consistency_weight=0.1,
+        perceptual_weight=0.1,
+        depth_gradient_weight=0.1,
+        edge_consistency_weight=0.1,
+        confidence_regularization_weight=0.1,
+    )
+    loss_dict = loss_fn(
+        diffusion_pred=torch.randn(1,16,32,32),
+        diffusion_target=torch.randn(1,16,32,32),
+        depth_target=torch.rand(1, 1, 32, 32),
+        shape_norm=out["shape_norm"],
+        uncertainty=out["uncertainty"],
+        focal_stack=focal_stack * 2 - 1,
+        critic_outputs=critic_out,
+        depth_range=torch.tensor([[0.2, 4.0]], dtype=torch.float32),
+        depth_mask=torch.ones(1, 32, 32),
+        focal_features=features,
+        confidence_map=out["uncertainty"],
+    )
     assert "total" in loss_dict
