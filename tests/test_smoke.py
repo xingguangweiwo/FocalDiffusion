@@ -41,3 +41,18 @@ def test_core_smoke():
         confidence_map=out["uncertainty"],
     )
     assert "total" in loss_dict
+
+
+def test_focal_sweep_n20_smoke():
+    focal_stack = torch.rand(1, 20, 3, 128, 128)
+    focus_distances = torch.linspace(0, 1, 20).unsqueeze(0)
+    processor = FocalStackProcessor(
+        feature_dim=128,
+        max_sequence_length=20,
+        focal_encoder_type="focal_sweep",
+        patch_size=8,
+        focal_attention_heads=8,
+        focal_attention_depth=2,
+    )
+    features = processor(focal_stack * 2 - 1, focus_distances)
+    assert "fused_features" in features

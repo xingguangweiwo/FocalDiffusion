@@ -70,6 +70,7 @@ training:
   use_aif_highpass: true
   use_focus_consistency_critic: true
   train_focus_critic: true
+  critic_warmup_steps: 500
   supervision_mode: supervised
 
 optimizer:
@@ -93,6 +94,7 @@ losses:
   focus_energy_weight: 0.5
   tau_contrast_weight: 0.2
   stack_contrast_weight: 0.2
+  mismatch_contrast_weight: 0.2
   shape_candidate_contrast_weight: 0.2
   uncertainty_weight: 0.05
   aif_highpass_weight: 0.1

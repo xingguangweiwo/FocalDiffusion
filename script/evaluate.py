@@ -1,5 +1,5 @@
 """
-Evaluation script for FocalDiffusion
+Evaluation script for FocalDiffusion with normalized-shape aware metrics.
 """
 
 import argparse
@@ -9,19 +9,17 @@ import torch
 import numpy as np
 from tqdm import tqdm
 import yaml
+import torch.nn.functional as F
 
 from src.pipelines import load_pipeline
 from src.data import create_dataloader
 from src.utils.metrics import compute_metrics
-from src.utils.visualization import visualize_results
+
 
 def evaluate(args):
-    """Main evaluation function"""
-    # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
-    # Load pipeline
     print(f"Loading model from {args.checkpoint}...")
     pipeline = load_pipeline(
         checkpoint_path=args.checkpoint,
@@ -31,8 +29,6 @@ def evaluate(args):
     )
     pipeline.eval()
 
-    # Create dataloader
-    print(f"Loading {args.dataset} dataset...")
     dataloader = create_dataloader(
         dataset_type=args.dataset,
         data_root=args.data_root,
@@ -45,72 +41,66 @@ def evaluate(args):
         augmentation=False,
     )
 
-    # Evaluation metrics
+    use_camera_encoder = config.get("model", {}).get("use_camera_encoder", False)
     all_metrics = []
 
-    # Evaluation loop
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
         if args.max_samples and batch_idx * args.batch_size >= args.max_samples:
             break
 
-        # Move to device
         focal_stack = batch['focal_stack'].to(args.device)
         focus_distances = batch['focus_distances'].to(args.device)
-        depth_gt = batch['depth'].to(args.device)
+        depth_gt = batch.get('depth')
+        depth_range = batch.get('depth_range')
+        camera_params = batch.get('camera_params') if use_camera_encoder else None
 
-        # Generate predictions
         with torch.no_grad():
             output = pipeline(
                 focal_stack=focal_stack,
                 focus_distances=focus_distances,
-                camera_params=batch.get('camera_params'),
+                camera_params=camera_params,
                 num_inference_steps=args.num_inference_steps,
                 output_type='pt',
             )
 
-        # Compute metrics
-        metrics = compute_metrics(
-            output.depth_map,
-            depth_gt.squeeze(1)
-        )
-        all_metrics.append(metrics)
+        shape_norm = output.depth_map
+        sample_metrics = {}
 
-        # Save visualizations for first few batches
-        if args.save_viz and batch_idx < args.num_viz:
-            viz_path = Path(args.output_dir) / f"viz_batch_{batch_idx}.png"
-            visualize_results(
-                {
-                    'focal_stack': focal_stack[0].cpu(),
-                    'depth': output.depth_map[0].cpu(),
-                    'depth_gt': depth_gt[0].cpu(),
-                    'all_in_focus': output.all_in_focus_image,
-                },
-                save_path=viz_path,
-                show=False,
-            )
+        if depth_gt is not None and depth_range is not None:
+            depth_gt = depth_gt.to(args.device).squeeze(1)
+            depth_range = depth_range.to(args.device)
+            depth_min = depth_range[:, 0].view(-1, 1, 1)
+            depth_max = depth_range[:, 1].view(-1, 1, 1)
+            pred_metric = shape_norm * (depth_max - depth_min).clamp(min=1e-6) + depth_min
+            sample_metrics.update(compute_metrics(pred_metric, depth_gt))
+            sample_metrics["loss"] = F.l1_loss(pred_metric, depth_gt).item()
+        elif depth_gt is not None:
+            depth_gt = depth_gt.to(args.device)
+            if shape_norm.dim() == 3:
+                shape_norm = shape_norm.unsqueeze(1)
+            if depth_gt.dim() == 3:
+                depth_gt = depth_gt.unsqueeze(1)
+            sample_metrics["normalized_loss"] = F.l1_loss(shape_norm, depth_gt).item()
 
-    # Aggregate metrics
+        sample_metrics["uncertainty_mean"] = float(output.uncertainty.mean().item()) if output.uncertainty is not None else 0.0
+        all_metrics.append(sample_metrics)
+
+    keys = sorted({k for m in all_metrics for k in m.keys()})
     final_metrics = {}
-    for key in all_metrics[0].keys():
-        values = [m[key] for m in all_metrics]
-        final_metrics[key] = {
-            'mean': np.mean(values),
-            'std': np.std(values),
-            'median': np.median(values),
-        }
+    for key in keys:
+        values = [m[key] for m in all_metrics if key in m]
+        final_metrics[key] = {'mean': float(np.mean(values)), 'std': float(np.std(values)), 'median': float(np.median(values))}
 
-    # Save results
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     with open(output_dir / 'metrics.json', 'w') as f:
         json.dump(final_metrics, f, indent=2)
 
-    # Print results
     print("\nEvaluation Results:")
     print("-" * 40)
     for key, values in final_metrics.items():
         print(f"{key}: {values['mean']:.4f} ± {values['std']:.4f}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate FocalDiffusion model")
@@ -125,11 +115,9 @@ def main():
     parser.add_argument('--max_samples', type=int, help='Maximum samples to evaluate')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--fp16', action='store_true', help='Use FP16 precision')
-    parser.add_argument('--save_viz', action='store_true', help='Save visualizations')
-    parser.add_argument('--num_viz', type=int, default=10, help='Number of visualizations')
-
     args = parser.parse_args()
     evaluate(args)
+
 
 if __name__ == "__main__":
     main()

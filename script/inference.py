@@ -102,18 +102,18 @@ def parse_args():
     parser.add_argument(
         '--focal-length',
         type=float,
-        help='Camera focal length in mm'
+        help='[Legacy] Camera focal length in mm (unused in default focal-sweep path)'
     )
     parser.add_argument(
         '--aperture',
         type=float,
-        help='Camera aperture (f-number)'
+        help='[Legacy] Camera aperture (unused in default focal-sweep path)'
     )
     parser.add_argument(
         '--sensor-size',
         type=float,
         default=0.036,
-        help='Sensor size in meters (default: full frame)'
+        help='[Legacy] Sensor size in meters (unused in default focal-sweep path)'
     )
 
     # Inference parameters
@@ -134,7 +134,7 @@ def parse_args():
         type=str,
         default='relative',
         choices=['relative', 'normalized', 'learned'],
-        help='Camera invariance mode'
+        help='[Legacy] Camera invariance mode (unused in default focal-sweep path)'
     )
 
     # Processing options
