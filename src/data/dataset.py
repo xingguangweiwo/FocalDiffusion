@@ -275,6 +275,17 @@ class FocalStackDataset(Dataset):
             if sample.get("all_in_focus"):
                 ok &= _check(sample["all_in_focus"], kind="all_in_focus")
 
+            focal_path = sample.get("focal_stack_path")
+            if focal_path:
+                resolved_path = self._resolve_path(focal_path, kind="focal_stack")
+                if not resolved_path.exists():
+                    logger.error(
+                        "Missing focal stack image %s (entry %r)",
+                        resolved_path,
+                        focal_path,
+                    )
+                    ok = False
+
             focal_dir = sample.get("focal_stack_dir")
             if focal_dir:
                 resolved_dir = self._resolve_path(focal_dir, kind="focal_stack")
@@ -317,6 +328,10 @@ class FocalStackDataset(Dataset):
         if not depth_key:
             raise ValueError("Each entry must provide a depth or depth_path field")
         sample["depth_path"] = depth_key
+
+        focal_path = entry.get("focal_stack_path")
+        if focal_path:
+            sample["focal_stack_path"] = focal_path
 
         focal_key = entry.get("focal_stack") or entry.get("focal_stack_dir") or entry.get("scene_path")
         if focal_key:
@@ -398,7 +413,11 @@ class FocalStackDataset(Dataset):
             "all_in_focus": all_in_focus,
             "focus_distances": focus_distances,
             "camera_params": camera_params,
-            "sample_path": sample_info.get("focal_stack_dir") or sample_info.get("depth_path", ""),
+            "sample_path": (
+                sample_info.get("focal_stack_path")
+                or sample_info.get("focal_stack_dir")
+                or sample_info.get("depth_path", "")
+            ),
             "depth_range": torch.tensor(
                 [depth_meta["min"], depth_meta["max"]], dtype=torch.float32
             ),
@@ -420,7 +439,11 @@ class FocalStackDataset(Dataset):
             return bool(sample_info["generate_focal_stack"])
         if self.generate_focal_stack:
             return True
-        return "all_in_focus" in sample_info and "focal_stack_dir" not in sample_info
+        return (
+            "all_in_focus" in sample_info
+            and "focal_stack_path" not in sample_info
+            and "focal_stack_dir" not in sample_info
+        )
 
     def _load_all_in_focus(
         self, sample_info: Dict, fallback: Optional[torch.Tensor] = None
@@ -442,28 +465,37 @@ class FocalStackDataset(Dataset):
         return torch.from_numpy(array).permute(2, 0, 1)
 
     def _load_focal_stack(self, sample_info: Dict) -> torch.Tensor:
-        dir_key = sample_info.get("focal_stack_dir") or sample_info.get("scene_path")
-        if not dir_key:
-            raise ValueError("Sample must include a focal_stack_dir when not generating")
+        stack_key = (
+            sample_info.get("focal_stack_path")
+            or sample_info.get("focal_stack_dir")
+            or sample_info.get("scene_path")
+        )
+        if not stack_key:
+            raise ValueError(
+                "Sample must include a focal_stack_path or focal_stack_dir when not generating"
+            )
 
-        scene_dir = self._resolve_path(dir_key, kind="focal_stack")
-        if not scene_dir.exists():
-            raise FileNotFoundError(f"Focal stack directory {scene_dir} does not exist")
+        stack_path = self._resolve_path(stack_key, kind="focal_stack")
+        if not stack_path.exists():
+            raise FileNotFoundError(f"Focal stack path {stack_path} does not exist")
 
         image_files = []
-        patterns = sample_info.get("image_glob")
-        if patterns:
-            if isinstance(patterns, str):
-                patterns = [patterns]
-            for pattern in patterns:
-                image_files.extend(sorted(scene_dir.glob(pattern)))
+        if stack_path.is_file():
+            image_files.append(stack_path)
         else:
-            image_files.extend(sorted(scene_dir.glob("*.png")))
-            image_files.extend(sorted(scene_dir.glob("*.jpg")))
-            image_files.extend(sorted(scene_dir.glob("*.jpeg")))
+            patterns = sample_info.get("image_glob")
+            if patterns:
+                if isinstance(patterns, str):
+                    patterns = [patterns]
+                for pattern in patterns:
+                    image_files.extend(sorted(stack_path.glob(pattern)))
+            else:
+                image_files.extend(sorted(stack_path.glob("*.png")))
+                image_files.extend(sorted(stack_path.glob("*.jpg")))
+                image_files.extend(sorted(stack_path.glob("*.jpeg")))
 
         if not image_files:
-            raise FileNotFoundError(f"No focal stack images found in {scene_dir}")
+            raise FileNotFoundError(f"No focal stack images found in {stack_path}")
 
         max_images = sample_info.get("num_images") or self.focal_stack_size
         if max_images <= 0:
@@ -723,7 +755,7 @@ class VirtualKITTIDataset(FocalStackDataset):
                 if depth_file.exists():
                     samples.append(
                         {
-                            "focal_stack_dir": str(rgb_dir.relative_to(self.data_root)),
+                            "focal_stack_path": str(rgb_file.relative_to(self.data_root)),
                             "depth_path": str(depth_file.relative_to(self.data_root)),
                             "num_images": 1,
                         }
