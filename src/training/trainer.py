@@ -595,6 +595,7 @@ class FocalDiffusionTrainer:
         )
 
         prompt_embeds, pooled_prompt_embeds = self._get_empty_prompt_embeddings()
+        effective_steps = 0
 
         for step, batch in enumerate(progress_bar):
             with self.accelerator.accumulate(self.pipeline):
@@ -602,10 +603,30 @@ class FocalDiffusionTrainer:
                 device = self.accelerator.device
                 focal_stack = batch['focal_stack'].to(device)
                 focus_distances = batch['focus_distances'].to(device=device, dtype=focal_stack.dtype)
-                depth_gt = batch['depth'].to(device)
-                rgb_gt = batch['all_in_focus'].to(device)
+                supervision_mode = self.config['training'].get('supervision_mode', 'supervised')
+                depth_gt = batch.get('depth')
+                rgb_gt = batch.get('all_in_focus')
+                if depth_gt is not None:
+                    depth_gt = depth_gt.to(device)
+                if rgb_gt is not None:
+                    rgb_gt = rgb_gt.to(device)
+                if supervision_mode == "supervised":
+                    if depth_gt is None:
+                        raise ValueError("supervised mode requires batch['depth'], but it is missing.")
+                    if rgb_gt is None:
+                        raise ValueError("supervised mode requires batch['all_in_focus'], but it is missing.")
+                if supervision_mode == "self_supervised" and rgb_gt is None:
+                    raise NotImplementedError(
+                        "Self-supervised diffusion training requires a pseudo-AIF target and is not fully implemented yet."
+                    )
+                if supervision_mode == "semi_supervised" and rgb_gt is None:
+                    logger.warning(
+                        "Skipping batch in semi_supervised mode because all_in_focus is missing; "
+                        "SD3 flow-matching clean latent target is unavailable."
+                    )
+                    continue
                 depth_range_tensor = batch.get('depth_range')
-                if depth_range_tensor is not None:
+                if depth_range_tensor is not None and depth_gt is not None:
                     depth_range_tensor = depth_range_tensor.to(device=device, dtype=depth_gt.dtype)
                 depth_mask = batch.get('valid_mask')
                 if depth_mask is not None:
@@ -705,27 +726,6 @@ class FocalDiffusionTrainer:
                     rgb_latent_pred = decoder_outputs["aif_latents"]
                     confidence_map = decoder_outputs.get("confidence_map", 1.0 - uncertainty)
 
-                    depth_probs = shape_norm
-                    depth_probs = F.interpolate(
-                        depth_probs,
-                        size=depth_gt.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
-                    )
-
-                    if depth_range_tensor is not None:
-                        depth_min = depth_range_tensor[:, 0].view(-1, 1, 1)
-                        depth_max = depth_range_tensor[:, 1].view(-1, 1, 1)
-                    elif camera_params is not None and 'depth_min' in camera_params and 'depth_max' in camera_params:
-                        depth_min = camera_params['depth_min'].to(dtype=depth_gt.dtype).view(-1, 1, 1)
-                        depth_max = camera_params['depth_max'].to(dtype=depth_gt.dtype).view(-1, 1, 1)
-                    else:
-                        depth_min = depth_gt.amin(dim=(-2, -1), keepdim=True)
-                        depth_max = depth_gt.amax(dim=(-2, -1), keepdim=True)
-
-                    depth_range = (depth_max - depth_min).clamp(min=1e-6)
-                    depth_pred = depth_probs * depth_range + depth_min
-
                     rgb_recon = self.pipeline.vae.decode(
                         rgb_latent_pred / self.pipeline.vae.config.scaling_factor,
                         return_dict=False
@@ -735,8 +735,7 @@ class FocalDiffusionTrainer:
                     # Cast tensors for stable loss computation
                     diffusion_pred = diffusion_pred.float()
                     diffusion_target = flow_target.float()
-                    depth_pred = depth_pred.float()
-                    depth_target = depth_gt.float()
+                    depth_target = depth_gt.float() if depth_gt is not None else None
                     rgb_recon = rgb_recon.float()
                     rgb_target_fp32 = rgb_target.float()
 
@@ -744,14 +743,16 @@ class FocalDiffusionTrainer:
                     critic_outputs = self.focus_consistency_critic(
                         focal_stack.float(), focus_distances.float(), shape_norm.float().detach()
                     )
+                    critic_warmup_steps = int(self.config['training'].get('critic_warmup_steps', 0))
                     with temporarily_freeze(self.focus_consistency_critic):
                         critic_generator_outputs = self.focus_consistency_critic(
                             focal_stack.float(), focus_distances.float(), shape_norm.float()
                         )
+                    if (global_step + step) < critic_warmup_steps:
+                        critic_generator_outputs = None
                     loss_dict = loss_fn(
                         diffusion_pred=diffusion_pred,
                         diffusion_target=diffusion_target,
-                        depth_pred=depth_pred,
                         depth_target=depth_target,
                         depth_mask=depth_mask,
                         rgb_pred=rgb_recon,
@@ -789,6 +790,7 @@ class FocalDiffusionTrainer:
                     self.ema.step(self._ema_parameters())
 
                 # Logging
+                effective_steps += 1
                 epoch_loss += loss.item()
                 if step % self.config['logging']['log_every_n_steps'] == 0:
                     progress_bar.set_postfix({
@@ -803,7 +805,9 @@ class FocalDiffusionTrainer:
                             **{f'train_{k}': v.item() for k, v in loss_dict.items() if k != 'total'}
                         }, step=global_step + step)
 
-        return epoch_loss / len(self.train_dataloader)
+        if effective_steps == 0:
+            return 0.0
+        return epoch_loss / effective_steps
 
     def _get_empty_prompt_embeddings(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Cache and return the embeddings for the empty prompt used during training."""

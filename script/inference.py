@@ -23,7 +23,7 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.pipelines import FocalDiffusionPipeline, load_pipeline
+from src.pipelines import load_pipeline
 from src.utils import (
     load_image_stack,
     save_depth_map,
@@ -31,7 +31,6 @@ from src.utils import (
     create_visualization,
     parse_exif_data,
     estimate_focus_distances,
-    ensure_sentencepiece_installed,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -103,18 +102,18 @@ def parse_args():
     parser.add_argument(
         '--focal-length',
         type=float,
-        help='Camera focal length in mm'
+        help='[Legacy] Camera focal length in mm (unused in default focal-sweep path)'
     )
     parser.add_argument(
         '--aperture',
         type=float,
-        help='Camera aperture (f-number)'
+        help='[Legacy] Camera aperture (unused in default focal-sweep path)'
     )
     parser.add_argument(
         '--sensor-size',
         type=float,
         default=0.036,
-        help='Sensor size in meters (default: full frame)'
+        help='[Legacy] Sensor size in meters (unused in default focal-sweep path)'
     )
 
     # Inference parameters
@@ -135,7 +134,7 @@ def parse_args():
         type=str,
         default='relative',
         choices=['relative', 'normalized', 'learned'],
-        help='Camera invariance mode'
+        help='[Legacy] Camera invariance mode (unused in default focal-sweep path)'
     )
 
     # Processing options
@@ -276,7 +275,6 @@ def process_focal_stack(
         pipeline,
         images: List[Image.Image],
         focus_distances: torch.Tensor,
-        camera_params: Dict,
         args,
         stack_name: str = "focal_stack"
 ) -> Dict:
@@ -290,7 +288,6 @@ def process_focal_stack(
         output = pipeline(
             focal_stack=images,
             focus_distances=focus_distances,
-            camera_params=camera_params,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
             camera_invariant_mode=args.camera_invariant_mode,
@@ -309,7 +306,6 @@ def process_focal_stack(
         'depth_colored': output.depth_colored,
         'uncertainty': output.uncertainty,
         'inference_time': inference_time,
-        'camera_params': camera_params,
         'focus_distances': focus_distances.tolist(),
     }
 
@@ -364,7 +360,6 @@ def save_results(results: Dict, output_dir: Path, args):
     # Save metadata
     metadata = {
         'name': name,
-        'camera_params': results['camera_params'],
         'focus_distances': results['focus_distances'],
         'inference_time': results['inference_time'],
     }
@@ -408,22 +403,19 @@ def main():
     }
     dtype = dtype_map[args.dtype]
 
+    if not args.model_path:
+        raise ValueError("A trained FocalDiffusion checkpoint is required.")
+    if not os.path.exists(args.model_path):
+        raise ValueError(f"Model path does not exist: {args.model_path}")
+
     # Load pipeline
-    if args.model_path:
-        logger.info(f"Loading model from checkpoint: {args.model_path}")
-        pipeline = load_pipeline(
-            checkpoint_path=args.model_path,
-            base_model_id=args.base_model,
-            device=device,
-            dtype=dtype,
-        )
-    else:
-        logger.info(f"Loading pretrained model: {args.base_model}")
-        ensure_sentencepiece_installed()
-        pipeline = FocalDiffusionPipeline.from_pretrained(
-            args.base_model,
-            torch_dtype=dtype,
-        ).to(device)
+    logger.info(f"Loading model from checkpoint: {args.model_path}")
+    pipeline = load_pipeline(
+        checkpoint_path=args.model_path,
+        base_model_id=args.base_model,
+        device=device,
+        dtype=dtype,
+    )
 
     pipeline.eval()
 
@@ -446,14 +438,7 @@ def main():
             images, image_paths = load_focal_stack(input_path)
 
             # Extract parameters
-            camera_params = extract_camera_params(image_paths, args)
             focus_distances = extract_focus_distances(image_paths, len(images), args)
-
-            # Convert camera params to tensors
-            camera_params_tensor = {
-                k: torch.tensor(v, dtype=dtype, device=device)
-                for k, v in camera_params.items()
-            }
 
             # Process
             stack_name = Path(input_path).stem if Path(input_path).is_dir() else f"stack_{input_idx:04d}"
@@ -462,7 +447,6 @@ def main():
                 pipeline,
                 images,
                 focus_distances.to(device),
-                camera_params_tensor,
                 args,
                 stack_name,
             )
