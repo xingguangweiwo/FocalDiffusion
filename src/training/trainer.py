@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 import json
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -33,6 +34,18 @@ from ..training.losses import FocusConsistencyCritic
 
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def temporarily_freeze(module):
+    prev = [p.requires_grad for p in module.parameters()]
+    try:
+        for p in module.parameters():
+            p.requires_grad_(False)
+        yield
+    finally:
+        for p, req in zip(module.parameters(), prev):
+            p.requires_grad_(req)
 
 
 class FocalDiffusionTrainer:
@@ -571,7 +584,8 @@ class FocalDiffusionTrainer:
             mismatch_contrast_weight=self.config['losses'].get('mismatch_contrast_weight', 0.2),
             shape_candidate_contrast_weight=self.config['losses'].get('shape_candidate_contrast_weight', 0.2),
             uncertainty_weight=self.config['losses'].get('uncertainty_weight', 0.05),
-            aif_highpass_weight=self.config['losses'].get('aif_highpass_weight', 0.2),
+            aif_highpass_weight=self.config['losses'].get('aif_highpass_weight', 0.1),
+            supervision_mode=self.config['training'].get('supervision_mode', 'supervised'),
         ).to(self.accelerator.device)
 
         progress_bar = tqdm(
@@ -727,7 +741,13 @@ class FocalDiffusionTrainer:
                     rgb_target_fp32 = rgb_target.float()
 
                     # Compute losses
-                    critic_outputs = self.focus_consistency_critic(focal_stack.float(), focus_distances.float(), shape_norm.float())
+                    critic_outputs = self.focus_consistency_critic(
+                        focal_stack.float(), focus_distances.float(), shape_norm.float().detach()
+                    )
+                    with temporarily_freeze(self.focus_consistency_critic):
+                        critic_generator_outputs = self.focus_consistency_critic(
+                            focal_stack.float(), focus_distances.float(), shape_norm.float()
+                        )
                     loss_dict = loss_fn(
                         diffusion_pred=diffusion_pred,
                         diffusion_target=diffusion_target,
@@ -742,6 +762,8 @@ class FocalDiffusionTrainer:
                         uncertainty=uncertainty.float(),
                         focal_stack=focal_stack.float(),
                         critic_outputs=critic_outputs,
+                        critic_generator_outputs=critic_generator_outputs,
+                        depth_range=depth_range_tensor.float() if depth_range_tensor is not None else None,
                     )
                     loss = loss_dict['total']
 
