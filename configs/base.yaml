@@ -70,6 +70,7 @@ training:
   use_aif_highpass: true
   use_focus_consistency_critic: true
   train_focus_critic: true
+  supervision_mode: supervised
 
 optimizer:
   type: adamw
@@ -94,7 +95,7 @@ losses:
   stack_contrast_weight: 0.2
   shape_candidate_contrast_weight: 0.2
   uncertainty_weight: 0.05
-  aif_highpass_weight: 0.2
+  aif_highpass_weight: 0.1
 
 validation:
   num_inference_steps: 30
