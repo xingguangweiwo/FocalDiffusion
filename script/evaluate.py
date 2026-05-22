@@ -3,6 +3,7 @@ Evaluation script for FocalDiffusion with normalized-shape aware metrics.
 """
 
 import argparse
+import warnings
 import json
 from pathlib import Path
 import torch
@@ -17,6 +18,7 @@ from src.utils.metrics import compute_metrics
 
 
 def evaluate(args):
+    warnings.warn("This script is deprecated and not aligned with the normalized-shape FocalDiffusion pipeline. Use trainer validation until this script is updated.", DeprecationWarning, stacklevel=2)
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
