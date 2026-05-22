@@ -4,17 +4,15 @@ FocalDiffusion is a focal-stack-conditioned SD3/SD3.5 latent diffusion project f
 
 - **Input:** focal stack + focus positions (`focus_distances`)
 - **Output:** AIF image + normalized depth/shape + uncertainty
-- **Metric depth / microscope height:** requires calibration (`depth_range`, z-step, or equivalent metadata)
+- **Metric depth:** requires calibration (`depth_range`, z-step, or equivalent metadata)
 - **Default path:** does **not** require PSF/NA/lens type/camera metadata
 - **Inference:** a trained FocalDiffusion checkpoint is required
 
 ## Highlights
 
 - SD3/SD3.5 backbone with focal-stack conditioning.
-- Flow-matching training objective (not DDPM noise-prediction objective).
-- Focus-consistency critic losses for focal sweep alignment.
+- Flow-matching training objective.
 - Normalized-shape supervision when `depth_range` is available.
-- Config-driven training setup for HyperSim / Virtual KITTI style workflows.
 
 ## Installation
 
