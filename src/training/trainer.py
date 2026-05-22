@@ -123,6 +123,7 @@ class FocalDiffusionTrainer:
             image_size=tuple(dataset_cfg['image_size']),
             focal_stack_size=dataset_cfg['focal_stack_size'],
             focal_range=tuple(dataset_cfg['focal_range']),
+            resize_mode=dataset_cfg.get('resize_mode', 'letterbox'),
             augmentation=True,
             shuffle=True,
             max_samples=dataset_cfg.get('max_train_samples'),
@@ -146,6 +147,7 @@ class FocalDiffusionTrainer:
             image_size=tuple(dataset_cfg['image_size']),
             focal_stack_size=dataset_cfg['focal_stack_size'],
             focal_range=tuple(dataset_cfg['focal_range']),
+            resize_mode=dataset_cfg.get('resize_mode', 'letterbox'),
             augmentation=False,
             shuffle=False,
             max_samples=dataset_cfg.get('max_val_samples'),
@@ -566,6 +568,7 @@ class FocalDiffusionTrainer:
         from ..training.losses import FocalDiffusionLoss
 
         self.pipeline.train()
+        self.focus_consistency_critic.train()
         epoch_loss = 0.0
 
         # Initialize loss function
@@ -617,7 +620,7 @@ class FocalDiffusionTrainer:
                         raise ValueError("supervised mode requires batch['all_in_focus'], but it is missing.")
                 if supervision_mode == "self_supervised" and rgb_gt is None:
                     raise NotImplementedError(
-                        "Self-supervised diffusion training requires a pseudo-AIF target and is not fully implemented yet."
+                        "Self-supervised diffusion training without all_in_focus requires a pseudo-AIF target and is not fully implemented."
                     )
                 if supervision_mode == "semi_supervised" and rgb_gt is None:
                     logger.warning(
@@ -652,7 +655,7 @@ class FocalDiffusionTrainer:
                 # Normalize inputs
                 if focal_stack.min() >= 0 and focal_stack.max() <= 1:
                     focal_stack = (focal_stack * 2.0) - 1.0
-                rgb_target = (rgb_gt * 2.0) - 1.0
+                rgb_target = (rgb_gt * 2.0) - 1.0 if rgb_gt is not None else None
 
                 # Extract focal features and explicitly attach camera metadata embeddings.
                 focal_features = self.focal_processor(
@@ -720,6 +723,9 @@ class FocalDiffusionTrainer:
                     )
 
                     # Decode auxiliary predictions for multi-task losses
+                    if rgb_target is None:
+                        raise ValueError("all_in_focus is required to compute the SD3 flow-matching reconstruction losses.")
+
                     decoder_outputs = self.dual_decoder(clean_latent_pred)
                     shape_norm = decoder_outputs["shape_norm"]
                     uncertainty = decoder_outputs["uncertainty"]
@@ -744,12 +750,13 @@ class FocalDiffusionTrainer:
                         focal_stack.float(), focus_distances.float(), shape_norm.float().detach()
                     )
                     critic_warmup_steps = int(self.config['training'].get('critic_warmup_steps', 0))
-                    with temporarily_freeze(self.focus_consistency_critic):
-                        critic_generator_outputs = self.focus_consistency_critic(
-                            focal_stack.float(), focus_distances.float(), shape_norm.float()
-                        )
                     if (global_step + step) < critic_warmup_steps:
                         critic_generator_outputs = None
+                    else:
+                        with temporarily_freeze(self.focus_consistency_critic):
+                            critic_generator_outputs = self.focus_consistency_critic(
+                                focal_stack.float(), focus_distances.float(), shape_norm.float()
+                            )
                     loss_dict = loss_fn(
                         diffusion_pred=diffusion_pred,
                         diffusion_target=diffusion_target,
@@ -774,6 +781,11 @@ class FocalDiffusionTrainer:
                 # Gradient clipping
                 if self.config['training'].get('max_grad_norm'):
                     clip_params = list(self._iter_pipeline_parameters(only_trainable=True))
+                    if getattr(self, "focus_consistency_critic", None) is not None:
+                        clip_params += [
+                            p for p in self.focus_consistency_critic.parameters()
+                            if p.requires_grad
+                        ]
                     if clip_params:
                         self.accelerator.clip_grad_norm_(
                             clip_params,
@@ -802,7 +814,7 @@ class FocalDiffusionTrainer:
                         self.accelerator.log({
                             'train_loss_step': loss.item(),
                             'learning_rate': self.lr_scheduler.get_last_lr()[0],
-                            **{f'train_{k}': v.item() for k, v in loss_dict.items() if k != 'total'}
+                            **{f'train_{k}': v.item() for k, v in loss_dict.items() if k != 'total' and isinstance(v, torch.Tensor)}
                         }, step=global_step + step)
 
         if effective_steps == 0:

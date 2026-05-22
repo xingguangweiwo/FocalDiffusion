@@ -37,6 +37,55 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def resize_or_pad_to_multiple(
+    images: List[Image.Image],
+    divisor: int = 16,
+) -> tuple[List[Image.Image], Dict[str, List[int]]]:
+    """Resize with preserved aspect ratio then pad to divisor multiples."""
+    if not images:
+        raise ValueError("images must not be empty")
+
+    orig_w, orig_h = images[0].size
+    for image in images[1:]:
+        if image.size != (orig_w, orig_h):
+            raise ValueError("All focal-stack images must share the same size")
+
+    target_h = ((orig_h + divisor - 1) // divisor) * divisor
+    target_w = ((orig_w + divisor - 1) // divisor) * divisor
+    pad_h = target_h - orig_h
+    pad_w = target_w - orig_w
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+
+    if pad_h == 0 and pad_w == 0:
+        return images, {
+            "original_size": [orig_h, orig_w],
+            "inference_size": [target_h, target_w],
+            "pad": [top, bottom, left, right],
+        }
+
+    padded: List[Image.Image] = []
+    for image in images:
+        arr = np.array(image)
+        arr = np.pad(arr, ((top, bottom), (left, right), (0, 0)), mode="edge")
+        padded.append(Image.fromarray(arr))
+
+    return padded, {
+        "original_size": [orig_h, orig_w],
+        "inference_size": [target_h, target_w],
+        "pad": [top, bottom, left, right],
+    }
+
+
+def unpad_tensor_spatial(tensor: torch.Tensor, pad: List[int]) -> torch.Tensor:
+    top, bottom, left, right = pad
+    h_end = tensor.shape[-2] - bottom if bottom > 0 else tensor.shape[-2]
+    w_end = tensor.shape[-1] - right if right > 0 else tensor.shape[-1]
+    return tensor[..., top:h_end, left:w_end]
+
+
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -136,6 +185,8 @@ def parse_args():
         choices=['relative', 'normalized', 'learned'],
         help='[Legacy] Camera invariance mode (unused in default focal-sweep path)'
     )
+    parser.add_argument('--height', type=int, default=None, help='Optional inference height override')
+    parser.add_argument('--width', type=int, default=None, help='Optional inference width override')
 
     # Processing options
     parser.add_argument(
@@ -283,20 +334,40 @@ def process_focal_stack(
     logger.info(f"Processing {stack_name}...")
     start_time = time.time()
 
+    padded_images, size_meta = resize_or_pad_to_multiple(images, divisor=16)
+
+    pipeline_kwargs = {}
+    if args.height is not None:
+        pipeline_kwargs["height"] = args.height
+    if args.width is not None:
+        pipeline_kwargs["width"] = args.width
+
     # Run inference
     with torch.no_grad():
         output = pipeline(
-            focal_stack=images,
+            focal_stack=padded_images,
             focus_distances=focus_distances,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
             camera_invariant_mode=args.camera_invariant_mode,
             output_type="pil" if args.save_visualization else "pt",
             return_dict=True,
+            **pipeline_kwargs,
         )
 
     inference_time = time.time() - start_time
     logger.info(f"Inference completed in {inference_time:.2f} seconds")
+
+    if isinstance(output.depth_map, torch.Tensor):
+        output.depth_map = unpad_tensor_spatial(output.depth_map, size_meta["pad"])
+    if isinstance(output.uncertainty, torch.Tensor):
+        output.uncertainty = unpad_tensor_spatial(output.uncertainty, size_meta["pad"])
+    if isinstance(output.all_in_focus_image, torch.Tensor):
+        output.all_in_focus_image = unpad_tensor_spatial(output.all_in_focus_image, size_meta["pad"])
+    elif isinstance(output.all_in_focus_image, Image.Image):
+        top, bottom, left, right = size_meta["pad"]
+        w, h = output.all_in_focus_image.size
+        output.all_in_focus_image = output.all_in_focus_image.crop((left, top, w - right, h - bottom))
 
     # Prepare results
     results = {
@@ -307,6 +378,9 @@ def process_focal_stack(
         'uncertainty': output.uncertainty,
         'inference_time': inference_time,
         'focus_distances': focus_distances.tolist(),
+        'original_size': size_meta["original_size"],
+        'inference_size': size_meta["inference_size"],
+        'output_size': list(output.depth_map.shape[-2:]) if isinstance(output.depth_map, torch.Tensor) else size_meta["original_size"],
     }
 
     if args.save_intermediate:
@@ -362,6 +436,9 @@ def save_results(results: Dict, output_dir: Path, args):
         'name': name,
         'focus_distances': results['focus_distances'],
         'inference_time': results['inference_time'],
+        'original_size': results.get('original_size'),
+        'inference_size': results.get('inference_size'),
+        'output_size': results.get('output_size'),
     }
 
     with open(output_dir / f"{name}_metadata.json", 'w') as f:
