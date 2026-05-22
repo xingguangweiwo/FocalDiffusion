@@ -1,81 +1,53 @@
 # FocalDiffusion: Focal-Stack-Conditioned Latent Diffusion for Joint All-in-Focus Reconstruction and Depth Estimation
 
-FocalDiffusion is a focal-stack-conditioned SD3/SD3.5 latent diffusion project for joint all-in-focus (AIF) reconstruction and depth prediction.
-
-- **Input:** focal stack + focus positions (`focus_distances`)
-- **Output:** AIF image + normalized depth/shape + uncertainty
-- **Metric depth:** requires calibration (`depth_range`, z-step, or equivalent metadata)
-- **Default path:** does **not** require PSF/NA/lens type/camera metadata
-- **Inference:** a trained FocalDiffusion checkpoint is required
+## Short Introduction
+FocalDiffusion is a focal-stack-conditioned latent diffusion framework for joint all-in-focus reconstruction and depth estimation. It uses images captured at different focus positions to predict a normalized shape/depth map, recover an all-in-focus image, and estimate uncertainty.
 
 ## Highlights
+- SD3-based latent diffusion training with an **SD3 flow-matching objective**.
+- Joint outputs: normalized shape/depth, AIF reconstruction, and uncertainty.
+- Focus-consistency critic for focus-energy and contrast diagnostics during training/validation.
+- Default training/inference path does **not** require PSF/NA/camera metadata.
 
-- SD3/SD3.5 backbone with focal-stack conditioning.
-- Flow-matching training objective.
-- Normalized-shape supervision when `depth_range` is available.
+## Important Notes
+- A trained checkpoint is required for practical inference quality.
+- Depth output is normalized by default.
+- Metric depth/height requires dataset/device calibration (e.g., depth range).
 
 ## Installation
-
 ```bash
-git clone https://github.com/xingguangweiwo/FocalDiffusion.git
-cd FocalDiffusion
-python -m venv .venv
-source .venv/bin/activate
 pip install -e .
 ```
 
-For SD3.5 access:
-
-```bash
-huggingface-cli login
-```
-
 ## Data Preparation
-
-Training uses plain-text file lists:
-
-```text
-<relative_rgb_or_stack_path> <relative_depth_path> [optional_extra_tokens]
-```
-
-- The first token can be an AIF image path or focal-stack directory.
-- If RGB + depth are provided, focal stacks can be synthesized by the built-in simulator.
-- Paths are resolved relative to `data_root` in config.
+- Prepare dataset file lists under `data/filelists/`.
+- Configure dataset roots, filelists, and modality options in `configs/*.yaml`.
+- Ensure `focal_stack`, `focus_distances`, and (for supervised/semi-supervised) labels are available according to your mode.
 
 ## Training
-
 ```bash
-python -m script.train --config configs/hypersim.yaml
-```
-
-Mixed dataset training:
-
-```bash
-python -m script.train --config configs/mixed.yaml
+python script/train.py --config configs/base.yaml
 ```
 
 ## Inference
-
 ```bash
-python -m script.inference \
-  --input /path/to/focal_stack \
-  --output outputs/inference/example \
-  --model-path /path/to/focaldiffusion_checkpoint.pt \
-  --base-model stabilityai/stable-diffusion-3.5-large
+python script/inference.py --config configs/base.yaml --checkpoint <path_to_checkpoint>
 ```
+
+## Method Overview
+1. Encode focal stack features with focal processor modules.
+2. Condition SD3 transformer denoising with focal features.
+3. Decode latent outputs into normalized shape, AIF latents, and uncertainty.
+4. Apply supervised/semi-supervised objectives plus focus-consistency diagnostics.
 
 ## Repository Structure
-
-```text
-configs/          YAML experiment configurations
-data/filelists/   Example dataset file lists
-script/           Training / evaluation / inference scripts
-src/data/         Dataset loading and focal-stack simulation
-src/models/       Focal encoders and decoders
-src/pipelines/    FocalDiffusion SD3.5 pipeline
-src/training/     Trainer, losses, optimization, validation
-```
+- `src/models/`: focal processors, attention blocks, decoders, camera modules.
+- `src/pipelines/`: FocalDiffusion pipeline and injected SD3 transformer.
+- `src/training/`: trainer, losses, validation, optimization utilities.
+- `src/data/`: datasets, augmentations, simulation helpers.
+- `script/`: train / inference / evaluate entry points.
+- `configs/`: base and dataset-specific configs.
+- `tests/`: smoke and module tests.
 
 ## License
-
-Please add a `LICENSE` file before public release.
+See project license files and repository policy.
