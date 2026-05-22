@@ -64,22 +64,6 @@ python -m script.inference \
   --base-model stabilityai/stable-diffusion-3.5-large
 ```
 
-## Method Overview
-
-Current training objective combines:
-
-- SD3/SD3.5 flow-matching loss
-- focus-consistency critic contrast losses
-- normalized shape supervision (if `depth_range` exists)
-- AIF high-pass consistency
-- uncertainty reliability loss
-
-## Important Notes
-
-- Model outputs are normalized by default.
-- Metric depth / microscope height needs calibration information.
-- A trained checkpoint is required for meaningful inference.
-
 ## Repository Structure
 
 ```text
