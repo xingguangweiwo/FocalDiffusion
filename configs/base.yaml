@@ -37,6 +37,7 @@ data:
   image_size: [512, 512]
   focal_stack_size: 5
   focal_range: [0.3, 10.0]
+  resize_mode: letterbox
   num_workers: 8
   max_train_samples: null
   max_val_samples: null

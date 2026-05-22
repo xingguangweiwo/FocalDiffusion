@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import logging
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -498,8 +499,8 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         camera_params: Optional[Dict[str, Union[torch.Tensor, float]]] = None,
         prompt: str = "",
         negative_prompt: Optional[str] = None,
-        height: int = 1024,
-        width: int = 1024,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
         num_inference_steps: int = 28,
         guidance_scale: float = 7.0,
         num_images_per_prompt: int = 1,
@@ -517,6 +518,10 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         dtype = self.transformer.dtype
 
         focal_stack = focal_stack.to(device=device, dtype=dtype)
+        input_h, input_w = focal_stack.shape[-2:]
+        target_h = input_h if height is None else int(height)
+        target_w = input_w if width is None else int(width)
+        height, width = self._make_divisible_size(target_h, target_w, divisor=max(int(self.vae_scale_factor), 16))
         if focus_distances.dim() == 1:
             focus_distances = focus_distances.unsqueeze(0)
         focus_distances = focus_distances.to(device=device, dtype=dtype)
@@ -646,6 +651,17 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             attention_maps=None,
             uncertainty=1.0 - confidence_map.squeeze(1),
         )
+
+    @staticmethod
+    def _make_divisible_size(height: int, width: int, divisor: int = 16) -> Tuple[int, int]:
+        """Round spatial size up to a multiple of ``divisor`` without forcing square outputs."""
+        if divisor <= 0:
+            raise ValueError("divisor must be positive")
+        height = max(1, int(height))
+        width = max(1, int(width))
+        out_h = int(math.ceil(height / divisor) * divisor)
+        out_w = int(math.ceil(width / divisor) * divisor)
+        return out_h, out_w
 
 
     def _repeat_focal_features(self, value: Any, repeats: int) -> Any:

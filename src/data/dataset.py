@@ -49,6 +49,7 @@ class FocalStackDataset(Dataset):
         camera_defaults: Optional[Dict[str, float]] = None,
         simulator_kwargs: Optional[Dict[str, float]] = None,
         depth_bounds: Optional[Tuple[float, float]] = None,
+        resize_mode: str = "letterbox",
     ) -> None:
         self.data_roots = self._normalise_root_map(data_root)
         default_candidates = self._select_root_candidates("default")
@@ -60,6 +61,7 @@ class FocalStackDataset(Dataset):
         self.generate_focal_stack = generate_focal_stack
         self.simulator_kwargs = simulator_kwargs or {}
         self.depth_bounds = depth_bounds
+        self.resize_mode = resize_mode
 
         self.camera_defaults = {
             "f_number": 8.0,
@@ -437,9 +439,32 @@ class FocalStackDataset(Dataset):
     def _load_image(self, path: Path) -> torch.Tensor:
         with Image.open(path) as img:
             img = img.convert("RGB")
-            img = img.resize(self.image_size, Image.Resampling.LANCZOS)
+            img, _ = self._resize_with_mode(img, interpolation=Image.Resampling.LANCZOS)
             array = np.array(img, dtype=np.float32) / 255.0
         return torch.from_numpy(array).permute(2, 0, 1)
+
+    def _resize_with_mode(
+        self,
+        image: Image.Image,
+        interpolation: Image.Resampling,
+        pad_value: Union[int, float] = 0,
+    ) -> Tuple[Image.Image, Dict[str, int]]:
+        target_w, target_h = self.image_size
+        src_w, src_h = image.size
+        if self.resize_mode == "stretch":
+            return image.resize((target_w, target_h), interpolation), {"top": 0, "left": 0, "new_h": target_h, "new_w": target_w}
+        if self.resize_mode != "letterbox":
+            raise ValueError(f"Unsupported resize_mode: {self.resize_mode}")
+
+        scale = min(target_w / max(src_w, 1), target_h / max(src_h, 1))
+        new_w = max(1, int(round(src_w * scale)))
+        new_h = max(1, int(round(src_h * scale)))
+        resized = image.resize((new_w, new_h), interpolation)
+        canvas = Image.new(image.mode, (target_w, target_h), color=pad_value)
+        left = (target_w - new_w) // 2
+        top = (target_h - new_h) // 2
+        canvas.paste(resized, (left, top))
+        return canvas, {"top": top, "left": left, "new_h": new_h, "new_w": new_w}
 
     def _load_focal_stack(self, sample_info: Dict) -> torch.Tensor:
         dir_key = sample_info.get("focal_stack_dir") or sample_info.get("scene_path")
@@ -595,11 +620,20 @@ class FocalStackDataset(Dataset):
         depth = np.clip(depth, depth_min, depth_max)
 
         depth_image = Image.fromarray(depth)
-        depth_image = depth_image.resize(self.image_size, Image.Resampling.NEAREST)
+        depth_image, resize_meta = self._resize_with_mode(
+            depth_image, interpolation=Image.Resampling.NEAREST, pad_value=0.0
+        )
         depth_resized = np.array(depth_image, dtype=np.float32)
 
         mask_image = Image.fromarray((valid_mask.astype(np.uint8) * 255))
-        mask_image = mask_image.resize(self.image_size, Image.Resampling.NEAREST)
+        if self.resize_mode == "stretch":
+            mask_image = mask_image.resize(self.image_size, Image.Resampling.NEAREST)
+        else:
+            target_w, target_h = self.image_size
+            resized_mask = mask_image.resize((resize_meta["new_w"], resize_meta["new_h"]), Image.Resampling.NEAREST)
+            letterbox_mask = Image.new("L", (target_w, target_h), color=0)
+            letterbox_mask.paste(resized_mask, (resize_meta["left"], resize_meta["top"]))
+            mask_image = letterbox_mask
         mask_resized = np.array(mask_image) > 0
 
         masked_depth = depth_resized[mask_resized]

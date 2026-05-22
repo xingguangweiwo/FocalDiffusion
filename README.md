@@ -47,6 +47,7 @@ python script/inference.py --config configs/base.yaml --checkpoint <path_to_chec
 - `src/data/`: datasets, augmentations, simulation helpers.
 - `script/`: train / inference / evaluate entry points.
 - `configs/`: base and dataset-specific configs.
+- `tests/`: smoke and module tests.
 
 ## License
 See project license files and repository policy.
