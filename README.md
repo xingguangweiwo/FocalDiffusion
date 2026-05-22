@@ -1,6 +1,6 @@
 # FocalDiffusion: Focal-Stack-Conditioned Latent Diffusion for Joint All-in-Focus Reconstruction and Depth Estimation
 
-FocalDiffusion is a focal-stack-conditioned SD3/SD3.5 latent diffusion project for joint all-in-focus (AIF) reconstruction and depth/shape prediction.
+FocalDiffusion is a focal-stack-conditioned SD3/SD3.5 latent diffusion project for joint all-in-focus (AIF) reconstruction and depth prediction.
 
 - **Input:** focal stack + focus positions (`focus_distances`)
 - **Output:** AIF image + normalized depth/shape + uncertainty
