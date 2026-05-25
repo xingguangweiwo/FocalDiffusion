@@ -1,7 +1,7 @@
-# FocalDiffusion: Focal-Stack-Conditioned Latent Diffusion for Joint All-in-Focus Reconstruction and Depth Estimation
+# FSDiffusion: Zero-Shot Focal-Stack-Conditioned Latent Diffusion for Joint All-in-Focus Reconstruction and Depth Estimation
 
 ## Short Introduction
-FocalDiffusion is a focal-stack-conditioned latent diffusion framework for joint all-in-focus reconstruction and depth estimation. It uses images captured at different focus positions to predict a normalized shape/depth map, recover an all-in-focus image, and estimate uncertainty.
+FSDiffusion is a focal-stack-conditioned latent diffusion framework for joint all-in-focus reconstruction and depth estimation. It uses images captured at different focus positions to predict a normalized shape/depth map, recover an all-in-focus image, and estimate uncertainty.
 
 ## Highlights
 - SD3-based latent diffusion training with an **SD3 flow-matching objective**.
@@ -42,7 +42,7 @@ python script/inference.py --config configs/base.yaml --checkpoint <path_to_chec
 
 ## Repository Structure
 - `src/models/`: focal processors, attention blocks, decoders, camera modules.
-- `src/pipelines/`: FocalDiffusion pipeline and injected SD3 transformer.
+- `src/pipelines/`: FSDiffusion pipeline and injected SD3 transformer.
 - `src/training/`: trainer, losses, validation, optimization utilities.
 - `src/data/`: datasets, augmentations, simulation helpers.
 - `script/`: train / inference / evaluate entry points.
