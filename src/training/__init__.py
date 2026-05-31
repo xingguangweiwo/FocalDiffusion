@@ -1,4 +1,4 @@
-"""FocalDiffusion training utilities"""
+"""FSDiffusion training utilities"""
 
 from .trainer import FocalDiffusionTrainer
 from .losses import (

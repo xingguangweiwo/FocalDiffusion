@@ -1,5 +1,5 @@
 """
-Evaluation script for FocalDiffusion with normalized-shape aware metrics.
+Evaluation script for FSDiffusion with normalized-depth aware metrics.
 """
 
 import argparse
@@ -18,7 +18,7 @@ from src.utils.metrics import compute_metrics
 
 
 def evaluate(args):
-    warnings.warn("This script is deprecated and not aligned with the normalized-shape FocalDiffusion pipeline. Use trainer validation until this script is updated.", DeprecationWarning, stacklevel=2)
+    warnings.warn("This script is deprecated and not aligned with the normalized-depth FSDiffusion pipeline. Use trainer validation until this script is updated.", DeprecationWarning, stacklevel=2)
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -61,7 +61,7 @@ def evaluate(args):
                 output_type='pt',
             )
 
-        shape_norm = output.depth_map
+        depth_final_norm = output.depth_map
         sample_metrics = {}
 
         if depth_gt is not None and depth_range is not None:
@@ -69,16 +69,16 @@ def evaluate(args):
             depth_range = depth_range.to(args.device)
             depth_min = depth_range[:, 0].view(-1, 1, 1)
             depth_max = depth_range[:, 1].view(-1, 1, 1)
-            pred_metric = shape_norm * (depth_max - depth_min).clamp(min=1e-6) + depth_min
+            pred_metric = depth_final_norm * (depth_max - depth_min).clamp(min=1e-6) + depth_min
             sample_metrics.update(compute_metrics(pred_metric, depth_gt))
             sample_metrics["loss"] = F.l1_loss(pred_metric, depth_gt).item()
         elif depth_gt is not None:
             depth_gt = depth_gt.to(args.device)
-            if shape_norm.dim() == 3:
-                shape_norm = shape_norm.unsqueeze(1)
+            if depth_final_norm.dim() == 3:
+                depth_final_norm = depth_final_norm.unsqueeze(1)
             if depth_gt.dim() == 3:
                 depth_gt = depth_gt.unsqueeze(1)
-            sample_metrics["normalized_loss"] = F.l1_loss(shape_norm, depth_gt).item()
+            sample_metrics["normalized_loss"] = F.l1_loss(depth_final_norm, depth_gt).item()
 
         uncertainty = getattr(output, "uncertainty_final", None)
         if uncertainty is None:
@@ -108,7 +108,7 @@ def evaluate(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate FocalDiffusion model")
+    parser = argparse.ArgumentParser(description="Evaluate FSDiffusion model")
     parser.add_argument('--config', type=str, required=True, help='Config file')
     parser.add_argument('--checkpoint', type=str, required=True, help='Model checkpoint')
     parser.add_argument('--dataset', type=str, choices=['hypersim', 'virtual_kitti'], required=True)

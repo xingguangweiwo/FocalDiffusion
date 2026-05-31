@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Inference script for FocalDiffusion
+Inference script for FSDiffusion
 Processes focal stacks to generate depth maps and all-in-focus images
 """
 
@@ -84,14 +84,14 @@ def unpad_tensor_spatial(tensor: torch.Tensor, pad: List[int]) -> torch.Tensor:
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Run inference with FocalDiffusion model"
+        description="Run inference with FSDiffusion model"
     )
 
     # Model arguments
     parser.add_argument(
         '--model-path',
         type=str,
-        help='Path to trained FocalDiffusion checkpoint (required for meaningful inference)'
+        help='Path to trained FSDiffusion checkpoint (required for meaningful inference)'
     )
     parser.add_argument(
         '--base-model',
@@ -279,8 +279,9 @@ def process_focal_stack(
         "depth_final",
         "focus_entropy",
         "focus_reliability",
+        "uncertainty_disagreement",
         "uncertainty_final",
-        "focus_prob",
+        "focus_posterior",
     ):
         value = getattr(output, attr, None)
         if isinstance(value, torch.Tensor):
@@ -304,8 +305,9 @@ def process_focal_stack(
         'depth_final': getattr(output, 'depth_final', None),
         'focus_reliability': getattr(output, 'focus_reliability', None),
         'focus_entropy': getattr(output, 'focus_entropy', None),
+        'uncertainty_disagreement': getattr(output, 'uncertainty_disagreement', None),
         'uncertainty_final': getattr(output, 'uncertainty_final', None),
-        'focus_prob': getattr(output, 'focus_prob', None),
+        'focus_posterior': getattr(output, 'focus_posterior', None),
         'inference_time': inference_time,
         'focus_distances': focus_distances.tolist(),
         'original_size': size_meta["original_size"],
@@ -363,20 +365,21 @@ def save_results(results: Dict, output_dir: Path, args):
         uncertainty = _to_numpy_map(results['uncertainty'])
         np.save(output_dir / f"{name}_uncertainty.npy", uncertainty)
 
-    for key in ("depth_prior", "depth_focus", "focus_reliability", "focus_entropy"):
+    for key in ("depth_prior", "depth_focus", "depth_final", "focus_reliability", "focus_entropy"):
         if results.get(key) is not None:
             value = _to_numpy_map(results[key])
             np.save(output_dir / f"{name}_{key}.npy", value)
             save_depth_map(value, output_dir / f"{name}_{key}.png")
 
-    if results.get('uncertainty_final') is not None:
-        np.save(output_dir / f"{name}_uncertainty_final.npy", _to_numpy_map(results['uncertainty_final']))
+    for key in ('uncertainty_disagreement', 'uncertainty_final'):
+        if results.get(key) is not None:
+            np.save(output_dir / f"{name}_{key}.npy", _to_numpy_map(results[key]))
 
-    if args.save_focus_prob and results.get('focus_prob') is not None:
-        focus_prob = results['focus_prob']
-        if isinstance(focus_prob, torch.Tensor):
-            focus_prob = focus_prob.detach().cpu().numpy()
-        np.save(output_dir / f"{name}_focus_prob.npy", focus_prob)
+    if args.save_focus_prob and results.get('focus_posterior') is not None:
+        focus_posterior = results['focus_posterior']
+        if isinstance(focus_posterior, torch.Tensor):
+            focus_posterior = focus_posterior.detach().cpu().numpy()
+        np.save(output_dir / f"{name}_focus_prob.npy", focus_posterior)
 
     # Save metadata
     metadata = {
@@ -428,7 +431,7 @@ def main():
     dtype = dtype_map[args.dtype]
 
     if not args.model_path:
-        raise ValueError("A trained FocalDiffusion checkpoint is required.")
+        raise ValueError("A trained FSDiffusion checkpoint is required.")
     if not os.path.exists(args.model_path):
         raise ValueError(f"Model path does not exist: {args.model_path}")
 

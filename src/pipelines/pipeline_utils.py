@@ -1,5 +1,5 @@
 """
-Pipeline utilities for FocalDiffusion
+Pipeline utilities for FSDiffusion
 """
 
 import logging
@@ -71,7 +71,7 @@ def load_pipeline(
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
 ) -> 'FocalDiffusionPipeline':
-    """Load FocalDiffusion pipeline from checkpoint"""
+    """Load FSDiffusion pipeline from checkpoint"""
     from .focal_diffusion_pipeline import FocalDiffusionPipeline
     from ..utils.env_utils import ensure_sentencepiece_installed
 
@@ -97,8 +97,6 @@ def load_pipeline(
         pipeline.focal_evidence_head.load_state_dict(checkpoint['focal_evidence_head_state_dict'], strict=False)
     if 'dual_decoder_state_dict' in checkpoint:
         pipeline.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
-    if 'focus_consistency_critic_state_dict' in checkpoint and hasattr(pipeline, 'focus_consistency_critic'):
-        pipeline.focus_consistency_critic.load_state_dict(checkpoint['focus_consistency_critic_state_dict'], strict=False)
     if 'transformer_state_dict' in checkpoint:
         transformer_state_dict = checkpoint['transformer_state_dict']
         _ensure_transformer_lora(pipeline, checkpoint_config, transformer_state_dict)
@@ -113,7 +111,7 @@ def save_pipeline(
         save_path: Union[str, Path],
         save_full_model: bool = True,
 ) -> None:
-    """Save FocalDiffusion pipeline to checkpoint"""
+    """Save FSDiffusion pipeline to checkpoint"""
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -121,7 +119,6 @@ def save_pipeline(
         'focal_processor_state_dict': pipeline.focal_processor.state_dict(),
         'focal_evidence_head_state_dict': pipeline.focal_evidence_head.state_dict(),
         'dual_decoder_state_dict': pipeline.dual_decoder.state_dict(),
-        **({'focus_consistency_critic_state_dict': pipeline.focus_consistency_critic.state_dict()} if hasattr(pipeline, 'focus_consistency_critic') else {}),
     }
 
     if save_full_model:

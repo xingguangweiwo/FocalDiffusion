@@ -32,7 +32,6 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
 
     _ = epoch
     trainer.pipeline.eval()
-    trainer.focus_consistency_critic.eval()
     val_metrics = {
         'loss': 0.0,
         'abs_rel': 0.0,
@@ -61,11 +60,11 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
                 return_dict=True,
             )
 
-            shape_norm = output.depth_map
-            if shape_norm.dim() == 3:
-                shape_norm_for_loss = shape_norm.unsqueeze(1)
+            depth_final_norm = output.depth_map
+            if depth_final_norm.dim() == 3:
+                depth_final_norm_for_loss = depth_final_norm.unsqueeze(1)
             else:
-                shape_norm_for_loss = shape_norm
+                depth_final_norm_for_loss = depth_final_norm
             uncertainty = getattr(output, "uncertainty_final", None)
             if uncertainty is None:
                 uncertainty = getattr(output, "uncertainty", None)
@@ -82,17 +81,17 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
             depth_range = batch.get('depth_range')
             mask = batch.get('valid_mask')
             if mask is not None:
-                mask = mask.to(shape_norm.device)
+                mask = mask.to(depth_final_norm.device)
 
             has_metric_target = depth_gt is not None and depth_range is not None
             if has_metric_target:
-                depth_gt = depth_gt.to(shape_norm.device)
+                depth_gt = depth_gt.to(depth_final_norm.device)
                 if depth_gt.dim() == 3:
                     depth_gt = depth_gt.unsqueeze(1)
-                depth_range = depth_range.to(shape_norm.device)
+                depth_range = depth_range.to(depth_final_norm.device)
                 depth_min = depth_range[:, 0].view(-1, 1, 1, 1)
                 depth_max = depth_range[:, 1].view(-1, 1, 1, 1)
-                pred_metric = shape_norm_for_loss * (depth_max - depth_min).clamp(min=1e-6) + depth_min
+                pred_metric = depth_final_norm_for_loss * (depth_max - depth_min).clamp(min=1e-6) + depth_min
                 metrics = compute_metrics(pred_metric.squeeze(1), depth_gt.squeeze(1), mask=mask)
                 for key, value in metrics.items():
                     if key in ("abs_rel", "rmse"):
@@ -101,10 +100,10 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
                 val_loss = _masked_l1(pred_metric, depth_gt, mask)
                 val_metrics['loss'] += val_loss.item()
             elif depth_gt is not None and depth_range is None:
-                depth_gt = depth_gt.to(shape_norm.device)
+                depth_gt = depth_gt.to(depth_final_norm.device)
                 if depth_gt.dim() == 3:
                     depth_gt = depth_gt.unsqueeze(1)
-                val_metrics['normalized_loss'] += F.l1_loss(shape_norm_for_loss, depth_gt).item()
+                val_metrics['normalized_loss'] += F.l1_loss(depth_final_norm_for_loss, depth_gt).item()
 
             num_batches += 1
 

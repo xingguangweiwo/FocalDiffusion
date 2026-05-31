@@ -1,5 +1,5 @@
 """
-Training script for FocalDiffusion
+Training script for FSDiffusion
 Uses the FocalDiffusionTrainer class from src.training.trainer
 """
 
@@ -64,7 +64,7 @@ SUPPORTED_DATASET_TYPES = {
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Train FocalDiffusion model for depth and all-in-focus generation"
+        description="Train FSDiffusion model for depth and all-in-focus generation"
     )
 
     # Required arguments
@@ -554,7 +554,7 @@ def main():
         return
 
     # Create trainer
-    logger.info("Initializing FocalDiffusion trainer...")
+    logger.info("Initializing FSDiffusion trainer...")
     try:
         from src.training.trainer import FocalDiffusionTrainer  # Lazy import to avoid heavy deps during dry-runs
     except ModuleNotFoundError as exc:
@@ -579,7 +579,7 @@ def main():
 
     # Start training
     logger.info("=" * 50)
-    logger.info("Starting FocalDiffusion training")
+    logger.info("Starting FSDiffusion training")
     logger.info(f"Model: {config['model']['base_model_id']}")
     logger.info(f"Dataset: {config['data']['dataset_type']}")
     logger.info(f"Batch size: {config['training']['batch_size']}")

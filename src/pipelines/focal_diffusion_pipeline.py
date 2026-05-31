@@ -55,15 +55,15 @@ class FocalDiffusionOutput(BaseOutput):
     all_in_focus_image: Union[torch.Tensor, Image.Image]
     depth_colored: Optional[Image.Image] = None
     uncertainty: Optional[torch.Tensor] = None
-    focal_features: Optional[Dict[str, torch.Tensor]] = None
     depth_prior: Optional[torch.Tensor] = None
     depth_focus: Optional[torch.Tensor] = None
     depth_final: Optional[torch.Tensor] = None
-    focus_prob: Optional[torch.Tensor] = None
+    focus_posterior: Optional[torch.Tensor] = None
     focus_entropy: Optional[torch.Tensor] = None
     focus_reliability: Optional[torch.Tensor] = None
     uncertainty_decoder: Optional[torch.Tensor] = None
     uncertainty_focus: Optional[torch.Tensor] = None
+    uncertainty_disagreement: Optional[torch.Tensor] = None
     uncertainty_final: Optional[torch.Tensor] = None
 
 
@@ -567,29 +567,29 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
         decoder_outputs = self.dual_decoder(latents)
-        depth_prior = decoder_outputs["shape_norm"]
+        depth_prior_norm = decoder_outputs["depth_prior_norm"]
         uncertainty_decoder = decoder_outputs["uncertainty"]
         rgb_latents = decoder_outputs["aif_latents"]
 
-        depth_prior = F.interpolate(depth_prior, size=(height, width), mode="bilinear", align_corners=False)
+        depth_prior_norm = F.interpolate(depth_prior_norm, size=(height, width), mode="bilinear", align_corners=False)
         uncertainty_decoder = F.interpolate(uncertainty_decoder, size=(height, width), mode="bilinear", align_corners=False)
-        depth_focus = F.interpolate(focal_evidence["depth_focus"], size=(height, width), mode="bilinear", align_corners=False)
+        depth_focus_norm = F.interpolate(focal_evidence["depth_focus_norm"], size=(height, width), mode="bilinear", align_corners=False)
         focus_reliability = F.interpolate(focal_evidence["focus_reliability"], size=(height, width), mode="bilinear", align_corners=False)
         focus_entropy = F.interpolate(focal_evidence["focus_entropy"], size=(height, width), mode="bilinear", align_corners=False)
-        focus_prob = focal_evidence["focus_prob"]
-        if depth_focus.shape[0] != depth_prior.shape[0]:
-            repeat_factor = depth_prior.shape[0] // depth_focus.shape[0]
-            depth_focus = depth_focus.repeat_interleave(repeat_factor, dim=0)
+        focus_posterior = focal_evidence["focus_posterior"]
+        if depth_focus_norm.shape[0] != depth_prior_norm.shape[0]:
+            repeat_factor = depth_prior_norm.shape[0] // depth_focus_norm.shape[0]
+            depth_focus_norm = depth_focus_norm.repeat_interleave(repeat_factor, dim=0)
             focus_reliability = focus_reliability.repeat_interleave(repeat_factor, dim=0)
             focus_entropy = focus_entropy.repeat_interleave(repeat_factor, dim=0)
-            focus_prob = focus_prob.repeat_interleave(repeat_factor, dim=0)
+            focus_posterior = focus_posterior.repeat_interleave(repeat_factor, dim=0)
 
-        depth_final = focus_reliability * depth_focus + (1.0 - focus_reliability) * depth_prior
-        depth_map = depth_final.squeeze(1)
+        depth_final_norm = focus_reliability * depth_focus_norm + (1.0 - focus_reliability) * depth_prior_norm
+        depth_map = depth_final_norm.squeeze(1)
         uncertainty_focus = focus_entropy
-        uncertainty_disagree = torch.abs(depth_focus - depth_prior)
-        uncertainty_physics = 0.5 * uncertainty_focus + 0.5 * uncertainty_disagree
-        uncertainty_final = (0.5 * uncertainty_decoder + 0.5 * uncertainty_physics).clamp(0.0, 1.0)
+        uncertainty_disagreement = torch.abs(depth_focus_norm - depth_prior_norm)
+        uncertainty_physical = 0.5 * uncertainty_focus + 0.5 * uncertainty_disagreement
+        uncertainty_final = (0.5 * uncertainty_decoder + 0.5 * uncertainty_physical).clamp(0.0, 1.0)
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
@@ -609,16 +609,16 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             depth_map=depth_map,
             all_in_focus_image=result,
             depth_colored=depth_color,
-            focal_features=focal_features,
             uncertainty=uncertainty_final.squeeze(1),
-            depth_prior=depth_prior.squeeze(1),
-            depth_focus=depth_focus.squeeze(1),
-            depth_final=depth_final.squeeze(1),
-            focus_prob=focus_prob,
+            depth_prior=depth_prior_norm.squeeze(1),
+            depth_focus=depth_focus_norm.squeeze(1),
+            depth_final=depth_final_norm.squeeze(1),
+            focus_posterior=focus_posterior,
             focus_entropy=focus_entropy.squeeze(1),
             focus_reliability=focus_reliability.squeeze(1),
             uncertainty_decoder=uncertainty_decoder.squeeze(1),
             uncertainty_focus=uncertainty_focus.squeeze(1),
+            uncertainty_disagreement=uncertainty_disagreement.squeeze(1),
             uncertainty_final=uncertainty_final.squeeze(1),
         )
 

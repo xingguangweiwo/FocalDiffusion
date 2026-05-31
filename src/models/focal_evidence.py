@@ -86,18 +86,22 @@ class FocalEvidenceHead(nn.Module):
 
         temperature = max(float(self.temperature), self.eps)
         focus_logits = self.score_head(features).reshape(B, N, H, W)
-        focus_prob = torch.softmax(focus_logits / temperature, dim=1)
-        depth_focus = (focus_prob * tau[:, :, None, None]).sum(dim=1, keepdim=True)
+        focus_posterior = torch.softmax(focus_logits / temperature, dim=1)
+        depth_focus_norm = (focus_posterior * tau[:, :, None, None]).sum(dim=1, keepdim=True)
 
-        entropy = -(focus_prob * torch.log(focus_prob + self.eps)).sum(dim=1, keepdim=True)
+        entropy = -(focus_posterior * torch.log(focus_posterior + self.eps)).sum(dim=1, keepdim=True)
         entropy = (entropy / math.log(max(N, 2))).clamp(0.0, 1.0)
         focus_reliability = (1.0 - entropy).clamp(0.0, 1.0)
 
         return {
             "focus_logits": focus_logits,
-            "focus_prob": focus_prob,
-            "depth_focus": depth_focus,
+            "focus_posterior": focus_posterior,
+            "depth_focus_norm": depth_focus_norm,
             "focus_entropy": entropy,
             "focus_reliability": focus_reliability,
+            "focus_coordinates": tau,
+            # Compatibility aliases for older scripts/tests.
+            "focus_prob": focus_posterior,
+            "depth_focus": depth_focus_norm,
             "tau": tau,
         }

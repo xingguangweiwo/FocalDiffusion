@@ -68,7 +68,7 @@ class FocalStackProcessor(nn.Module):
         self,
         feature_dim: int = 512,
         num_scales: int = 4,
-        max_sequence_length: int = 20,
+        max_sequence_length: int = 100,
         dropout: float = 0.1,
         focal_encoder_type: str = "focal_sweep",
         patch_size: int = 8,

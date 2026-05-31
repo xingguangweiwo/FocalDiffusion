@@ -1,4 +1,4 @@
-"""FocalDiffusion pipelines."""
+"""FSDiffusion pipelines."""
 
 from .focal_diffusion_pipeline import (
     FocalDiffusionOutput,
