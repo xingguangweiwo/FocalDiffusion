@@ -11,6 +11,7 @@ FSDiffusion is a focal-stack-conditioned latent diffusion framework for joint al
 
 ## Important Notes
 - A trained checkpoint is required for practical inference quality.
+- Here, zero-shot means inference on unseen focal-stack datasets without test-set fine-tuning, not training-free inference without a learned checkpoint.
 - Depth output is normalized by default.
 - Metric depth/height requires dataset/device calibration (e.g., depth range).
 
@@ -35,10 +36,12 @@ python script/inference.py --model-path <path_to_checkpoint> --input <focal_stac
 ```
 
 ## Method Overview
-1. Encode focal stack features with focal processor modules.
+FSDiffusion now uses a Focal Evidence Posterior module that explicitly predicts a per-pixel distribution over focus planes. The posterior is converted into a focus-derived depth by soft-argmax and into observability by entropy. The final depth is a physics-gated fusion of the focus-derived depth and the diffusion decoder prior. This differs from direct stack-attention depth prediction because the model exposes the focal response curve and uncertainty, preserving the algorithmic structure of classical focus measurement.
+
+1. Encode focal stack evidence with a local Focal Evidence Posterior head and focal-sweep conditioning modules.
 2. Condition SD3 transformer denoising with focal features.
-3. Decode latent outputs into normalized shape, AIF latents, and uncertainty.
-4. Apply supervised/semi-supervised objectives plus focus-consistency diagnostics.
+3. Decode latent outputs into a normalized depth prior, AIF latents, and decoder uncertainty.
+4. Fuse the focus-derived depth and decoder prior with entropy-based reliability, while keeping the old focus critic only as an optional ablation.
 
 ## Repository Structure
 - `src/models/`: focal processors, attention blocks, decoders, camera modules.

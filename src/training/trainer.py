@@ -200,6 +200,7 @@ class FocalDiffusionTrainer:
         # Import here to avoid circular imports
         from ..pipelines import FocalDiffusionPipeline
         from ..models import FocalStackProcessor
+        from ..models.focal_evidence import FocalEvidenceHead
         from ..models.dual_decoder import DualOutputDecoder
 
         # Load base SD3.5 pipeline
@@ -280,7 +281,7 @@ class FocalDiffusionTrainer:
 
         self.focal_processor = FocalStackProcessor(
             feature_dim=self.config['model']['feature_dim'],
-            num_scales=self.config['model']['num_scales'],
+            num_scales=self.config['model'].get('num_scales', 1),
             max_sequence_length=self.config['model']['max_focal_stack_size'],
             focal_encoder_type=self.config['model'].get('focal_encoder_type','focal_sweep'),
             patch_size=self.config['model'].get('patch_size',8),
@@ -288,7 +289,10 @@ class FocalDiffusionTrainer:
             focal_attention_depth=self.config['model'].get('focal_attention_depth',2),
         )
 
-        self.camera_encoder = None
+        self.focal_evidence_head = FocalEvidenceHead(
+            hidden=self.config["model"].get("focal_evidence_hidden", 48),
+            temperature=self.config["model"].get("focal_evidence_temperature", 0.07),
+        )
 
         self.dual_decoder = DualOutputDecoder(
             in_channels=pipe.vae.config.latent_channels,
@@ -310,7 +314,7 @@ class FocalDiffusionTrainer:
             transformer=pipe.transformer,
             scheduler=pipe.scheduler,
             focal_processor=self.focal_processor,
-            camera_encoder=self.camera_encoder,
+            focal_evidence_head=self.focal_evidence_head,
             dual_decoder=self.dual_decoder,
         )
 
@@ -322,7 +326,7 @@ class FocalDiffusionTrainer:
 
         # Refresh local handles in case the pipeline replaced any modules internally.
         self.focal_processor = self.pipeline.focal_processor
-        self.camera_encoder = self.pipeline.camera_encoder
+        self.focal_evidence_head = self.pipeline.focal_evidence_head
         self.dual_decoder = self.pipeline.dual_decoder
         self.focus_consistency_critic = self.focus_consistency_critic.to(target_device)
 
@@ -371,10 +375,9 @@ class FocalDiffusionTrainer:
 
         # Always train focal components
         self.focal_processor.requires_grad_(True)
-        if self.camera_encoder is not None and self.config['model'].get('use_camera_encoder', False):
-            self.camera_encoder.requires_grad_(True)
+        self.focal_evidence_head.requires_grad_(True)
         self.dual_decoder.requires_grad_(True)
-        self.focus_consistency_critic.requires_grad_(self.config['training'].get('train_focus_critic', True))
+        self.focus_consistency_critic.requires_grad_(self.config['training'].get('train_focus_critic', False))
 
         # Log trainable parameters
         pipeline_params = list(self._iter_pipeline_parameters())
@@ -632,41 +635,13 @@ class FocalDiffusionTrainer:
                 if depth_mask is not None:
                     depth_mask = depth_mask.to(device=device)
 
-                camera_params = batch.get('camera_params') if self.config['model'].get('use_camera_encoder', False) else None
-
-                if camera_params is not None:
-                    batch_size = focal_stack.shape[0]
-                    converted_params = {}
-                    for key, value in camera_params.items():
-                        if isinstance(value, torch.Tensor):
-                            converted_params[key] = value.to(device=device, dtype=focal_stack.dtype)
-                        else:
-                            converted_params[key] = torch.full(
-                                (batch_size,),
-                                float(value),
-                                device=device,
-                                dtype=focal_stack.dtype,
-                            )
-                    camera_params = converted_params
-
                 # Normalize inputs
                 if focal_stack.min() >= 0 and focal_stack.max() <= 1:
                     focal_stack = (focal_stack * 2.0) - 1.0
                 rgb_target = (rgb_gt * 2.0) - 1.0 if rgb_gt is not None else None
 
-                # Extract focal features and explicitly attach camera metadata embeddings.
-                focal_features = self.focal_processor(
-                    focal_stack,
-                    focus_distances,
-                    camera_params
-                )
-
-                if camera_params is not None and self.camera_encoder is not None:
-                    focal_features['camera_features'] = self.camera_encoder(
-                        camera_params,
-                        mode="relative",
-                        focus_distances=focus_distances,
-                    )
+                # Extract focal features for SD3 conditioning.
+                focal_features = self.focal_processor(focal_stack, focus_distances)
 
                 focal_features = {
                     key: value.to(self.pipeline.transformer.dtype)
@@ -726,6 +701,16 @@ class FocalDiffusionTrainer:
                     decoder_outputs = self.dual_decoder(clean_latent_pred)
                     shape_norm = decoder_outputs["shape_norm"]
                     uncertainty = decoder_outputs["uncertainty"]
+                    focal_evidence = self.focal_evidence_head(focal_stack.float(), focus_distances.float())
+                    depth_focus = F.interpolate(focal_evidence["depth_focus"], size=shape_norm.shape[-2:], mode="bilinear", align_corners=False)
+                    focus_reliability = F.interpolate(focal_evidence["focus_reliability"], size=shape_norm.shape[-2:], mode="bilinear", align_corners=False)
+                    focus_entropy = F.interpolate(focal_evidence["focus_entropy"], size=shape_norm.shape[-2:], mode="bilinear", align_corners=False)
+                    depth_prior = shape_norm
+                    depth_final = focus_reliability * depth_focus + (1.0 - focus_reliability) * depth_prior
+                    uncertainty_decoder = uncertainty
+                    uncertainty_disagree = torch.abs(depth_focus - depth_prior)
+                    uncertainty_focus = focus_entropy
+                    uncertainty_final = (0.5 * uncertainty_decoder + 0.25 * uncertainty_focus + 0.25 * uncertainty_disagree).clamp(0, 1)
                     rgb_latent_pred = decoder_outputs["aif_latents"]
                     rgb_recon = self.pipeline.vae.decode(
                         rgb_latent_pred / self.pipeline.vae.config.scaling_factor,
@@ -740,18 +725,22 @@ class FocalDiffusionTrainer:
                     rgb_recon = rgb_recon.float()
                     rgb_target_fp32 = rgb_target.float()
 
-                    # Compute losses
-                    critic_outputs = self.focus_consistency_critic(
-                        focal_stack.float(), focus_distances.float(), shape_norm.float().detach()
-                    )
-                    critic_warmup_steps = int(self.config['training'].get('critic_warmup_steps', 0))
-                    if (global_step + step) < critic_warmup_steps:
-                        critic_generator_outputs = None
+                    # Compute losses; the legacy focus critic is optional ablation only.
+                    if self.config['training'].get('train_focus_critic', False):
+                        critic_outputs = self.focus_consistency_critic(
+                            focal_stack.float(), focus_distances.float(), depth_final.float().detach()
+                        )
+                        critic_warmup_steps = int(self.config['training'].get('critic_warmup_steps', 0))
+                        if (global_step + step) < critic_warmup_steps:
+                            critic_generator_outputs = None
+                        else:
+                            with temporarily_freeze(self.focus_consistency_critic):
+                                critic_generator_outputs = self.focus_consistency_critic(
+                                    focal_stack.float(), focus_distances.float(), depth_final.float()
+                                )
                     else:
-                        with temporarily_freeze(self.focus_consistency_critic):
-                            critic_generator_outputs = self.focus_consistency_critic(
-                                focal_stack.float(), focus_distances.float(), shape_norm.float()
-                            )
+                        critic_outputs = None
+                        critic_generator_outputs = None
                     loss_dict = loss_fn(
                         diffusion_pred=diffusion_pred,
                         diffusion_target=diffusion_target,
@@ -759,8 +748,15 @@ class FocalDiffusionTrainer:
                         depth_mask=depth_mask,
                         rgb_pred=rgb_recon,
                         rgb_target=rgb_target_fp32,
-                        shape_norm=shape_norm.float(),
-                        uncertainty=uncertainty.float(),
+                        shape_norm=depth_final.float(),
+                        depth_prior=depth_prior.float(),
+                        depth_focus=depth_focus.float(),
+                        depth_final=depth_final.float(),
+                        uncertainty=uncertainty_final.float(),
+                        focus_prob=focal_evidence["focus_prob"].float(),
+                        focus_entropy=focus_entropy.float(),
+                        focus_reliability=focus_reliability.float(),
+                        focus_distances=focus_distances.float(),
                         focal_stack=focal_stack.float(),
                         critic_outputs=critic_outputs,
                         critic_generator_outputs=critic_generator_outputs,
@@ -807,7 +803,10 @@ class FocalDiffusionTrainer:
                         self.accelerator.log({
                             'train_loss_step': loss.item(),
                             'learning_rate': self.lr_scheduler.get_last_lr()[0],
-                            **{f'train_{k}': v.item() for k, v in loss_dict.items() if k != 'total' and isinstance(v, torch.Tensor)}
+                            **{f'train_{k}': v.item() for k, v in loss_dict.items() if k != 'total' and isinstance(v, torch.Tensor)},
+                            'train_focus_entropy_mean': focus_entropy.mean().item(),
+                            'train_focus_reliability_mean': focus_reliability.mean().item(),
+                            'train_depth_prior_focus_disagreement': torch.abs(depth_focus - depth_prior).mean().item(),
                         }, step=global_step + step)
 
         if effective_steps == 0:

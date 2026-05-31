@@ -93,8 +93,8 @@ def load_pipeline(
     # Load component weights
     if 'focal_processor_state_dict' in checkpoint:
         pipeline.focal_processor.load_state_dict(checkpoint['focal_processor_state_dict'])
-    if getattr(pipeline, 'camera_encoder', None) is not None and 'camera_encoder_state_dict' in checkpoint:
-        pipeline.camera_encoder.load_state_dict(checkpoint['camera_encoder_state_dict'], strict=False)
+    if 'focal_evidence_head_state_dict' in checkpoint:
+        pipeline.focal_evidence_head.load_state_dict(checkpoint['focal_evidence_head_state_dict'], strict=False)
     if 'dual_decoder_state_dict' in checkpoint:
         pipeline.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
     if 'focus_consistency_critic_state_dict' in checkpoint and hasattr(pipeline, 'focus_consistency_critic'):
@@ -119,7 +119,7 @@ def save_pipeline(
 
     checkpoint = {
         'focal_processor_state_dict': pipeline.focal_processor.state_dict(),
-        **({'camera_encoder_state_dict': pipeline.camera_encoder.state_dict()} if getattr(pipeline, 'camera_encoder', None) is not None else {}),
+        'focal_evidence_head_state_dict': pipeline.focal_evidence_head.state_dict(),
         'dual_decoder_state_dict': pipeline.dual_decoder.state_dict(),
         **({'focus_consistency_critic_state_dict': pipeline.focus_consistency_critic.state_dict()} if hasattr(pipeline, 'focus_consistency_critic') else {}),
     }

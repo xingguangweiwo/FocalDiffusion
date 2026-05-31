@@ -43,7 +43,6 @@ def evaluate(args):
         augmentation=False,
     )
 
-    use_camera_encoder = config.get("model", {}).get("use_camera_encoder", False)
     all_metrics = []
 
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
@@ -54,13 +53,10 @@ def evaluate(args):
         focus_distances = batch['focus_distances'].to(args.device)
         depth_gt = batch.get('depth')
         depth_range = batch.get('depth_range')
-        camera_params = batch.get('camera_params') if use_camera_encoder else None
-
         with torch.no_grad():
             output = pipeline(
                 focal_stack=focal_stack,
                 focus_distances=focus_distances,
-                camera_params=camera_params,
                 num_inference_steps=args.num_inference_steps,
                 output_type='pt',
             )
@@ -84,7 +80,14 @@ def evaluate(args):
                 depth_gt = depth_gt.unsqueeze(1)
             sample_metrics["normalized_loss"] = F.l1_loss(shape_norm, depth_gt).item()
 
-        sample_metrics["uncertainty_mean"] = float(output.uncertainty.mean().item()) if output.uncertainty is not None else 0.0
+        uncertainty = getattr(output, "uncertainty_final", None)
+        if uncertainty is None:
+            uncertainty = output.uncertainty
+        sample_metrics["uncertainty_mean"] = float(uncertainty.mean().item()) if uncertainty is not None else 0.0
+        sample_metrics["focus_entropy_mean"] = float(output.focus_entropy.mean().item()) if output.focus_entropy is not None else 0.0
+        sample_metrics["focus_reliability_mean"] = float(output.focus_reliability.mean().item()) if output.focus_reliability is not None else 0.0
+        if output.depth_prior is not None and output.depth_focus is not None:
+            sample_metrics["depth_prior_focus_disagreement"] = float(torch.abs(output.depth_prior - output.depth_focus).mean().item())
         all_metrics.append(sample_metrics)
 
     keys = sorted({k for m in all_metrics for k in m.keys()})
