@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import logging
 import math
@@ -54,7 +54,6 @@ class FocalDiffusionOutput(BaseOutput):
     all_in_focus_image: Union[torch.Tensor, Image.Image]
     depth_colored: Optional[Image.Image] = None
     uncertainty: Optional[torch.Tensor] = None
-    attention_maps: Optional[Dict[str, torch.Tensor]] = None
     focal_features: Optional[Dict[str, torch.Tensor]] = None
 
 
@@ -262,19 +261,6 @@ class FocalInjectedSD3Transformer(nn.Module):
         hidden_seq = hidden_seq + scale * attn(norm(hidden_seq), cond_seq)
         return hidden_seq.transpose(1, 2).reshape_as(hidden_states)
 
-
-def duplicate_focal_features_for_cfg(focal_features: Mapping[str, Any]) -> Dict[str, Any]:
-    """Duplicate batch-first focal feature tensors for classifier-free guidance."""
-
-    duplicated: Dict[str, Any] = {}
-    for key, value in focal_features.items():
-        if isinstance(value, torch.Tensor):
-            duplicated[key] = torch.cat([value, value], dim=0)
-        elif isinstance(value, Mapping):
-            duplicated[key] = duplicate_focal_features_for_cfg(value)
-        else:
-            duplicated[key] = value
-    return duplicated
 
 
 class FocalDiffusionPipeline(StableDiffusion3Pipeline):
@@ -648,7 +634,6 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             all_in_focus_image=result,
             depth_colored=depth_color,
             focal_features=focal_features,
-            attention_maps=None,
             uncertainty=1.0 - confidence_map.squeeze(1),
         )
 
@@ -663,13 +648,6 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         out_w = int(math.ceil(width / divisor) * divisor)
         return out_h, out_w
 
-
-    def _repeat_focal_features(self, value: Any, repeats: int) -> Any:
-        if isinstance(value, torch.Tensor):
-            return value.repeat_interleave(repeats, dim=0)
-        if isinstance(value, dict):
-            return {key: self._repeat_focal_features(item, repeats) for key, item in value.items()}
-        return value
 
     def _ensure_tensor_stack(self, stack: Union[torch.Tensor, List[Image.Image]]) -> torch.Tensor:
         if isinstance(stack, torch.Tensor):

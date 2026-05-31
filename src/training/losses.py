@@ -95,17 +95,26 @@ class FocalDiffusionLoss(nn.Module):
         self.uncertainty_weight=uncertainty_weight; self.aif_highpass_weight=aif_highpass_weight
         self.supervision_mode = supervision_mode
 
-    def forward(self, diffusion_pred, diffusion_target, depth_pred=None, depth_target=None, rgb_pred=None, rgb_target=None, shape_norm=None, uncertainty=None, focal_stack=None, critic_outputs=None, critic_generator_outputs=None, depth_mask=None, focal_features=None, confidence_map=None, depth_range=None, **kwargs):
+    def forward(
+        self,
+        diffusion_pred,
+        diffusion_target,
+        depth_target=None,
+        rgb_pred=None,
+        rgb_target=None,
+        shape_norm=None,
+        uncertainty=None,
+        focal_stack=None,
+        critic_outputs=None,
+        critic_generator_outputs=None,
+        depth_mask=None,
+        depth_range=None,
+    ):
         supervised_losses = {}
         critic_losses = {}
         generator_losses = {'loss_fm': F.mse_loss(diffusion_pred, diffusion_target)}
 
-        if self.supervision_mode == "self_supervised":
-            enable_supervised = False
-        elif self.supervision_mode == "semi_supervised":
-            enable_supervised = True
-        else:
-            enable_supervised = True
+        enable_supervised = self.supervision_mode in {"supervised", "semi_supervised"}
 
         if enable_supervised and depth_target is not None and shape_norm is not None and depth_range is not None:
             shape_norm_resized = F.interpolate(shape_norm, size=depth_target.shape[-2:], mode='bilinear', align_corners=False)
@@ -143,8 +152,6 @@ class FocalDiffusionLoss(nn.Module):
                 hp_pred=rp-F.avg_pool2d(rp,5,1,2); hp_phys=aif_phys-F.avg_pool2d(aif_phys,5,1,2)
                 generator_losses['loss_aif_highpass']=F.l1_loss(hp_pred,hp_phys)
 
-        if self.supervision_mode == "self_supervised":
-            supervised_losses = {}
 
         total=torch.zeros_like(generator_losses['loss_fm'])
         total = total + self.diffusion_weight * generator_losses['loss_fm']
