@@ -66,10 +66,6 @@ training:
     transformer: attention_only
   lora_rank: 8
   lora_alpha: 16
-  use_focus_consistency: true
-  use_tau_contrast: true
-  use_aif_highpass: true
-  use_focus_consistency_critic: true
   train_focus_critic: true
   critic_warmup_steps: 500
   supervision_mode: supervised

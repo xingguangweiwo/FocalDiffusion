@@ -11,6 +11,22 @@ from tqdm import tqdm
 from ..utils.metrics import compute_metrics
 
 
+def _masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return F.l1_loss(pred, target)
+
+    mask = mask.to(device=pred.device, dtype=torch.bool)
+    if pred.dim() == mask.dim() + 1 and pred.shape[1] == 1:
+        mask = mask.unsqueeze(1)
+    elif mask.dim() == pred.dim() + 1 and mask.shape[1] == 1:
+        mask = mask.squeeze(1)
+    if mask.shape != pred.shape:
+        mask = mask.expand_as(pred)
+    if not mask.any():
+        return pred.new_tensor(0.0)
+
+    return F.l1_loss(pred[mask], target[mask])
+
 def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, float]:
     """Run one validation epoch for the provided trainer instance."""
 
@@ -95,7 +111,7 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
                     if key in ("abs_rel", "rmse"):
                         val_metrics[key] += value
                 metric_depth_batches += 1
-                val_loss = F.l1_loss(pred_metric[mask], depth_gt[mask]) if mask is not None else F.l1_loss(pred_metric, depth_gt)
+                val_loss = _masked_l1(pred_metric, depth_gt, mask)
                 val_metrics['loss'] += val_loss.item()
             elif depth_gt is not None and depth_range is None:
                 depth_gt = depth_gt.to(shape_norm.device)
@@ -104,6 +120,9 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
                 val_metrics['normalized_loss'] += F.l1_loss(shape_norm_for_loss, depth_gt).item()
 
             num_batches += 1
+
+    if num_batches == 0:
+        return val_metrics
 
     for key in val_metrics:
         if key in ("abs_rel", "rmse"):

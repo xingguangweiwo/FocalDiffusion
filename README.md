@@ -31,7 +31,7 @@ python script/train.py --config configs/base.yaml
 
 ## Inference
 ```bash
-python script/inference.py --config configs/base.yaml --checkpoint <path_to_checkpoint>
+python script/inference.py --config configs/base.yaml --model-path <path_to_checkpoint> --input <focal_stack_dir_or_images> --output <output_dir>
 ```
 
 ## Method Overview

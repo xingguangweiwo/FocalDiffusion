@@ -167,8 +167,3 @@ class FocalDiffusionLoss(nn.Module):
             'critic_losses': critic_losses,
             'supervised_losses': supervised_losses,
         }
-
-
-class DepthLoss(nn.Module):
-    def forward(self, pred, target, mask=None):
-        return F.l1_loss(pred, target)

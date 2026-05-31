@@ -12,7 +12,7 @@ from typing import Dict, Optional
 class CameraInvariantEncoder(nn.Module):
     """
     Encodes camera parameters into invariant representations
-    Supports three modes: relative, normalized, and learned
+    Supports two modes: relative and normalized
     """
 
     def __init__(
@@ -40,7 +40,6 @@ class CameraInvariantEncoder(nn.Module):
         # Parameter encoders
         self.focal_length_encoder = self._build_encoder("focal_length")
         self.aperture_encoder = self._build_encoder("aperture")
-        self.sensor_encoder = self._build_encoder("sensor")
 
         # Relative relationship encoder.  Relative mode concatenates five
         # Fourier-embedded groups: hyperfocal ratio, aperture, near DoF, far DoF,
@@ -71,7 +70,7 @@ class CameraInvariantEncoder(nn.Module):
 
         Args:
             camera_params: Dict with 'focal_length', 'aperture', 'sensor_size'
-            mode: "relative", "normalized", or "learned"
+            mode: "relative" or "normalized"
             focus_distances: [B, N] for relative encoding
 
         Returns:
@@ -81,8 +80,6 @@ class CameraInvariantEncoder(nn.Module):
             return self.encode_relative(camera_params, focus_distances)
         elif mode == "normalized":
             return self.encode_normalized(camera_params)
-        elif mode == "learned":
-            return self.encode_learned(camera_params, focus_distances)
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -193,44 +190,6 @@ class CameraInvariantEncoder(nn.Module):
         combined = focal_feat + aperture_feat
 
         return combined
-
-    def encode_learned(
-            self,
-            camera_params: Dict[str, torch.Tensor],
-            focus_distances: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Fully learned encoding with minimal inductive bias
-        """
-        # Stack all parameters
-        focal_length = camera_params['focal_length']
-        aperture = camera_params['aperture']
-
-        if focal_length.dim() == 0:
-            focal_length = focal_length.unsqueeze(0)
-        if aperture.dim() == 0:
-            aperture = aperture.unsqueeze(0)
-
-        # Create feature vector
-        features = torch.cat([
-            focal_length.unsqueeze(-1),
-            aperture.unsqueeze(-1),
-            focus_distances.mean(dim=1, keepdim=True),
-            focus_distances.std(dim=1, keepdim=True),
-            focus_distances.min(dim=1, keepdim=True)[0],
-            focus_distances.max(dim=1, keepdim=True)[0],
-        ], dim=-1)
-
-        # Encode with all three encoders
-        focal_feat = self.focal_length_encoder(features)
-        aperture_feat = self.aperture_encoder(features)
-        sensor_feat = self.sensor_encoder(features)
-
-        # Combine
-        combined = torch.cat([focal_feat, aperture_feat, sensor_feat], dim=-1)
-        output = self.relation_encoder(combined)
-
-        return output
 
     def _build_encoder(self, name: str) -> nn.Module:
         """Build a parameter-specific encoder"""
