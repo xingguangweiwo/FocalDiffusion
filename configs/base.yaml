@@ -88,6 +88,9 @@ losses:
   diffusion_weight: 1.0
   depth_weight: 1.0
   rgb_weight: 0.5
+  # Legacy trainer compatibility key. Current FocalDiffusionLoss ignores it.
+  # Remove this only after removing the matching trainer argument.
+  consistency_weight: 0.0
   focus_energy_weight: 0.5
   tau_contrast_weight: 0.2
   stack_contrast_weight: 0.2
