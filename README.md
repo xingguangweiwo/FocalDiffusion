@@ -1,4 +1,4 @@
-# FSDiffusion: Zero-Shot Focal-Stack-Conditioned Latent Diffusion for Joint All-in-Focus Reconstruction and Depth Estimation
+# FSDiffusion: Reliable Zero-Shot Focal-Stack Diffusion via Focal Evidence
 
 ## Short Introduction
 FSDiffusion is a focal-stack-conditioned latent diffusion framework for joint all-in-focus reconstruction and depth estimation. It uses images captured at different focus positions to predict a normalized shape/depth map, recover an all-in-focus image, and estimate uncertainty.
