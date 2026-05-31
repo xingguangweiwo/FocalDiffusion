@@ -42,6 +42,7 @@ from transformers import (
 from ..models.focal_attention import FocalCrossAttention
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
+from ..models.focal_evidence import FocalEvidenceHead
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +56,21 @@ class FocalDiffusionOutput(BaseOutput):
     depth_colored: Optional[Image.Image] = None
     uncertainty: Optional[torch.Tensor] = None
     focal_features: Optional[Dict[str, torch.Tensor]] = None
+    depth_prior: Optional[torch.Tensor] = None
+    depth_focus: Optional[torch.Tensor] = None
+    depth_final: Optional[torch.Tensor] = None
+    focus_prob: Optional[torch.Tensor] = None
+    focus_entropy: Optional[torch.Tensor] = None
+    focus_reliability: Optional[torch.Tensor] = None
+    uncertainty_decoder: Optional[torch.Tensor] = None
+    uncertainty_focus: Optional[torch.Tensor] = None
+    uncertainty_final: Optional[torch.Tensor] = None
 
 
 class FocalInjectedSD3Transformer(nn.Module):
     """Wrapper around the SD3.5 transformer that accepts focal features."""
 
-    def __init__(self, base_transformer: SD3Transformer2DModel, condition_channels: int) -> None:
+    def __init__(self, base_transformer: SD3Transformer2DModel, condition_channels: int = 512) -> None:
         super().__init__()
         self.base_transformer = base_transformer
         self.condition_channels = condition_channels
@@ -86,7 +96,6 @@ class FocalInjectedSD3Transformer(nn.Module):
 
         self.condition_adapter = nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
         self._condition_adapters = nn.ModuleDict()
-        self._camera_condition_adapters = nn.ModuleDict()
         self.dtype = getattr(base, "dtype", torch.float32)
         self.condition_adapter.to(device=self._base_device, dtype=self.dtype)
 
@@ -189,13 +198,6 @@ class FocalInjectedSD3Transformer(nn.Module):
             self._condition_adapters[key] = adapter
         return self._condition_adapters[key]
 
-    def _get_camera_condition_adapter(self, channels: int) -> nn.Linear:
-        key = str(channels)
-        if key not in self._camera_condition_adapters:
-            adapter = nn.Linear(channels, self.config.attention_head_dim * self.config.num_attention_heads)
-            self._camera_condition_adapters[key] = adapter
-        return self._camera_condition_adapters[key]
-
     @staticmethod
     def _match_condition_batch(condition: torch.Tensor, target_batch: int) -> torch.Tensor:
         if condition.shape[0] == target_batch:
@@ -228,16 +230,6 @@ class FocalInjectedSD3Transformer(nn.Module):
         else:
             adapter = self._get_condition_adapter(fused.shape[1]).to(device=fused.device, dtype=fused.dtype)
             conditioned = adapter(fused)
-
-        camera_features = focal_features.get("camera_features")
-        if camera_features is not None:
-            camera_features = camera_features.to(device=conditioned.device, dtype=conditioned.dtype)
-            camera_adapter = self._get_camera_condition_adapter(camera_features.shape[-1]).to(
-                device=conditioned.device,
-                dtype=conditioned.dtype,
-            )
-            camera_condition = camera_adapter(camera_features).unsqueeze(-1).unsqueeze(-1)
-            conditioned = conditioned + self.condition_scale * camera_condition
 
         spatial_maps = focal_features.get("temporal_attention_maps")
         if spatial_maps is not None:
@@ -273,7 +265,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         "text_encoder_3",
         "transformer",
         "focal_processor",
-        "camera_encoder",
+        "focal_evidence_head",
         "dual_decoder",
     )
 
@@ -289,7 +281,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         transformer: SD3Transformer2DModel,
         scheduler: FlowMatchEulerDiscreteScheduler,
         focal_processor: Optional[nn.Module] = None,
-        camera_encoder: Optional[nn.Module] = None,
+        focal_evidence_head: Optional[nn.Module] = None,
         dual_decoder: Optional[nn.Module] = None,
     ) -> None:
         super().__init__(
@@ -318,7 +310,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         )
         self._optional_components = base_optional + (
             "focal_processor",
-            "camera_encoder",
+            "focal_evidence_head",
             "dual_decoder",
         )
 
@@ -326,12 +318,12 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         # serialization remains compatible with diffusers' component bookkeeping.
         self.register_to_config(
             focal_processor=None,
-            camera_encoder=None,
+            focal_evidence_head=None,
             dual_decoder=None,
         )
 
         self.focal_processor = focal_processor or FocalStackProcessor()
-        self.camera_encoder = camera_encoder
+        self.focal_evidence_head = focal_evidence_head or FocalEvidenceHead()
         self.dual_decoder = dual_decoder or DualOutputDecoder(
             in_channels=self.vae.config.latent_channels,
             out_channels_depth=1,
@@ -368,7 +360,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         self.register_modules(
             transformer=self.transformer,
             focal_processor=self.focal_processor,
-            camera_encoder=self.camera_encoder,
+            focal_evidence_head=self.focal_evidence_head,
             dual_decoder=self.dual_decoder,
         )
 
@@ -385,7 +377,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             "tokenizer": self.tokenizer,
             "tokenizer_2": self.tokenizer_2,
             "focal_processor": self.focal_processor,
-            "camera_encoder": self.camera_encoder,
+            "focal_evidence_head": self.focal_evidence_head,
             "dual_decoder": self.dual_decoder,
         }
 
@@ -482,7 +474,6 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         self,
         focal_stack: Union[torch.Tensor, List[Image.Image]],
         focus_distances: torch.Tensor,
-        camera_params: Optional[Dict[str, Union[torch.Tensor, float]]] = None,
         prompt: str = "",
         negative_prompt: Optional[str] = None,
         height: Optional[int] = None,
@@ -494,7 +485,6 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         latents: Optional[torch.FloatTensor] = None,
         output_type: str = "pil",
         return_dict: bool = True,
-        camera_invariant_mode: str = "relative",
         **kwargs: Any,
     ) -> Union[FocalDiffusionOutput, Tuple[torch.Tensor, Union[torch.Tensor, Image.Image]]]:
         del kwargs  # unused hook for future extensions
@@ -512,28 +502,8 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             focus_distances = focus_distances.unsqueeze(0)
         focus_distances = focus_distances.to(device=device, dtype=dtype)
 
-        if camera_params is not None and self.camera_encoder is not None:
-            camera_params = {
-                key: value.to(device=device, dtype=dtype)
-                if isinstance(value, torch.Tensor)
-                else torch.full((focal_stack.shape[0],), float(value), device=device, dtype=dtype)
-                for key, value in camera_params.items()
-            }
-            camera_features = self.camera_encoder(
-                camera_params,
-                mode=camera_invariant_mode,
-                focus_distances=focus_distances,
-            )
-        else:
-            camera_features = None
-
-        focal_features = self.focal_processor(
-            focal_stack,
-            focus_distances,
-            camera_params=camera_params,
-        )
-        if camera_features is not None:
-            focal_features["camera_features"] = camera_features
+        focal_evidence = self.focal_evidence_head(focal_stack, focus_distances)
+        focal_features = self.focal_processor(focal_stack, focus_distances)
 
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = self.encode_prompt(
             prompt=prompt,
@@ -597,23 +567,29 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
         decoder_outputs = self.dual_decoder(latents)
-        depth_probs = decoder_outputs["shape_norm"]
+        depth_prior = decoder_outputs["shape_norm"]
+        uncertainty_decoder = decoder_outputs["uncertainty"]
         rgb_latents = decoder_outputs["aif_latents"]
-        confidence_map = decoder_outputs.get("confidence_map", 1.0 - decoder_outputs["uncertainty"])
-        depth_probs = F.interpolate(
-            depth_probs, size=(height, width), mode="bilinear", align_corners=False
-        )
-        depth_map = depth_probs.squeeze(1)
 
-        if camera_params is not None and "depth_min" in camera_params and "depth_max" in camera_params:
-            depth_min = camera_params["depth_min"].to(depth_map.dtype).view(-1, 1, 1)
-            depth_max = camera_params["depth_max"].to(depth_map.dtype).view(-1, 1, 1)
-            depth_map = depth_min + depth_map * (depth_max - depth_min)
-        else:
-            logger.warning(
-                "No depth_min/depth_max provided at inference time; returning normalized "
-                "depth probabilities instead of metric depth."
-            )
+        depth_prior = F.interpolate(depth_prior, size=(height, width), mode="bilinear", align_corners=False)
+        uncertainty_decoder = F.interpolate(uncertainty_decoder, size=(height, width), mode="bilinear", align_corners=False)
+        depth_focus = F.interpolate(focal_evidence["depth_focus"], size=(height, width), mode="bilinear", align_corners=False)
+        focus_reliability = F.interpolate(focal_evidence["focus_reliability"], size=(height, width), mode="bilinear", align_corners=False)
+        focus_entropy = F.interpolate(focal_evidence["focus_entropy"], size=(height, width), mode="bilinear", align_corners=False)
+        focus_prob = focal_evidence["focus_prob"]
+        if depth_focus.shape[0] != depth_prior.shape[0]:
+            repeat_factor = depth_prior.shape[0] // depth_focus.shape[0]
+            depth_focus = depth_focus.repeat_interleave(repeat_factor, dim=0)
+            focus_reliability = focus_reliability.repeat_interleave(repeat_factor, dim=0)
+            focus_entropy = focus_entropy.repeat_interleave(repeat_factor, dim=0)
+            focus_prob = focus_prob.repeat_interleave(repeat_factor, dim=0)
+
+        depth_final = focus_reliability * depth_focus + (1.0 - focus_reliability) * depth_prior
+        depth_map = depth_final.squeeze(1)
+        uncertainty_focus = focus_entropy
+        uncertainty_disagree = torch.abs(depth_focus - depth_prior)
+        uncertainty_physics = 0.5 * uncertainty_focus + 0.5 * uncertainty_disagree
+        uncertainty_final = (0.5 * uncertainty_decoder + 0.5 * uncertainty_physics).clamp(0.0, 1.0)
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
@@ -634,7 +610,16 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             all_in_focus_image=result,
             depth_colored=depth_color,
             focal_features=focal_features,
-            uncertainty=1.0 - confidence_map.squeeze(1),
+            uncertainty=uncertainty_final.squeeze(1),
+            depth_prior=depth_prior.squeeze(1),
+            depth_focus=depth_focus.squeeze(1),
+            depth_final=depth_final.squeeze(1),
+            focus_prob=focus_prob,
+            focus_entropy=focus_entropy.squeeze(1),
+            focus_reliability=focus_reliability.squeeze(1),
+            uncertainty_decoder=uncertainty_decoder.squeeze(1),
+            uncertainty_focus=uncertainty_focus.squeeze(1),
+            uncertainty_final=uncertainty_final.squeeze(1),
         )
 
     @staticmethod

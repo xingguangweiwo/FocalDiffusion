@@ -5,6 +5,7 @@ __version__ = "1.0.0"
 __all__ = [
     "FocalDiffusionPipeline",
     "FocalStackProcessor",
+    "FocalEvidenceHead",
     "CameraInvariantEncoder",
 ]
 
@@ -24,11 +25,12 @@ def __getattr__(name: str):
         from .pipelines import FocalDiffusionPipeline
 
         return FocalDiffusionPipeline
-    if name in {"FocalStackProcessor", "CameraInvariantEncoder"}:
-        from .models import CameraInvariantEncoder, FocalStackProcessor
+    if name in {"FocalStackProcessor", "FocalEvidenceHead", "CameraInvariantEncoder"}:
+        from .models import CameraInvariantEncoder, FocalEvidenceHead, FocalStackProcessor
 
         mapping = {
             "FocalStackProcessor": FocalStackProcessor,
+            "FocalEvidenceHead": FocalEvidenceHead,
             "CameraInvariantEncoder": CameraInvariantEncoder,
         }
         return mapping[name]

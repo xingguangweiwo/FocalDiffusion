@@ -13,6 +13,16 @@ def normalize_focus_coordinates(focus_distances: torch.Tensor) -> torch.Tensor:
     return (focus_distances - mn) / (mx - mn + 1e-6)
 
 
+def build_focus_target_from_depth(depth_norm, focus_distances, temperature=0.07):
+    tau = normalize_focus_coordinates(focus_distances)
+    if depth_norm.dim() == 4:
+        depth_hw = depth_norm.squeeze(1)
+    else:
+        depth_hw = depth_norm
+    logits = -torch.abs(tau[:, :, None, None] - depth_hw[:, None]) / max(temperature, 1e-6)
+    return torch.softmax(logits, dim=1), tau
+
+
 def build_aif_physical(focal_stack: torch.Tensor, shape_norm: torch.Tensor, tau: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
     logits = -torch.abs(tau.unsqueeze(-1).unsqueeze(-1) - shape_norm.unsqueeze(1)) / max(temperature, 1e-6)
     w = torch.softmax(logits, dim=1).unsqueeze(2)
@@ -87,12 +97,15 @@ class FocusConsistencyCritic(nn.Module):
 
 
 class FocalDiffusionLoss(nn.Module):
-    def __init__(self, diffusion_weight: float = 1.0, depth_weight: float = 0.0, rgb_weight: float = 0.0, focus_energy_weight: float = 0.5, tau_contrast_weight: float = 0.2, stack_contrast_weight: float = 0.2, mismatch_contrast_weight: float = 0.2, shape_candidate_contrast_weight: float = 0.2, uncertainty_weight: float = 0.05, aif_highpass_weight: float = 0.1, supervision_mode: str = "supervised", **kwargs):
+    def __init__(self, diffusion_weight: float = 1.0, depth_weight: float = 0.0, rgb_weight: float = 0.0, focus_energy_weight: float = 0.0, tau_contrast_weight: float = 0.0, stack_contrast_weight: float = 0.0, mismatch_contrast_weight: float = 0.0, shape_candidate_contrast_weight: float = 0.0, uncertainty_weight: float = 0.0, aif_highpass_weight: float = 0.0, supervision_mode: str = "supervised", focus_posterior_kl_weight: float = 0.2, focus_depth_weight: float = 0.2, prior_depth_weight: float = 0.05, aif_focus_evidence_weight: float = 0.1, uncertainty_focus_weight: float = 0.05, focus_target_temperature: float = 0.07, **kwargs):
         super().__init__()
         self.diffusion_weight=diffusion_weight; self.depth_weight=depth_weight; self.rgb_weight=rgb_weight
         self.focus_energy_weight=focus_energy_weight; self.tau_contrast_weight=tau_contrast_weight
         self.stack_contrast_weight=stack_contrast_weight; self.mismatch_contrast_weight=mismatch_contrast_weight; self.shape_candidate_contrast_weight=shape_candidate_contrast_weight
         self.uncertainty_weight=uncertainty_weight; self.aif_highpass_weight=aif_highpass_weight
+        self.focus_posterior_kl_weight=focus_posterior_kl_weight; self.focus_depth_weight=focus_depth_weight
+        self.prior_depth_weight=prior_depth_weight; self.aif_focus_evidence_weight=aif_focus_evidence_weight
+        self.uncertainty_focus_weight=uncertainty_focus_weight; self.focus_target_temperature=focus_target_temperature
         self.supervision_mode = supervision_mode
 
     def forward(
@@ -105,6 +118,13 @@ class FocalDiffusionLoss(nn.Module):
         shape_norm=None,
         uncertainty=None,
         focal_stack=None,
+        depth_prior=None,
+        depth_focus=None,
+        depth_final=None,
+        focus_prob=None,
+        focus_entropy=None,
+        focus_reliability=None,
+        focus_distances=None,
         critic_outputs=None,
         critic_generator_outputs=None,
         depth_mask=None,
@@ -116,18 +136,68 @@ class FocalDiffusionLoss(nn.Module):
 
         enable_supervised = self.supervision_mode in {"supervised", "semi_supervised"}
 
-        if enable_supervised and depth_target is not None and shape_norm is not None and depth_range is not None:
-            shape_norm_resized = F.interpolate(shape_norm, size=depth_target.shape[-2:], mode='bilinear', align_corners=False)
+        depth_gt_norm = None
+        mask = None
+        depth_prediction = depth_final if depth_final is not None else shape_norm
+        if enable_supervised and depth_target is not None and depth_prediction is not None and depth_range is not None:
+            depth_pred_resized = F.interpolate(depth_prediction, size=depth_target.shape[-2:], mode='bilinear', align_corners=False)
             depth_min = depth_range[:, 0].view(-1, 1, 1, 1)
             depth_max = depth_range[:, 1].view(-1, 1, 1, 1)
             depth_gt_norm = ((depth_target - depth_min) / (depth_max - depth_min).clamp(min=1e-6)).clamp(0.0, 1.0)
             if depth_mask is not None:
-                mask = depth_mask.unsqueeze(1) if depth_mask.dim() == shape_norm_resized.dim() - 1 else depth_mask
-                supervised_losses['loss_shape_supervised'] = (torch.abs(shape_norm_resized - depth_gt_norm) * mask).sum() / mask.sum().clamp(min=1)
+                mask = depth_mask.unsqueeze(1) if depth_mask.dim() == depth_pred_resized.dim() - 1 else depth_mask
+                supervised_losses['loss_shape_supervised'] = (torch.abs(depth_pred_resized - depth_gt_norm) * mask).sum() / mask.sum().clamp(min=1)
             else:
-                supervised_losses['loss_shape_supervised'] = F.l1_loss(shape_norm_resized, depth_gt_norm)
+                supervised_losses['loss_shape_supervised'] = F.l1_loss(depth_pred_resized, depth_gt_norm)
+
+            if depth_focus is not None:
+                focus_resized = F.interpolate(depth_focus, size=depth_target.shape[-2:], mode='bilinear', align_corners=False)
+                if mask is not None:
+                    supervised_losses['loss_focus_depth'] = (torch.abs(focus_resized - depth_gt_norm) * mask).sum() / mask.sum().clamp(min=1)
+                else:
+                    supervised_losses['loss_focus_depth'] = F.l1_loss(focus_resized, depth_gt_norm)
+            if depth_prior is not None:
+                prior_resized = F.interpolate(depth_prior, size=depth_target.shape[-2:], mode='bilinear', align_corners=False)
+                if mask is not None:
+                    supervised_losses['loss_prior_depth'] = (torch.abs(prior_resized - depth_gt_norm) * mask).sum() / mask.sum().clamp(min=1)
+                else:
+                    supervised_losses['loss_prior_depth'] = F.l1_loss(prior_resized, depth_gt_norm)
+            if focus_prob is not None and focus_distances is not None:
+                focus_prob_resized = focus_prob
+                if focus_prob_resized.shape[-2:] != depth_target.shape[-2:]:
+                    focus_prob_resized = F.interpolate(focus_prob_resized, size=depth_target.shape[-2:], mode='bilinear', align_corners=False)
+                    focus_prob_resized = focus_prob_resized / focus_prob_resized.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                focus_target, _ = build_focus_target_from_depth(depth_gt_norm, focus_distances, temperature=self.focus_target_temperature)
+                kl = focus_target * (torch.log(focus_target + 1e-6) - torch.log(focus_prob_resized + 1e-6))
+                kl = kl.sum(dim=1, keepdim=True)
+                supervised_losses['loss_focus_posterior_kl'] = (kl * mask).sum() / mask.sum().clamp(min=1) if mask is not None else kl.mean()
+            if uncertainty is not None and depth_final is not None:
+                u = F.interpolate(uncertainty, size=depth_target.shape[-2:], mode='bilinear', align_corners=False)
+                final_resized = F.interpolate(depth_final.detach(), size=depth_target.shape[-2:], mode='bilinear', align_corners=False)
+                error_norm = torch.abs(final_resized - depth_gt_norm)
+                generator_losses['loss_uncertainty_error'] = F.l1_loss(u, error_norm) if mask is None else (torch.abs(u - error_norm) * mask).sum() / mask.sum().clamp(min=1)
         if enable_supervised and rgb_pred is not None and rgb_target is not None:
             supervised_losses['rgb'] = F.l1_loss(rgb_pred, rgb_target)
+        if focus_prob is not None and focal_stack is not None and rgb_pred is not None:
+            focus_for_aif = focus_prob
+            if focus_for_aif.shape[-2:] != focal_stack.shape[-2:]:
+                focus_for_aif = F.interpolate(focus_for_aif, size=focal_stack.shape[-2:], mode='bilinear', align_corners=False)
+                focus_for_aif = focus_for_aif / focus_for_aif.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            aif_focus = (focus_for_aif[:, :, None] * focal_stack).sum(dim=1)
+            rp = rgb_pred
+            if rp.shape[-2:] != aif_focus.shape[-2:]:
+                rp = F.interpolate(rp, size=aif_focus.shape[-2:], mode='bilinear', align_corners=False)
+            hp_pred = rp - F.avg_pool2d(rp, 5, 1, 2)
+            aif_focus_detached = aif_focus.detach()
+            hp_focus = aif_focus_detached - F.avg_pool2d(aif_focus_detached, 5, 1, 2)
+            generator_losses['loss_aif_focus_evidence'] = F.l1_loss(hp_pred, hp_focus)
+        if uncertainty is not None and focus_entropy is not None:
+            u = uncertainty
+            fe = focus_entropy.detach()
+            if u.shape[-2:] != fe.shape[-2:]:
+                u = F.interpolate(u, size=fe.shape[-2:], mode='bilinear', align_corners=False)
+            generator_losses['loss_uncertainty_focus'] = F.l1_loss(u, fe)
+
         if critic_outputs is not None:
             critic_losses['loss_critic_tau'] = critic_outputs['tau_contrast']
             critic_losses['loss_critic_stack'] = critic_outputs['stack_contrast']
@@ -157,12 +227,18 @@ class FocalDiffusionLoss(nn.Module):
         total = total + self.diffusion_weight * generator_losses['loss_fm']
         total = total + self.focus_energy_weight * generator_losses.get('loss_focus_generator', torch.zeros_like(total))
         total = total + self.uncertainty_weight * generator_losses.get('loss_uncertainty', torch.zeros_like(total))
+        total = total + self.uncertainty_weight * generator_losses.get('loss_uncertainty_error', torch.zeros_like(total))
+        total = total + self.uncertainty_focus_weight * generator_losses.get('loss_uncertainty_focus', torch.zeros_like(total))
         total = total + self.aif_highpass_weight * generator_losses.get('loss_aif_highpass', torch.zeros_like(total))
+        total = total + self.aif_focus_evidence_weight * generator_losses.get('loss_aif_focus_evidence', torch.zeros_like(total))
         total = total + self.tau_contrast_weight * critic_losses.get('loss_critic_tau', torch.zeros_like(total))
         total = total + self.stack_contrast_weight * critic_losses.get('loss_critic_stack', torch.zeros_like(total))
         total = total + self.mismatch_contrast_weight * critic_losses.get('loss_critic_mismatch', torch.zeros_like(total))
         total = total + self.shape_candidate_contrast_weight * critic_losses.get('loss_critic_shape_candidate', torch.zeros_like(total))
         total = total + self.depth_weight * supervised_losses.get('loss_shape_supervised', torch.zeros_like(total))
+        total = total + self.focus_posterior_kl_weight * supervised_losses.get('loss_focus_posterior_kl', torch.zeros_like(total))
+        total = total + self.focus_depth_weight * supervised_losses.get('loss_focus_depth', torch.zeros_like(total))
+        total = total + self.prior_depth_weight * supervised_losses.get('loss_prior_depth', torch.zeros_like(total))
         total = total + self.rgb_weight * supervised_losses.get('rgb', torch.zeros_like(total))
 
         return {

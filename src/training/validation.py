@@ -38,11 +38,9 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
         'abs_rel': 0.0,
         'rmse': 0.0,
         'normalized_loss': 0.0,
-        'focus_energy': 0.0,
-        'tau_contrast': 0.0,
-        'stack_contrast': 0.0,
-        'mismatch_contrast': 0.0,
-        'shape_candidate_contrast': 0.0,
+        'focus_entropy_mean': 0.0,
+        'focus_reliability_mean': 0.0,
+        'depth_prior_focus_disagreement': 0.0,
         'uncertainty_mean': 0.0
     }
     metric_depth_batches = 0
@@ -54,11 +52,9 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
             desc="Validation",
             disable=not trainer.accelerator.is_local_main_process,
         ):
-            camera_params = batch.get("camera_params") if trainer.config["model"].get("use_camera_encoder", False) else None
             output = trainer.pipeline(
                 focal_stack=batch['focal_stack'],
                 focus_distances=batch['focus_distances'],
-                camera_params=camera_params,
                 num_inference_steps=trainer.config['validation']['num_inference_steps'],
                 guidance_scale=trainer.config['validation']['guidance_scale'],
                 output_type='pt',
@@ -67,29 +63,20 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
 
             shape_norm = output.depth_map
             if shape_norm.dim() == 3:
-                shape_for_critic = shape_norm.unsqueeze(1)
                 shape_norm_for_loss = shape_norm.unsqueeze(1)
             else:
-                shape_for_critic = shape_norm
                 shape_norm_for_loss = shape_norm
-            uncertainty = getattr(output, "uncertainty", None)
+            uncertainty = getattr(output, "uncertainty_final", None)
+            if uncertainty is None:
+                uncertainty = getattr(output, "uncertainty", None)
             if uncertainty is not None:
                 val_metrics["uncertainty_mean"] += uncertainty.mean().item()
-
-            focal_stack = batch['focal_stack'].to(shape_norm.device)
-            if focal_stack.min() >= 0 and focal_stack.max() <= 1:
-                focal_stack = focal_stack * 2.0 - 1.0
-            focus_distances = batch['focus_distances'].to(shape_norm.device, dtype=focal_stack.dtype)
-            critic_outputs = trainer.focus_consistency_critic(
-                focal_stack.float(),
-                focus_distances.float(),
-                shape_for_critic.float(),
-            )
-            val_metrics["focus_energy"] += float(critic_outputs["focus_energy"].mean().item())
-            val_metrics["tau_contrast"] += float(critic_outputs["tau_contrast"].mean().item())
-            val_metrics["stack_contrast"] += float(critic_outputs["stack_contrast"].mean().item())
-            val_metrics["mismatch_contrast"] += float(critic_outputs["mismatch_contrast"].mean().item())
-            val_metrics["shape_candidate_contrast"] += float(critic_outputs["shape_candidate_contrast"].mean().item())
+            if output.focus_entropy is not None:
+                val_metrics["focus_entropy_mean"] += output.focus_entropy.mean().item()
+            if output.focus_reliability is not None:
+                val_metrics["focus_reliability_mean"] += output.focus_reliability.mean().item()
+            if output.depth_prior is not None and output.depth_focus is not None:
+                val_metrics["depth_prior_focus_disagreement"] += torch.abs(output.depth_prior - output.depth_focus).mean().item()
 
             depth_gt = batch.get('depth')
             depth_range = batch.get('depth_range')

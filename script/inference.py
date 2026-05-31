@@ -160,6 +160,11 @@ def parse_args():
         action='store_true',
         help='Save visualization figures'
     )
+    parser.add_argument(
+        '--save-focus-prob',
+        action='store_true',
+        help='Save the full focus posterior tensor as focus_prob.npy'
+    )
 
     return parser.parse_args()
 
@@ -267,8 +272,19 @@ def process_focal_stack(
 
     if isinstance(output.depth_map, torch.Tensor):
         output.depth_map = unpad_tensor_spatial(output.depth_map, size_meta["pad"])
-    if isinstance(output.uncertainty, torch.Tensor):
-        output.uncertainty = unpad_tensor_spatial(output.uncertainty, size_meta["pad"])
+    for attr in (
+        "uncertainty",
+        "depth_prior",
+        "depth_focus",
+        "depth_final",
+        "focus_entropy",
+        "focus_reliability",
+        "uncertainty_final",
+        "focus_prob",
+    ):
+        value = getattr(output, attr, None)
+        if isinstance(value, torch.Tensor):
+            setattr(output, attr, unpad_tensor_spatial(value, size_meta["pad"]))
     if isinstance(output.all_in_focus_image, torch.Tensor):
         output.all_in_focus_image = unpad_tensor_spatial(output.all_in_focus_image, size_meta["pad"])
     elif isinstance(output.all_in_focus_image, Image.Image):
@@ -283,6 +299,13 @@ def process_focal_stack(
         'all_in_focus': output.all_in_focus_image,
         'depth_colored': output.depth_colored,
         'uncertainty': output.uncertainty,
+        'depth_prior': getattr(output, 'depth_prior', None),
+        'depth_focus': getattr(output, 'depth_focus', None),
+        'depth_final': getattr(output, 'depth_final', None),
+        'focus_reliability': getattr(output, 'focus_reliability', None),
+        'focus_entropy': getattr(output, 'focus_entropy', None),
+        'uncertainty_final': getattr(output, 'uncertainty_final', None),
+        'focus_prob': getattr(output, 'focus_prob', None),
         'inference_time': inference_time,
         'focus_distances': focus_distances.tolist(),
         'original_size': size_meta["original_size"],
@@ -292,6 +315,14 @@ def process_focal_stack(
 
     return results
 
+
+
+def _to_numpy_map(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if value is not None and value.ndim == 3:
+        value = value[0]
+    return value
 
 def save_results(results: Dict, output_dir: Path, args):
     """Save processing results"""
@@ -329,10 +360,23 @@ def save_results(results: Dict, output_dir: Path, args):
 
     # Save uncertainty if available
     if results.get('uncertainty') is not None:
-        uncertainty = results['uncertainty']
-        if isinstance(uncertainty, torch.Tensor):
-            uncertainty = uncertainty.cpu().numpy()
+        uncertainty = _to_numpy_map(results['uncertainty'])
         np.save(output_dir / f"{name}_uncertainty.npy", uncertainty)
+
+    for key in ("depth_prior", "depth_focus", "focus_reliability", "focus_entropy"):
+        if results.get(key) is not None:
+            value = _to_numpy_map(results[key])
+            np.save(output_dir / f"{name}_{key}.npy", value)
+            save_depth_map(value, output_dir / f"{name}_{key}.png")
+
+    if results.get('uncertainty_final') is not None:
+        np.save(output_dir / f"{name}_uncertainty_final.npy", _to_numpy_map(results['uncertainty_final']))
+
+    if args.save_focus_prob and results.get('focus_prob') is not None:
+        focus_prob = results['focus_prob']
+        if isinstance(focus_prob, torch.Tensor):
+            focus_prob = focus_prob.detach().cpu().numpy()
+        np.save(output_dir / f"{name}_focus_prob.npy", focus_prob)
 
     # Save metadata
     metadata = {

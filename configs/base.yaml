@@ -3,13 +3,14 @@
 model:
   base_model_id: "stabilityai/stable-diffusion-3.5-large"
   feature_dim: 128
-  num_scales: 3
   max_focal_stack_size: 20
   focal_encoder_type: "focal_sweep"
   patch_size: 8
   focal_attention_heads: 8
   focal_attention_depth: 2
-  use_camera_encoder: false
+  focal_evidence_hidden: 48
+  focal_evidence_temperature: 0.07
+  use_focal_evidence_posterior: true
 
 data:
   dataset_type: filelist
@@ -66,7 +67,7 @@ training:
     transformer: attention_only
   lora_rank: 8
   lora_alpha: 16
-  train_focus_critic: true
+  train_focus_critic: false
   critic_warmup_steps: 500
   supervision_mode: supervised
 
@@ -84,13 +85,21 @@ losses:
   diffusion_weight: 1.0
   depth_weight: 1.0
   rgb_weight: 0.5
-  focus_energy_weight: 0.5
-  tau_contrast_weight: 0.2
-  stack_contrast_weight: 0.2
-  mismatch_contrast_weight: 0.2
-  shape_candidate_contrast_weight: 0.2
-  uncertainty_weight: 0.05
-  aif_highpass_weight: 0.1
+  focus_posterior_kl_weight: 0.2
+  focus_depth_weight: 0.2
+  prior_depth_weight: 0.05
+  aif_focus_evidence_weight: 0.1
+  uncertainty_focus_weight: 0.05
+  focus_target_temperature: 0.07
+
+  # Old critic ablation; default off.
+  focus_energy_weight: 0.0
+  tau_contrast_weight: 0.0
+  stack_contrast_weight: 0.0
+  mismatch_contrast_weight: 0.0
+  shape_candidate_contrast_weight: 0.0
+  uncertainty_weight: 0.0
+  aif_highpass_weight: 0.0
 
 validation:
   num_inference_steps: 30
