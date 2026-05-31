@@ -24,11 +24,6 @@ def test_core_smoke():
         diffusion_weight=1.0,
         depth_weight=1.0,
         rgb_weight=0.0,
-        consistency_weight=0.1,
-        perceptual_weight=0.1,
-        depth_gradient_weight=0.1,
-        edge_consistency_weight=0.1,
-        confidence_regularization_weight=0.1,
     )
     loss_dict = loss_fn(
         diffusion_pred=torch.randn(1,16,32,32),
