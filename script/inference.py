@@ -8,10 +8,9 @@ import argparse
 import os
 import sys
 from pathlib import Path
-import yaml
 import json
 import time
-from typing import List, Dict, Optional, Union
+from typing import Dict, List
 import logging
 
 import torch
@@ -25,10 +24,8 @@ sys.path.insert(0, str(project_root))
 
 from src.pipelines import load_pipeline
 from src.utils import (
-    load_image_stack,
     save_depth_map,
     save_all_in_focus,
-    create_visualization,
     parse_exif_data,
     estimate_focus_distances,
 )
@@ -148,23 +145,6 @@ def parse_args():
         type=str,
         help='Comma-separated focus distances in meters (auto-detect if not specified)'
     )
-    parser.add_argument(
-        '--focal-length',
-        type=float,
-        help='[Legacy] Camera focal length in mm (unused in default focal-sweep path)'
-    )
-    parser.add_argument(
-        '--aperture',
-        type=float,
-        help='[Legacy] Camera aperture (unused in default focal-sweep path)'
-    )
-    parser.add_argument(
-        '--sensor-size',
-        type=float,
-        default=0.036,
-        help='[Legacy] Sensor size in meters (unused in default focal-sweep path)'
-    )
-
     # Inference parameters
     parser.add_argument(
         '--num-inference-steps',
@@ -177,13 +157,6 @@ def parse_args():
         type=float,
         default=1.0,
         help='Guidance scale for inference (1.0 disables text classifier-free guidance)'
-    )
-    parser.add_argument(
-        '--camera-invariant-mode',
-        type=str,
-        default='relative',
-        choices=['relative', 'normalized', 'learned'],
-        help='[Legacy] Camera invariance mode (unused in default focal-sweep path)'
     )
     parser.add_argument('--height', type=int, default=None, help='Optional inference height override')
     parser.add_argument('--width', type=int, default=None, help='Optional inference width override')
@@ -256,39 +229,6 @@ def load_focal_stack(input_path: str) -> tuple:
     return images, [str(p) for p in image_paths]
 
 
-def extract_camera_params(image_paths: List[str], args) -> Dict:
-    """Extract camera parameters from EXIF or arguments"""
-    camera_params = {}
-
-    # Try to get from EXIF first
-    if image_paths:
-        exif_data = parse_exif_data(image_paths[0])
-        if exif_data:
-            camera_params = {
-                'focal_length': exif_data.get('focal_length', args.focal_length or 50.0) / 1000,
-                'aperture': exif_data.get('aperture', args.aperture or 2.8),
-                'sensor_size': exif_data.get('sensor_size', args.sensor_size),
-            }
-
-    # Override with command line arguments
-    if args.focal_length:
-        camera_params['focal_length'] = args.focal_length / 1000  # Convert to meters
-    if args.aperture:
-        camera_params['aperture'] = args.aperture
-    if args.sensor_size:
-        camera_params['sensor_size'] = args.sensor_size
-
-    # Use defaults if still missing
-    if not camera_params:
-        camera_params = {
-            'focal_length': 0.050,  # 50mm
-            'aperture': 2.8,
-            'sensor_size': 0.036,  # Full frame
-        }
-
-    return camera_params
-
-
 def extract_focus_distances(
         image_paths: List[str],
         num_images: int,
@@ -349,7 +289,6 @@ def process_focal_stack(
             focus_distances=focus_distances,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
-            camera_invariant_mode=args.camera_invariant_mode,
             output_type="pil" if args.save_visualization else "pt",
             return_dict=True,
             **pipeline_kwargs,
