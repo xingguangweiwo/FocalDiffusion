@@ -35,8 +35,6 @@ def test_core_smoke():
         critic_outputs=critic_out,
         depth_range=torch.tensor([[0.2, 4.0]], dtype=torch.float32),
         depth_mask=torch.ones(1, 32, 32),
-        focal_features=features,
-        confidence_map=out["uncertainty"],
     )
     assert "total" in loss_dict
 

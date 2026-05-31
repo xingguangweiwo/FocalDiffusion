@@ -571,6 +571,13 @@ class FocalDiffusionTrainer:
         self.focus_consistency_critic.train()
         epoch_loss = 0.0
 
+        supervision_mode = self.config['training'].get('supervision_mode', 'supervised')
+        if supervision_mode not in {"supervised", "semi_supervised"}:
+            raise ValueError(
+                "training.supervision_mode must be 'supervised' or 'semi_supervised'; "
+                f"got {supervision_mode!r}."
+            )
+
         # Initialize loss function
         loss_fn = FocalDiffusionLoss(
             diffusion_weight=self.config['losses']['diffusion_weight'],
@@ -583,7 +590,7 @@ class FocalDiffusionTrainer:
             shape_candidate_contrast_weight=self.config['losses'].get('shape_candidate_contrast_weight', 0.2),
             uncertainty_weight=self.config['losses'].get('uncertainty_weight', 0.05),
             aif_highpass_weight=self.config['losses'].get('aif_highpass_weight', 0.1),
-            supervision_mode=self.config['training'].get('supervision_mode', 'supervised'),
+            supervision_mode=supervision_mode,
         ).to(self.accelerator.device)
 
         progress_bar = tqdm(
@@ -601,7 +608,6 @@ class FocalDiffusionTrainer:
                 device = self.accelerator.device
                 focal_stack = batch['focal_stack'].to(device)
                 focus_distances = batch['focus_distances'].to(device=device, dtype=focal_stack.dtype)
-                supervision_mode = self.config['training'].get('supervision_mode', 'supervised')
                 depth_gt = batch.get('depth')
                 rgb_gt = batch.get('all_in_focus')
                 if depth_gt is not None:
@@ -613,10 +619,6 @@ class FocalDiffusionTrainer:
                         raise ValueError("supervised mode requires batch['depth'], but it is missing.")
                     if rgb_gt is None:
                         raise ValueError("supervised mode requires batch['all_in_focus'], but it is missing.")
-                if supervision_mode == "self_supervised" and rgb_gt is None:
-                    raise NotImplementedError(
-                        "Self-supervised diffusion training without all_in_focus requires a pseudo-AIF target and is not fully implemented."
-                    )
                 if supervision_mode == "semi_supervised" and rgb_gt is None:
                     logger.warning(
                         "Skipping batch in semi_supervised mode because all_in_focus is missing; "
@@ -725,8 +727,6 @@ class FocalDiffusionTrainer:
                     shape_norm = decoder_outputs["shape_norm"]
                     uncertainty = decoder_outputs["uncertainty"]
                     rgb_latent_pred = decoder_outputs["aif_latents"]
-                    confidence_map = decoder_outputs.get("confidence_map", 1.0 - uncertainty)
-
                     rgb_recon = self.pipeline.vae.decode(
                         rgb_latent_pred / self.pipeline.vae.config.scaling_factor,
                         return_dict=False
@@ -759,8 +759,6 @@ class FocalDiffusionTrainer:
                         depth_mask=depth_mask,
                         rgb_pred=rgb_recon,
                         rgb_target=rgb_target_fp32,
-                        focal_features=focal_features,
-                        confidence_map=confidence_map.float(),
                         shape_norm=shape_norm.float(),
                         uncertainty=uncertainty.float(),
                         focal_stack=focal_stack.float(),
@@ -871,52 +869,6 @@ class FocalDiffusionTrainer:
         return (
             prompt_embeds.repeat(repeat_shape),
             pooled_prompt_embeds.repeat(pooled_repeat_shape),
-        )
-
-    def _predict_clean_latents(
-        self,
-        noisy_latents: torch.Tensor,
-        noise_pred: torch.Tensor,
-        timesteps: torch.Tensor,
-        noise_levels: Optional[torch.Tensor] = None,
-        reference_latents: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Reconstruct the clean latent sample from the model's noise prediction."""
-
-        scheduler = self.pipeline.scheduler
-        latent_dtype = noisy_latents.dtype
-        device = noisy_latents.device
-
-        noise_pred = noise_pred.to(dtype=latent_dtype)
-
-        if noise_levels is not None:
-            sigma = noise_levels.to(device=device, dtype=latent_dtype)
-            sigma = sigma.view(-1, *[1] * (noisy_latents.ndim - 1))
-            denom = 1.0 - sigma
-            near_zero = denom.abs() < 1e-6
-            denom = denom.clamp(min=1e-6)
-            clean = (noisy_latents - sigma * noise_pred) / denom
-
-            if reference_latents is not None and torch.any(near_zero):
-                fallback = reference_latents.to(device=device, dtype=latent_dtype).detach()
-                clean = torch.where(near_zero, fallback, clean)
-
-            return clean
-
-        if hasattr(scheduler, "alphas_cumprod"):
-            alphas_cumprod = scheduler.alphas_cumprod.to(device=device, dtype=latent_dtype)
-            timestep_indices = timesteps.to(device=device)
-            if timestep_indices.dtype not in (torch.int32, torch.int64, torch.int16, torch.uint8):
-                timestep_indices = timestep_indices.long()
-            timestep_indices = timestep_indices.clamp(min=0, max=alphas_cumprod.shape[0] - 1)
-            alpha_prod_t = alphas_cumprod.index_select(0, timestep_indices)
-            alpha = alpha_prod_t.sqrt().view(-1, *[1] * (noisy_latents.ndim - 1))
-            sigma = (1 - alpha_prod_t).sqrt().view(-1, *[1] * (noisy_latents.ndim - 1))
-            clean = (noisy_latents - sigma * noise_pred) / alpha.clamp(min=1e-6)
-            return clean
-
-        raise RuntimeError(
-            "Unable to recover clean latents for the active scheduler."
         )
 
     def validate(self, epoch: int) -> dict:

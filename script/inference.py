@@ -26,8 +26,6 @@ from src.pipelines import load_pipeline
 from src.utils import (
     save_depth_map,
     save_all_in_focus,
-    parse_exif_data,
-    estimate_focus_distances,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -96,11 +94,6 @@ def parse_args():
         help='Path to trained FocalDiffusion checkpoint (required for meaningful inference)'
     )
     parser.add_argument(
-        '--config',
-        type=str,
-        help='Path to inference configuration file'
-    )
-    parser.add_argument(
         '--base-model',
         type=str,
         default='stabilityai/stable-diffusion-3.5-large',
@@ -143,7 +136,7 @@ def parse_args():
     parser.add_argument(
         '--focus-distances',
         type=str,
-        help='Comma-separated focus distances in meters (auto-detect if not specified)'
+        help='Comma-separated focus distances in meters (uses 0..N-1 index spacing if not specified)'
     )
     # Inference parameters
     parser.add_argument(
@@ -163,20 +156,9 @@ def parse_args():
 
     # Processing options
     parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=1,
-        help='Batch size for processing'
-    )
-    parser.add_argument(
         '--save-visualization',
         action='store_true',
         help='Save visualization figures'
-    )
-    parser.add_argument(
-        '--save-intermediate',
-        action='store_true',
-        help='Save intermediate outputs'
     )
 
     return parser.parse_args()
@@ -230,34 +212,20 @@ def load_focal_stack(input_path: str) -> tuple:
 
 
 def extract_focus_distances(
-        image_paths: List[str],
         num_images: int,
         args
 ) -> torch.Tensor:
-    """Extract or estimate focus distances"""
+    """Extract focus distances from CLI values or use index-spaced positions."""
 
     if args.focus_distances:
-        # Parse from command line
         distances = [float(x) for x in args.focus_distances.split(',')]
-
         if len(distances) != num_images:
-            logger.warning(
-                f"Number of focus distances ({len(distances)}) doesn't match "
-                f"number of images ({num_images}). Using estimation instead."
+            raise ValueError(
+                f"Number of focus distances ({len(distances)}) must match "
+                f"number of images ({num_images})."
             )
-            distances = estimate_focus_distances(num_images)
     else:
-        # Try to extract from EXIF
-        distances = []
-        for img_path in image_paths:
-            exif_data = parse_exif_data(img_path)
-            if exif_data and 'focus_distance' in exif_data:
-                distances.append(exif_data['focus_distance'])
-
-        if len(distances) != num_images:
-            # Fallback to estimation
-            logger.warning("using evenly spaced focus positions.")
-            distances = list(np.linspace(0.0, float(num_images-1), num_images))
+        distances = list(np.linspace(0.0, float(num_images - 1), num_images))
 
     return torch.tensor(distances, dtype=torch.float32)
 
@@ -321,10 +289,6 @@ def process_focal_stack(
         'inference_size': size_meta["inference_size"],
         'output_size': list(output.depth_map.shape[-2:]) if isinstance(output.depth_map, torch.Tensor) else size_meta["original_size"],
     }
-
-    if args.save_intermediate:
-        results['focal_features'] = output.focal_features
-        results['attention_maps'] = output.attention_maps
 
     return results
 
@@ -451,10 +415,10 @@ def main():
     for input_idx, input_path in enumerate(tqdm(input_paths, desc="Processing")):
         try:
             # Load focal stack
-            images, image_paths = load_focal_stack(input_path)
+            images, _ = load_focal_stack(input_path)
 
             # Extract parameters
-            focus_distances = extract_focus_distances(image_paths, len(images), args)
+            focus_distances = extract_focus_distances(len(images), args)
 
             # Process
             stack_name = Path(input_path).stem if Path(input_path).is_dir() else f"stack_{input_idx:04d}"
@@ -473,6 +437,8 @@ def main():
 
             all_results.append(results)
 
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Error processing {input_path}: {str(e)}")
             continue
