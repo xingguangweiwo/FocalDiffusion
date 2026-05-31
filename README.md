@@ -1,7 +1,7 @@
 # FSDiffusion: Reliable Zero-Shot Focal-Stack Diffusion via Focal Evidence
 
 ## Short Introduction
-FSDiffusion is a focal-stack-conditioned latent diffusion framework for reliable zero-shot all-in-focus reconstruction and normalized depth estimation. FSDiffusion uses a Focal Evidence Posterior to explicitly predict a per-pixel posterior distribution over focus planes. The posterior is converted into focus-derived depth by soft-argmax and into reliability by entropy. The final depth is a physics-gated fusion of focus-derived depth and diffusion-prior depth, and uncertainty is derived from focus entropy, prior-focus disagreement, and decoder uncertainty.
+FSDiffusion is a focal-stack-conditioned latent diffusion framework for reliable zero-shot all-in-focus reconstruction and depth estimation. FSDiffusion uses a Focal Evidence Posterior to explicitly predict a per-pixel posterior distribution over focus planes. The posterior is converted into focus-derived depth by soft-argmax and into reliability by entropy. The final depth is a physics-gated fusion of focus-derived depth and diffusion-prior depth, and uncertainty is derived from focus entropy, prior-focus disagreement, and decoder uncertainty.
 
 ## Highlights
 - Local **Focal Evidence Posterior** (`focus_posterior`) over focus planes.

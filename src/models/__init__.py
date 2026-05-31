@@ -4,6 +4,7 @@ from .dual_decoder import DualOutputDecoder
 from .focal_attention import FocalCrossAttention
 from .focal_evidence import FocalEvidenceHead
 from .focal_processor import FocalStackProcessor
+from .focal_evidence import FocalEvidenceHead
 
 __all__ = [
     "FocalCrossAttention",
