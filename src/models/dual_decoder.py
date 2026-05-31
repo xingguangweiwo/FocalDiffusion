@@ -1,4 +1,4 @@
-"""Dual-output decoder used by FocalDiffusion."""
+"""Dual-output decoder used by FSDiffusion."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ class _ResidualBlock(nn.Module):
 
 
 class DualOutputDecoder(nn.Module):
-    """Decode SD3.5 latents into AIF, depth and confidence with cross-task coupling."""
+    """Decode SD3.5 latents into AIF, depth prior and confidence with cross-task coupling."""
 
     def __init__(
         self,
@@ -115,7 +115,7 @@ class DualOutputDecoder(nn.Module):
         )
 
     def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return refined depth logits, RGB latents, and confidence map."""
+        """Return normalized depth prior, AIF latents, and uncertainty."""
 
         features = latents
         skip: Optional[torch.Tensor] = None
@@ -173,15 +173,16 @@ class DualOutputDecoder(nn.Module):
             dim=1,
         )
         depth_delta = self.depth_refine(refine_input)
-        shape_norm = torch.sigmoid(depth_logits_coarse + (1.0 - confidence) * depth_delta)
+        depth_prior_norm = torch.sigmoid(depth_logits_coarse + (1.0 - confidence) * depth_delta)
         uncertainty = torch.sigmoid(1.5 * (1.0 - confidence))
 
         return {
-            "shape_norm": shape_norm,
+            "depth_prior_norm": depth_prior_norm,
             "uncertainty": uncertainty,
             "aif_latents": rgb_latents,
-            # backward-compatible aliases
-            "depth_logits": shape_norm,
+            # Backward-compatible aliases.
+            "shape_norm": depth_prior_norm,
+            "depth_logits": depth_prior_norm,
             "rgb_latent_pred": rgb_latents,
             "confidence_map": 1.0 - uncertainty,
         }

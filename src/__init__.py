@@ -1,35 +1,27 @@
-"""FocalDiffusion - all-in-focus image and depth generation from focal stacks."""
+"""FSDiffusion: Reliable Zero-Shot Focal-Stack Diffusion via Focal Evidence."""
 
 __version__ = "1.0.0"
 
 __all__ = [
     "FocalDiffusionPipeline",
     "FocalStackProcessor",
-    "CameraInvariantEncoder",
+    "FocalEvidenceHead",
 ]
 
 
 def __getattr__(name: str):
-    """Lazily import heavy modules on demand.
-
-    Importing :mod:`src` previously pulled in ``torch`` and other optional
-    dependencies immediately which prevented lightweight utilities (such as
-    the YAML loader) from running in environments where those libraries are
-    not installed.  The lazy loader keeps the public API intact while deferring
-    the expensive imports until the corresponding attributes are actually
-    requested.
-    """
+    """Lazily import heavy modules on demand."""
 
     if name == "FocalDiffusionPipeline":
         from .pipelines import FocalDiffusionPipeline
 
         return FocalDiffusionPipeline
-    if name in {"FocalStackProcessor", "CameraInvariantEncoder"}:
-        from .models import CameraInvariantEncoder, FocalStackProcessor
+    if name in {"FocalStackProcessor", "FocalEvidenceHead"}:
+        from .models import FocalEvidenceHead, FocalStackProcessor
 
         mapping = {
             "FocalStackProcessor": FocalStackProcessor,
-            "CameraInvariantEncoder": CameraInvariantEncoder,
+            "FocalEvidenceHead": FocalEvidenceHead,
         }
         return mapping[name]
 

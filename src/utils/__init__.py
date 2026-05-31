@@ -1,4 +1,4 @@
-"""FocalDiffusion utilities."""
+"""FSDiffusion utilities."""
 
 from .image_utils import (
     load_image_stack,
