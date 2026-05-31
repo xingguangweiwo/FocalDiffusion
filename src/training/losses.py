@@ -1,8 +1,7 @@
 """Loss functions and focus-consistency critic for FocalDiffusion."""
 
 from __future__ import annotations
-from contextlib import contextmanager
-from typing import Dict, Iterator
+from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -173,15 +172,3 @@ class FocalDiffusionLoss(nn.Module):
 class DepthLoss(nn.Module):
     def forward(self, pred, target, mask=None):
         return F.l1_loss(pred, target)
-
-
-class ConsistencyLoss(nn.Module):
-    def forward(self, focal_features):
-        return torch.zeros((), device=next(iter(focal_features.values())).device)
-
-
-class PerceptualLoss(nn.Module):
-    def __init__(self, net='vgg'):
-        super().__init__(); self.register_buffer('_zero', torch.tensor(0.0), persistent=False)
-    def forward(self,pred,target):
-        return self._zero.to(device=pred.device, dtype=pred.dtype)
