@@ -153,3 +153,92 @@ def test_build_support_inputs_shapes():
     assert support_maps["focus_peakiness"].shape == (B, 1, H, W)
     assert support_maps["posterior_margin"].shape == (B, 1, H, W)
     assert support_maps["depth_disagreement"].shape == (B, 1, H, W)
+
+
+def test_local_affinity_shapes_and_range():
+    from src.training.losses import _compute_local_affinity
+
+    B, C, H, W = 2, 3, 12, 10
+    evidence_image = torch.randn(B, C, H, W)
+
+    affinity = _compute_local_affinity(evidence_image)
+
+    assert affinity["x"].shape == (B, 1, H, W - 1)
+    assert affinity["y"].shape == (B, 1, H - 1, W)
+    assert torch.isfinite(affinity["x"]).all()
+    assert torch.isfinite(affinity["y"]).all()
+    assert affinity["x"].min() >= 0
+    assert affinity["x"].max() <= 1
+    assert affinity["y"].min() >= 0
+    assert affinity["y"].max() <= 1
+
+
+def test_focal_consistency_regularizers_are_finite():
+    from src.training.losses import (
+        _compute_local_affinity,
+        _depth_affinity_smoothness_loss,
+        _focal_axis_smoothness_loss,
+        _gate_consistency_loss,
+        _posterior_consistency_loss,
+    )
+
+    B, N, H, W = 2, 5, 12, 10
+    focus_posterior = torch.softmax(torch.randn(B, N, H, W), dim=1)
+    depth_final = torch.rand(B, 1, H, W)
+    gate_focus = torch.rand(B, 1, H, W)
+    evidence_image = torch.randn(B, 3, H, W)
+    affinity = _compute_local_affinity(evidence_image)
+
+    losses = [
+        _posterior_consistency_loss(focus_posterior, affinity),
+        _depth_affinity_smoothness_loss(depth_final, affinity),
+        _gate_consistency_loss(gate_focus, affinity),
+        _focal_axis_smoothness_loss(focus_posterior),
+    ]
+    for loss in losses:
+        assert loss.dim() == 0
+        assert torch.isfinite(loss)
+
+    two_plane_posterior = torch.softmax(torch.randn(B, 2, H, W), dim=1)
+    focal_axis_loss = _focal_axis_smoothness_loss(two_plane_posterior)
+    assert focal_axis_loss.dim() == 0
+    assert torch.isfinite(focal_axis_loss)
+    assert focal_axis_loss.item() == 0.0
+
+
+def test_focal_diffusion_loss_includes_consistency_terms():
+    B, N, C, H, W = 2, 5, 3, 12, 10
+    depth_target = torch.rand(B, 1, H, W)
+    focus_posterior = torch.softmax(torch.randn(B, N, H, W), dim=1)
+
+    loss_fn = FocalDiffusionLoss(
+        diffusion_weight=0.0,
+        depth_weight=1.0,
+        rgb_weight=0.0,
+        posterior_consistency_weight=0.02,
+        depth_affinity_smoothness_weight=0.01,
+        gate_consistency_weight=0.005,
+        focal_axis_smoothness_weight=0.002,
+    )
+    loss_dict = loss_fn(
+        diffusion_pred=torch.zeros(B, 4),
+        diffusion_target=torch.zeros(B, 4),
+        depth_target=depth_target,
+        depth_range=torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        depth_final_norm=torch.rand(B, 1, H, W),
+        depth_prior_norm=torch.rand(B, 1, H, W),
+        depth_focus_norm=torch.rand(B, 1, H, W),
+        focus_posterior=focus_posterior,
+        focus_entropy=torch.rand(B, 1, H, W),
+        focus_distances=torch.linspace(0.3, 10.0, N).repeat(B, 1),
+        focal_stack=torch.randn(B, N, C, H, W),
+        rgb_pred=torch.randn(B, C, H, W),
+        rgb_target=torch.randn(B, C, H, W),
+        gate_focus=torch.rand(B, 1, H, W),
+    )
+
+    assert "loss_posterior_consistency" in loss_dict
+    assert "loss_depth_affinity_smoothness" in loss_dict
+    assert "loss_gate_consistency" in loss_dict
+    assert "loss_focal_axis_smoothness" in loss_dict
+    assert torch.isfinite(loss_dict["total"])
