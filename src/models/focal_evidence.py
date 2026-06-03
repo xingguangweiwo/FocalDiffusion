@@ -91,17 +91,98 @@ class FocalEvidenceHead(nn.Module):
 
         entropy = -(focus_posterior * torch.log(focus_posterior + self.eps)).sum(dim=1, keepdim=True)
         entropy = (entropy / math.log(max(N, 2))).clamp(0.0, 1.0)
-        focus_reliability = (1.0 - entropy).clamp(0.0, 1.0)
+        focus_peakiness = (1.0 - entropy).clamp(0.0, 1.0)
 
         return {
             "focus_logits": focus_logits,
             "focus_posterior": focus_posterior,
             "depth_focus_norm": depth_focus_norm,
             "focus_entropy": entropy,
-            "focus_reliability": focus_reliability,
+            "focus_peakiness": focus_peakiness,
+            "focus_reliability": focus_peakiness,  # Compatibility alias only; not calibrated reliability.
             "focus_coordinates": tau,
             # Compatibility aliases for older scripts/tests.
             "focus_prob": focus_posterior,
             "depth_focus": depth_focus_norm,
             "tau": tau,
+        }
+
+
+def build_support_inputs(
+    focus_posterior: torch.Tensor,
+    focus_entropy: torch.Tensor,
+    depth_focus_norm: torch.Tensor,
+    depth_prior_norm: torch.Tensor,
+    uncertainty_decoder: torch.Tensor,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Build lightweight physical support inputs.
+
+    Args:
+        focus_posterior: Per-pixel posterior over focus planes with shape [B, N, H, W].
+        focus_entropy: Normalized posterior entropy with shape [B, 1, H, W].
+        depth_focus_norm: Focus-derived normalized depth with shape [B, 1, H, W].
+        depth_prior_norm: Decoder-prior normalized depth with shape [B, 1, H, W].
+        uncertainty_decoder: Decoder uncertainty with shape [B, 1, H, W].
+
+    Returns:
+        A 5-channel support tensor and a dictionary of diagnostic support maps.
+    """
+
+    if focus_posterior.shape[1] < 2:
+        raise ValueError("focus_posterior must contain at least two focal planes to compute posterior_margin.")
+
+    focus_peakiness = (1.0 - focus_entropy).clamp(0.0, 1.0)
+    top2 = torch.topk(focus_posterior, k=2, dim=1).values
+    posterior_margin = top2[:, 0:1] - top2[:, 1:2]
+    depth_disagreement = torch.abs(depth_focus_norm - depth_prior_norm)
+
+    support_inputs = torch.cat(
+        [
+            focus_entropy,
+            focus_peakiness,
+            posterior_margin,
+            depth_disagreement,
+            uncertainty_decoder,
+        ],
+        dim=1,
+    )
+    support_maps = {
+        "focus_peakiness": focus_peakiness,
+        "posterior_margin": posterior_margin,
+        "depth_disagreement": depth_disagreement,
+    }
+    return support_inputs, support_maps
+
+
+class PhysicalSupportHead(nn.Module):
+    """Tiny head that calibrates focus/prior gates and uncertainty from physical support maps."""
+
+    def __init__(self, in_channels: int = 5, hidden: int = 16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 4, kernel_size=1),
+        )
+
+    def forward(self, support_inputs: torch.Tensor) -> Dict[str, torch.Tensor]:
+        raw = self.net(support_inputs)
+        gate_logits = raw[:, :3]
+        uncertainty_logit = raw[:, 3:4]
+
+        gate = torch.softmax(gate_logits, dim=1)
+        gate_focus = gate[:, 0:1]
+        gate_prior = gate[:, 1:2]
+        gate_abstain = gate[:, 2:3]
+
+        uncertainty_final = torch.sigmoid(uncertainty_logit)
+        physical_support = 1.0 - uncertainty_final
+
+        return {
+            "gate_logits": gate_logits,
+            "gate_focus": gate_focus,
+            "gate_prior": gate_prior,
+            "gate_abstain": gate_abstain,
+            "uncertainty_final": uncertainty_final,
+            "physical_support": physical_support,
         }

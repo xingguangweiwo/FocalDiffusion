@@ -27,6 +27,7 @@ def save_checkpoint(
         'focal_processor_state_dict': trainer.accelerator.unwrap_model(trainer.focal_processor).state_dict(),
         'focal_evidence_head_state_dict': trainer.accelerator.unwrap_model(trainer.focal_evidence_head).state_dict(),
         'dual_decoder_state_dict': trainer.accelerator.unwrap_model(trainer.dual_decoder).state_dict(),
+        'physical_support_head_state_dict': trainer.accelerator.unwrap_model(trainer.physical_support_head).state_dict(),
         'optimizer_state_dict': trainer.optimizer.state_dict(),
         'scheduler_state_dict': trainer.lr_scheduler.state_dict(),
         'config': trainer.config,
@@ -77,6 +78,11 @@ def load_checkpoint(trainer: "FocalDiffusionTrainer", checkpoint_path: str) -> T
     if 'focal_evidence_head_state_dict' in checkpoint:
         trainer.focal_evidence_head.load_state_dict(checkpoint['focal_evidence_head_state_dict'], strict=False)
     trainer.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
+    if 'physical_support_head_state_dict' in checkpoint:
+        trainer.physical_support_head.load_state_dict(
+            checkpoint['physical_support_head_state_dict'],
+            strict=False,
+        )
 
     if 'transformer_state_dict' in checkpoint:
         missing, unexpected = trainer.pipeline.transformer.load_state_dict(

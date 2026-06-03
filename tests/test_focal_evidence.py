@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from src.models import FocalStackProcessor
-from src.models.focal_evidence import FocalEvidenceHead
+from src.models.focal_evidence import FocalEvidenceHead, PhysicalSupportHead, build_support_inputs
 from src.training.losses import FocalDiffusionLoss, build_soft_focus_target_from_depth
 
 
@@ -16,14 +16,16 @@ def test_focal_evidence_shapes_probability_and_ranges():
     assert out["focus_posterior"].shape == (B, N, H, W)
     assert out["depth_focus_norm"].shape == (B, 1, H, W)
     assert out["focus_entropy"].shape == (B, 1, H, W)
+    assert out["focus_peakiness"].shape == (B, 1, H, W)
     assert out["focus_reliability"].shape == (B, 1, H, W)
     assert torch.allclose(out["focus_posterior"].sum(dim=1), torch.ones(B, H, W), atol=1e-4)
     assert out["depth_focus_norm"].min() >= 0
     assert out["depth_focus_norm"].max() <= 1
     assert out["focus_entropy"].min() >= 0
     assert out["focus_entropy"].max() <= 1
-    assert out["focus_reliability"].min() >= 0
-    assert out["focus_reliability"].max() <= 1
+    assert out["focus_peakiness"].min() >= 0
+    assert out["focus_peakiness"].max() <= 1
+    assert torch.allclose(out["focus_reliability"], out["focus_peakiness"])
 
 
 def test_focal_evidence_supports_one_hundred_slices():
@@ -63,6 +65,13 @@ def test_pipeline_output_dataclass_exposes_focal_evidence_fields():
         "focus_posterior",
         "focus_entropy",
         "focus_reliability",
+        "focus_peakiness",
+        "physical_support",
+        "gate_focus",
+        "gate_prior",
+        "gate_abstain",
+        "posterior_margin",
+        "depth_disagreement",
         "uncertainty_disagreement",
         "uncertainty_final",
     ):
@@ -97,6 +106,7 @@ def test_focus_posterior_kl_loss_is_finite():
         focus_entropy=evidence["focus_entropy"],
         focus_reliability=evidence["focus_reliability"],
         focus_distances=focus_distances,
+        gate_focus=torch.rand(B, 1, H, W),
         focal_stack=stack,
         rgb_pred=torch.randn(B, C, H, W),
     )
@@ -104,4 +114,42 @@ def test_focus_posterior_kl_loss_is_finite():
     assert torch.isfinite(focus_target).all()
     assert "loss_focus_posterior_kl" in loss_dict
     assert torch.isfinite(loss_dict["loss_focus_posterior_kl"])
+    assert "loss_gate_focus" in loss_dict
     assert torch.isfinite(loss_dict["total"])
+
+
+def test_physical_support_head_shapes_and_gate_normalization():
+    support_inputs = torch.randn(2, 5, 32, 48)
+    head = PhysicalSupportHead(in_channels=5, hidden=16)
+    out = head(support_inputs)
+
+    assert out["gate_logits"].shape == (2, 3, 32, 48)
+    assert out["gate_focus"].shape == (2, 1, 32, 48)
+    assert out["gate_prior"].shape == (2, 1, 32, 48)
+    assert out["gate_abstain"].shape == (2, 1, 32, 48)
+    assert out["uncertainty_final"].shape == (2, 1, 32, 48)
+    assert out["physical_support"].shape == (2, 1, 32, 48)
+    gate_sum = out["gate_focus"] + out["gate_prior"] + out["gate_abstain"]
+    assert torch.allclose(gate_sum, torch.ones_like(gate_sum), atol=1e-5)
+
+
+def test_build_support_inputs_shapes():
+    B, N, H, W = 2, 5, 32, 48
+    focus_posterior = torch.softmax(torch.randn(B, N, H, W), dim=1)
+    focus_entropy = torch.rand(B, 1, H, W)
+    depth_focus = torch.rand(B, 1, H, W)
+    depth_prior = torch.rand(B, 1, H, W)
+    uncertainty_decoder = torch.rand(B, 1, H, W)
+
+    support_inputs, support_maps = build_support_inputs(
+        focus_posterior,
+        focus_entropy,
+        depth_focus,
+        depth_prior,
+        uncertainty_decoder,
+    )
+
+    assert support_inputs.shape == (B, 5, H, W)
+    assert support_maps["focus_peakiness"].shape == (B, 1, H, W)
+    assert support_maps["posterior_margin"].shape == (B, 1, H, W)
+    assert support_maps["depth_disagreement"].shape == (B, 1, H, W)

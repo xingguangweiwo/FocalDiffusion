@@ -1,12 +1,12 @@
 # FSDiffusion: Reliable Zero-Shot Focal-Stack Diffusion via Focal Evidence
 
 ## Short Introduction
-FSDiffusion is a focal-stack-conditioned latent diffusion framework for reliable zero-shot all-in-focus reconstruction and depth estimation. FSDiffusion uses a Focal Evidence Posterior to explicitly predict a per-pixel posterior distribution over focus planes. The posterior is converted into focus-derived depth by soft-argmax and into reliability by entropy. The final depth is a physics-gated fusion of focus-derived depth and diffusion-prior depth, and uncertainty is derived from focus entropy, prior-focus disagreement, and decoder uncertainty.
+FSDiffusion is a focal-stack-conditioned latent diffusion framework for reliable zero-shot all-in-focus reconstruction and depth estimation. FSDiffusion uses a Focal Evidence Posterior to explicitly predict a per-pixel posterior distribution over focus planes. The posterior is converted into focus-derived depth by soft-argmax, while focus entropy is treated as posterior sharpness rather than calibrated reliability. A lightweight Physical Support Head learns selective focus/prior gates and uncertainty from compact focal evidence diagnostics.
 
 ## Highlights
 - Local **Focal Evidence Posterior** (`focus_posterior`) over focus planes.
-- Physics-gated fusion of focus-derived depth and diffusion-prior depth.
-- Physical-support uncertainty from focus entropy, prior-focus disagreement, and decoder uncertainty.
+- Learned physical-support gating of focus-derived depth and diffusion-prior depth.
+- Physical-support uncertainty from focus entropy, posterior margin, prior-focus disagreement, and decoder uncertainty.
 - AIF-focus high-pass consistency for local evidence alignment.
 - Default training/inference path does **not** require PSF/NA/camera metadata.
 
@@ -38,12 +38,12 @@ python script/inference.py --model-path <path_to_checkpoint> --input <focal_stac
 ```
 
 ## Method Overview
-FSDiffusion uses a Focal Evidence Posterior to explicitly predict a per-pixel posterior distribution over focus planes. The posterior is converted into focus-derived depth by soft-argmax and into reliability by entropy. The final depth is a physics-gated fusion of focus-derived depth and diffusion-prior depth, and uncertainty is derived from focus entropy, prior-focus disagreement, and decoder uncertainty.
+FSDiffusion uses a Focal Evidence Posterior to explicitly predict a per-pixel posterior distribution over focus planes. Focus entropy measures posterior sharpness rather than calibrated reliability. FSDiffusion therefore uses a lightweight Physical Support Head that calibrates the final gate and uncertainty from focus entropy, posterior margin, focus-prior disagreement, and decoder uncertainty. Reliable means evidence-aware uncertainty calibration and selective trust, not guaranteed correctness for all pixels or all scenes.
 
-1. Estimate `focus_posterior`, `depth_focus`, `focus_entropy`, and `focus_reliability` with a local Focal Evidence Posterior head.
+1. Estimate `focus_posterior`, `depth_focus`, `focus_entropy`, and `focus_peakiness` with a local Focal Evidence Posterior head.
 2. Decode SD3/FSDiffusion latents into `depth_prior`, AIF latents, and decoder uncertainty.
-3. Fuse `depth_focus` and `depth_prior` with entropy-derived reliability to produce final `depth_map`.
-4. Report physical-support uncertainty from focus entropy, prior-focus disagreement, and decoder uncertainty.
+3. Build compact physical-support inputs from focus peakiness / posterior sharpness, posterior margin, focus-prior disagreement, and decoder uncertainty.
+4. Fuse `depth_focus` and `depth_prior` with learned focus/prior gates, and report calibrated physical support plus final uncertainty.
 
 ## Repository Structure
 - `src/models/`: focal-sweep processor, focal evidence head, attention blocks, and dual-output decoder.

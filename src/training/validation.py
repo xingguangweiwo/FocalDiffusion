@@ -39,6 +39,14 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
         'normalized_loss': 0.0,
         'focus_entropy_mean': 0.0,
         'focus_reliability_mean': 0.0,
+        'gate_focus_mean': 0.0,
+        'gate_prior_mean': 0.0,
+        'gate_abstain_mean': 0.0,
+        'physical_support_mean': 0.0,
+        'depth_disagreement_mean': 0.0,
+        'posterior_margin_mean': 0.0,
+        'uncertainty_final_mean': 0.0,
+        'uncertainty_error_l1': 0.0,
         'depth_prior_focus_disagreement': 0.0,
         'uncertainty_mean': 0.0
     }
@@ -76,6 +84,20 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
                 val_metrics["focus_reliability_mean"] += output.focus_reliability.mean().item()
             if output.depth_prior is not None and output.depth_focus is not None:
                 val_metrics["depth_prior_focus_disagreement"] += torch.abs(output.depth_prior - output.depth_focus).mean().item()
+            if output.gate_focus is not None:
+                val_metrics["gate_focus_mean"] += output.gate_focus.mean().item()
+            if output.gate_prior is not None:
+                val_metrics["gate_prior_mean"] += output.gate_prior.mean().item()
+            if output.gate_abstain is not None:
+                val_metrics["gate_abstain_mean"] += output.gate_abstain.mean().item()
+            if output.physical_support is not None:
+                val_metrics["physical_support_mean"] += output.physical_support.mean().item()
+            if output.depth_disagreement is not None:
+                val_metrics["depth_disagreement_mean"] += output.depth_disagreement.mean().item()
+            if output.posterior_margin is not None:
+                val_metrics["posterior_margin_mean"] += output.posterior_margin.mean().item()
+            if output.uncertainty_final is not None:
+                val_metrics["uncertainty_final_mean"] += output.uncertainty_final.mean().item()
 
             depth_gt = batch.get('depth')
             depth_range = batch.get('depth_range')
@@ -99,6 +121,17 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
                 metric_depth_batches += 1
                 val_loss = _masked_l1(pred_metric, depth_gt, mask)
                 val_metrics['loss'] += val_loss.item()
+                if uncertainty is not None:
+                    uncertainty_for_error = uncertainty.unsqueeze(1) if uncertainty.dim() == 3 else uncertainty
+                    if uncertainty_for_error.shape[-2:] != depth_final_norm_for_loss.shape[-2:]:
+                        uncertainty_for_error = F.interpolate(
+                            uncertainty_for_error,
+                            size=depth_final_norm_for_loss.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    error_norm = torch.abs(depth_final_norm_for_loss.detach() - ((depth_gt - depth_min) / (depth_max - depth_min).clamp(min=1e-6)).clamp(0.0, 1.0))
+                    val_metrics["uncertainty_error_l1"] += _masked_l1(uncertainty_for_error, error_norm, mask).item()
             elif depth_gt is not None and depth_range is None:
                 depth_gt = depth_gt.to(depth_final_norm.device)
                 if depth_gt.dim() == 3:

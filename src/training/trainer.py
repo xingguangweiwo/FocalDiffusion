@@ -25,6 +25,7 @@ from diffusers.training_utils import EMAModel
 from typing import Any, Dict, Optional, Tuple
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
+from ..models.focal_evidence import build_support_inputs
 
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ class FocalDiffusionTrainer:
         logger.info("Loading SD3.5 base model...")
         from ..pipelines import FocalDiffusionPipeline
         from ..models import FocalStackProcessor
-        from ..models.focal_evidence import FocalEvidenceHead
+        from ..models.focal_evidence import FocalEvidenceHead, PhysicalSupportHead
         from ..models.dual_decoder import DualOutputDecoder
 
         model_cfg = self.config['model']
@@ -215,13 +216,12 @@ class FocalDiffusionTrainer:
             focal_attention_depth=self.config['model'].get('focal_attention_depth', 2),
         )
         self.focal_evidence_head = FocalEvidenceHead(
-            hidden=self.config['model'].get('focal_evidence_hidden', 48),
-            temperature=self.config['model'].get('focal_evidence_temperature', 0.07),
-        )
-
-        self.focal_evidence_head = FocalEvidenceHead(
             hidden=self.config["model"].get("focal_evidence_hidden", 48),
             temperature=self.config["model"].get("focal_evidence_temperature", 0.07),
+        )
+        self.physical_support_head = PhysicalSupportHead(
+            in_channels=5,
+            hidden=self.config["model"].get("physical_support_hidden", 16),
         )
 
         self.dual_decoder = DualOutputDecoder(
@@ -245,6 +245,7 @@ class FocalDiffusionTrainer:
             focal_processor=self.focal_processor,
             focal_evidence_head=self.focal_evidence_head,
             dual_decoder=self.dual_decoder,
+            physical_support_head=self.physical_support_head,
         )
 
         target_device = self.accelerator.device if hasattr(self, "accelerator") else torch.device("cpu")
@@ -252,6 +253,7 @@ class FocalDiffusionTrainer:
         self.focal_processor = self.pipeline.focal_processor
         self.focal_evidence_head = self.pipeline.focal_evidence_head
         self.dual_decoder = self.pipeline.dual_decoder
+        self.physical_support_head = self.pipeline.physical_support_head
 
         # Configure trainable parameters
         self._configure_trainable_params()
@@ -292,6 +294,7 @@ class FocalDiffusionTrainer:
         self.focal_processor.requires_grad_(True)
         self.focal_evidence_head.requires_grad_(True)
         self.dual_decoder.requires_grad_(True)
+        self.physical_support_head.requires_grad_(True)
 
         pipeline_params = list(self._iter_pipeline_parameters())
         total_params = sum(param.numel() for param in pipeline_params)
@@ -428,7 +431,8 @@ class FocalDiffusionTrainer:
             prior_depth_weight=self.config['losses'].get('prior_depth_weight', 0.05),
             aif_focus_evidence_weight=self.config['losses'].get('aif_focus_evidence_weight', 0.1),
             uncertainty_focus_weight=self.config['losses'].get('uncertainty_focus_weight', 0.05),
-            uncertainty_error_weight=self.config['losses'].get('uncertainty_error_weight', 0.0),
+            uncertainty_error_weight=self.config['losses'].get('uncertainty_error_weight', 0.05),
+            gate_calibration_weight=self.config['losses'].get('gate_calibration_weight', 0.05),
             focus_target_temperature=self.config['losses'].get('focus_target_temperature', 0.07),
             supervision_mode=supervision_mode,
         )
@@ -529,13 +533,34 @@ class FocalDiffusionTrainer:
                     uncertainty = decoder_outputs["uncertainty"]
                     focal_evidence = self.focal_evidence_head(focal_stack.float(), focus_distances.float())
                     depth_focus_norm = F.interpolate(focal_evidence["depth_focus_norm"], size=depth_prior_norm.shape[-2:], mode="bilinear", align_corners=False)
-                    focus_reliability = F.interpolate(focal_evidence["focus_reliability"], size=depth_prior_norm.shape[-2:], mode="bilinear", align_corners=False)
                     focus_entropy = F.interpolate(focal_evidence["focus_entropy"], size=depth_prior_norm.shape[-2:], mode="bilinear", align_corners=False)
-                    depth_final_norm = focus_reliability * depth_focus_norm + (1.0 - focus_reliability) * depth_prior_norm
+                    focus_posterior = F.interpolate(
+                        focal_evidence["focus_posterior"],
+                        size=depth_prior_norm.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    focus_posterior = focus_posterior / focus_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
                     uncertainty_decoder = uncertainty
-                    uncertainty_disagreement = torch.abs(depth_focus_norm - depth_prior_norm)
-                    uncertainty_focus = focus_entropy
-                    uncertainty_final = (0.5 * uncertainty_decoder + 0.25 * uncertainty_focus + 0.25 * uncertainty_disagreement).clamp(0, 1)
+                    support_inputs, support_maps = build_support_inputs(
+                        focus_posterior=focus_posterior,
+                        focus_entropy=focus_entropy,
+                        depth_focus_norm=depth_focus_norm,
+                        depth_prior_norm=depth_prior_norm,
+                        uncertainty_decoder=uncertainty_decoder,
+                    )
+                    support_outputs = self.physical_support_head(support_inputs)
+                    gate_focus = support_outputs["gate_focus"]
+                    gate_prior = support_outputs["gate_prior"]
+                    gate_abstain = support_outputs["gate_abstain"]
+                    gate_sum = (gate_focus + gate_prior).clamp(min=1e-6)
+                    gate_focus_norm = gate_focus / gate_sum
+                    gate_prior_norm = gate_prior / gate_sum
+                    depth_final_norm = gate_focus_norm * depth_focus_norm + gate_prior_norm * depth_prior_norm
+                    uncertainty_final = torch.maximum(
+                        support_outputs["uncertainty_final"],
+                        gate_abstain,
+                    ).clamp(0.0, 1.0)
                     rgb_latent_pred = decoder_outputs["aif_latents"]
                     rgb_recon = self.pipeline.vae.decode(
                         rgb_latent_pred / self.pipeline.vae.config.scaling_factor,
@@ -561,12 +586,16 @@ class FocalDiffusionTrainer:
                         depth_focus_norm=depth_focus_norm.float(),
                         depth_final_norm=depth_final_norm.float(),
                         uncertainty=uncertainty_final.float(),
-                        focus_posterior=focal_evidence["focus_posterior"].float(),
+                        focus_posterior=focus_posterior.float(),
                         focus_entropy=focus_entropy.float(),
-                        focus_reliability=focus_reliability.float(),
+                        focus_reliability=support_outputs["physical_support"].float(),
                         focus_distances=focus_distances.float(),
                         focal_stack=focal_stack.float(),
                         depth_range=depth_range_tensor.float() if depth_range_tensor is not None else None,
+                        gate_focus=gate_focus_norm.float(),
+                        gate_prior=gate_prior_norm.float(),
+                        gate_abstain=gate_abstain.float(),
+                        physical_support=support_outputs["physical_support"].float(),
                     )
                     loss = loss_dict['total']
 
@@ -591,8 +620,12 @@ class FocalDiffusionTrainer:
                             'learning_rate': self.lr_scheduler.get_last_lr()[0],
                             **{f'train_{k}': v.item() for k, v in loss_dict.items() if k != 'total' and isinstance(v, torch.Tensor)},
                             'train_focus_entropy_mean': focus_entropy.mean().item(),
-                            'train_focus_reliability_mean': focus_reliability.mean().item(),
-                            'train_depth_prior_focus_disagreement': torch.abs(depth_focus_norm - depth_prior_norm).mean().item(),
+                            'train_focus_peakiness_mean': support_maps['focus_peakiness'].mean().item(),
+                            'train_gate_focus_mean': gate_focus_norm.mean().item(),
+                            'train_gate_prior_mean': gate_prior_norm.mean().item(),
+                            'train_gate_abstain_mean': gate_abstain.mean().item(),
+                            'train_physical_support_mean': support_outputs['physical_support'].mean().item(),
+                            'train_depth_prior_focus_disagreement': support_maps['depth_disagreement'].mean().item(),
                         }, step=global_step + step)
 
         if effective_steps == 0:
