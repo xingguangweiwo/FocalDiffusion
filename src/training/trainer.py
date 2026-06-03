@@ -433,6 +433,11 @@ class FocalDiffusionTrainer:
             uncertainty_focus_weight=self.config['losses'].get('uncertainty_focus_weight', 0.05),
             uncertainty_error_weight=self.config['losses'].get('uncertainty_error_weight', 0.05),
             gate_calibration_weight=self.config['losses'].get('gate_calibration_weight', 0.05),
+            posterior_consistency_weight=self.config['losses'].get('posterior_consistency_weight', 0.02),
+            depth_affinity_smoothness_weight=self.config['losses'].get('depth_affinity_smoothness_weight', 0.01),
+            gate_consistency_weight=self.config['losses'].get('gate_consistency_weight', 0.0),
+            focal_axis_smoothness_weight=self.config['losses'].get('focal_axis_smoothness_weight', 0.0),
+            local_affinity_sigma=self.config['losses'].get('local_affinity_sigma', 0.10),
             focus_target_temperature=self.config['losses'].get('focus_target_temperature', 0.07),
             supervision_mode=supervision_mode,
         )

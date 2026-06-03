@@ -26,6 +26,118 @@ def build_soft_focus_target_from_depth(
     return torch.softmax(logits, dim=1), focus_coordinates
 
 
+# Structure-guided focal evidence regularization implemented as training-time
+# consistency losses. It uses local image affinity from the focal stack or AIF
+# target, without external foundation models or inference-time overhead.
+def _resize_and_normalize_posterior(posterior: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    """Resize a focus posterior and re-normalize across focal planes."""
+    if posterior.shape[-2:] == size:
+        return posterior
+    posterior = F.interpolate(posterior, size=size, mode="bilinear", align_corners=False)
+    return posterior / posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+
+def _build_evidence_image(
+    focal_stack: torch.Tensor,
+    focus_posterior: torch.Tensor,
+    rgb_target: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Build an image-like reference for local affinity computation."""
+    if rgb_target is not None:
+        return rgb_target.detach()
+
+    posterior = focus_posterior.detach()
+    if posterior.shape[-2:] != focal_stack.shape[-2:]:
+        posterior = _resize_and_normalize_posterior(posterior, focal_stack.shape[-2:])
+    evidence_image = (posterior[:, :, None] * focal_stack).sum(dim=1)
+    return evidence_image.detach()
+
+
+def _compute_local_affinity(evidence_image: torch.Tensor, sigma: float = 0.10) -> dict[str, torch.Tensor]:
+    """Compute local x/y affinities without forming a global pixel Gram matrix."""
+    sigma = max(float(sigma), 1e-6)
+    image = evidence_image.detach()
+    diff_x = (image[:, :, :, 1:] - image[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+    diff_y = (image[:, :, 1:, :] - image[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+    sim_x = torch.exp(-diff_x / sigma)
+    sim_y = torch.exp(-diff_y / sigma)
+    return {"x": sim_x.detach(), "y": sim_y.detach()}
+
+
+def _pairwise_valid_mask(mask: torch.Tensor | None, direction: str) -> torch.Tensor | None:
+    """Convert a dense valid mask into pairwise x/y valid weights."""
+    if mask is None:
+        return None
+    mask = mask.float()
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    if direction == "x":
+        return mask[:, :, :, 1:] * mask[:, :, :, :-1]
+    if direction == "y":
+        return mask[:, :, 1:, :] * mask[:, :, :-1, :]
+    raise ValueError(f"Unsupported pairwise direction: {direction}")
+
+
+def _weighted_pairwise_mean(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Average pairwise values with affinity and optional validity weights."""
+    weight = weight.to(device=value.device, dtype=value.dtype)
+    if valid is not None:
+        valid = valid.to(device=value.device, dtype=value.dtype)
+        weight = weight * valid
+    return (value * weight).sum() / weight.sum().clamp(min=1.0)
+
+
+def _posterior_consistency_loss(
+    focus_posterior: torch.Tensor,
+    affinity: dict[str, torch.Tensor],
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Encourage similar local regions to keep consistent focus posteriors."""
+    diff_x = (focus_posterior[:, :, :, 1:] - focus_posterior[:, :, :, :-1]).abs().sum(dim=1, keepdim=True)
+    diff_y = (focus_posterior[:, :, 1:, :] - focus_posterior[:, :, :-1, :]).abs().sum(dim=1, keepdim=True)
+    loss_x = _weighted_pairwise_mean(diff_x, affinity["x"], _pairwise_valid_mask(valid_mask, "x"))
+    loss_y = _weighted_pairwise_mean(diff_y, affinity["y"], _pairwise_valid_mask(valid_mask, "y"))
+    return 0.5 * (loss_x + loss_y)
+
+
+def _depth_affinity_smoothness_loss(
+    depth_final_norm: torch.Tensor,
+    affinity: dict[str, torch.Tensor],
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Smooth normalized depth within locally similar regions while preserving edges."""
+    diff_x = (depth_final_norm[:, :, :, 1:] - depth_final_norm[:, :, :, :-1]).abs()
+    diff_y = (depth_final_norm[:, :, 1:, :] - depth_final_norm[:, :, :-1, :]).abs()
+    loss_x = _weighted_pairwise_mean(diff_x, affinity["x"], _pairwise_valid_mask(valid_mask, "x"))
+    loss_y = _weighted_pairwise_mean(diff_y, affinity["y"], _pairwise_valid_mask(valid_mask, "y"))
+    return 0.5 * (loss_x + loss_y)
+
+
+def _gate_consistency_loss(
+    gate_focus: torch.Tensor,
+    affinity: dict[str, torch.Tensor],
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Discourage random local jitter in focus fusion gates."""
+    diff_x = (gate_focus[:, :, :, 1:] - gate_focus[:, :, :, :-1]).abs()
+    diff_y = (gate_focus[:, :, 1:, :] - gate_focus[:, :, :-1, :]).abs()
+    loss_x = _weighted_pairwise_mean(diff_x, affinity["x"], _pairwise_valid_mask(valid_mask, "x"))
+    loss_y = _weighted_pairwise_mean(diff_y, affinity["y"], _pairwise_valid_mask(valid_mask, "y"))
+    return 0.5 * (loss_x + loss_y)
+
+
+def _focal_axis_smoothness_loss(focus_posterior: torch.Tensor) -> torch.Tensor:
+    """Apply a small curvature penalty along the focal-plane axis."""
+    if focus_posterior.shape[1] < 3:
+        return focus_posterior.new_tensor(0.0)
+    curvature = focus_posterior[:, 2:] - 2 * focus_posterior[:, 1:-1] + focus_posterior[:, :-2]
+    return curvature.abs().mean()
+
+
 
 class FocalDiffusionLoss(nn.Module):
     """Main FEP training objective for flow, depth, evidence, AIF and uncertainty."""
@@ -44,6 +156,11 @@ class FocalDiffusionLoss(nn.Module):
         uncertainty_error_weight: float = 0.05,
         focus_target_temperature: float = 0.07,
         gate_calibration_weight: float = 0.05,
+        posterior_consistency_weight: float = 0.02,
+        depth_affinity_smoothness_weight: float = 0.01,
+        gate_consistency_weight: float = 0.0,
+        focal_axis_smoothness_weight: float = 0.0,
+        local_affinity_sigma: float = 0.10,
         **kwargs,
     ):
         super().__init__()
@@ -60,6 +177,11 @@ class FocalDiffusionLoss(nn.Module):
         self.uncertainty_error_weight = uncertainty_error_weight
         self.focus_target_temperature = focus_target_temperature
         self.gate_calibration_weight = gate_calibration_weight
+        self.posterior_consistency_weight = posterior_consistency_weight
+        self.depth_affinity_smoothness_weight = depth_affinity_smoothness_weight
+        self.gate_consistency_weight = gate_consistency_weight
+        self.focal_axis_smoothness_weight = focal_axis_smoothness_weight
+        self.local_affinity_sigma = local_affinity_sigma
 
     @staticmethod
     def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -177,6 +299,70 @@ class FocalDiffusionLoss(nn.Module):
                 uncertainty_resized = F.interpolate(uncertainty_resized, size=focus_entropy_target.shape[-2:], mode="bilinear", align_corners=False)
             losses["loss_uncertainty_focus"] = F.l1_loss(uncertainty_resized, focus_entropy_target)
 
+        if focal_stack is not None and focus_posterior is not None and depth_final_norm is not None:
+            evidence_image = _build_evidence_image(
+                focal_stack=focal_stack,
+                focus_posterior=focus_posterior,
+                rgb_target=rgb_target,
+            )
+            if evidence_image.shape[-2:] != depth_final_norm.shape[-2:]:
+                evidence_image = F.interpolate(
+                    evidence_image,
+                    size=depth_final_norm.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).detach()
+
+            if focus_posterior.shape[-2:] != depth_final_norm.shape[-2:]:
+                posterior_for_reg = _resize_and_normalize_posterior(focus_posterior, depth_final_norm.shape[-2:])
+            else:
+                posterior_for_reg = focus_posterior
+
+            valid_mask_for_reg = depth_mask
+            if valid_mask_for_reg is not None and valid_mask_for_reg.shape[-2:] != depth_final_norm.shape[-2:]:
+                if valid_mask_for_reg.dim() == 3:
+                    valid_mask_for_reg = valid_mask_for_reg.unsqueeze(1)
+                valid_mask_for_reg = F.interpolate(
+                    valid_mask_for_reg.float(),
+                    size=depth_final_norm.shape[-2:],
+                    mode="nearest",
+                )
+
+            affinity = _compute_local_affinity(
+                evidence_image,
+                sigma=self.local_affinity_sigma,
+            )
+            losses["loss_posterior_consistency"] = _posterior_consistency_loss(
+                posterior_for_reg,
+                affinity,
+                valid_mask=valid_mask_for_reg,
+            )
+            losses["loss_depth_affinity_smoothness"] = _depth_affinity_smoothness_loss(
+                depth_final_norm,
+                affinity,
+                valid_mask=valid_mask_for_reg,
+            )
+
+            if gate_focus is not None:
+                if gate_focus.shape[-2:] != depth_final_norm.shape[-2:]:
+                    gate_for_reg = F.interpolate(
+                        gate_focus,
+                        size=depth_final_norm.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                else:
+                    gate_for_reg = gate_focus
+                losses["loss_gate_consistency"] = _gate_consistency_loss(
+                    gate_for_reg,
+                    affinity,
+                    valid_mask=valid_mask_for_reg,
+                )
+
+            losses["loss_focal_axis_smoothness"] = _focal_axis_smoothness_loss(
+                posterior_for_reg,
+            )
+
         total = torch.zeros_like(losses["loss_flow_matching"])
         total = total + self.diffusion_weight * losses["loss_flow_matching"]
         total = total + self.depth_weight * losses.get("loss_depth_final", torch.zeros_like(total))
@@ -188,5 +374,21 @@ class FocalDiffusionLoss(nn.Module):
         total = total + self.uncertainty_focus_weight * losses.get("loss_uncertainty_focus", torch.zeros_like(total))
         total = total + self.uncertainty_error_weight * losses.get("loss_uncertainty_error", torch.zeros_like(total))
         total = total + self.gate_calibration_weight * losses.get("loss_gate_focus", torch.zeros_like(total))
+        total = total + self.posterior_consistency_weight * losses.get(
+            "loss_posterior_consistency",
+            torch.zeros_like(total),
+        )
+        total = total + self.depth_affinity_smoothness_weight * losses.get(
+            "loss_depth_affinity_smoothness",
+            torch.zeros_like(total),
+        )
+        total = total + self.gate_consistency_weight * losses.get(
+            "loss_gate_consistency",
+            torch.zeros_like(total),
+        )
+        total = total + self.focal_axis_smoothness_weight * losses.get(
+            "loss_focal_axis_smoothness",
+            torch.zeros_like(total),
+        )
 
         return {**losses, "total": total}
