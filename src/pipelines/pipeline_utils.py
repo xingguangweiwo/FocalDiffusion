@@ -97,6 +97,8 @@ def load_pipeline(
         pipeline.focal_evidence_head.load_state_dict(checkpoint['focal_evidence_head_state_dict'], strict=False)
     if 'dual_decoder_state_dict' in checkpoint:
         pipeline.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
+    if 'physical_support_head_state_dict' in checkpoint:
+        pipeline.physical_support_head.load_state_dict(checkpoint['physical_support_head_state_dict'], strict=False)
     if 'transformer_state_dict' in checkpoint:
         transformer_state_dict = checkpoint['transformer_state_dict']
         _ensure_transformer_lora(pipeline, checkpoint_config, transformer_state_dict)
@@ -119,6 +121,7 @@ def save_pipeline(
         'focal_processor_state_dict': pipeline.focal_processor.state_dict(),
         'focal_evidence_head_state_dict': pipeline.focal_evidence_head.state_dict(),
         'dual_decoder_state_dict': pipeline.dual_decoder.state_dict(),
+        'physical_support_head_state_dict': pipeline.physical_support_head.state_dict(),
     }
 
     if save_full_model:

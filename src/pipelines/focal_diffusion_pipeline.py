@@ -42,7 +42,7 @@ from transformers import (
 from ..models.focal_attention import FocalCrossAttention
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
-from ..models.focal_evidence import FocalEvidenceHead
+from ..models.focal_evidence import FocalEvidenceHead, PhysicalSupportHead, build_support_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,13 @@ class FocalDiffusionOutput(BaseOutput):
     focus_posterior: Optional[torch.Tensor] = None
     focus_entropy: Optional[torch.Tensor] = None
     focus_reliability: Optional[torch.Tensor] = None
+    focus_peakiness: Optional[torch.Tensor] = None
+    physical_support: Optional[torch.Tensor] = None
+    gate_focus: Optional[torch.Tensor] = None
+    gate_prior: Optional[torch.Tensor] = None
+    gate_abstain: Optional[torch.Tensor] = None
+    posterior_margin: Optional[torch.Tensor] = None
+    depth_disagreement: Optional[torch.Tensor] = None
     uncertainty_decoder: Optional[torch.Tensor] = None
     uncertainty_focus: Optional[torch.Tensor] = None
     uncertainty_disagreement: Optional[torch.Tensor] = None
@@ -267,6 +274,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         "focal_processor",
         "focal_evidence_head",
         "dual_decoder",
+        "physical_support_head",
     )
 
     def __init__(
@@ -283,6 +291,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         focal_processor: Optional[nn.Module] = None,
         focal_evidence_head: Optional[nn.Module] = None,
         dual_decoder: Optional[nn.Module] = None,
+        physical_support_head: Optional[nn.Module] = None,
     ) -> None:
         super().__init__(
             vae=vae,
@@ -312,6 +321,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             "focal_processor",
             "focal_evidence_head",
             "dual_decoder",
+            "physical_support_head",
         )
 
         # Ensure the extended pipeline configuration tracks focal-specific components so
@@ -320,6 +330,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             focal_processor=None,
             focal_evidence_head=None,
             dual_decoder=None,
+            physical_support_head=None,
         )
 
         self.focal_processor = focal_processor or FocalStackProcessor()
@@ -328,6 +339,10 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             in_channels=self.vae.config.latent_channels,
             out_channels_depth=1,
             out_channels_rgb=self.vae.config.latent_channels,
+        )
+        self.physical_support_head = physical_support_head or PhysicalSupportHead(
+            in_channels=5,
+            hidden=16,
         )
 
         condition_channels = getattr(self.focal_processor, "feature_dim", None)
@@ -362,6 +377,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             focal_processor=self.focal_processor,
             focal_evidence_head=self.focal_evidence_head,
             dual_decoder=self.dual_decoder,
+            physical_support_head=self.physical_support_head,
         )
 
     @property
@@ -379,6 +395,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             "focal_processor": self.focal_processor,
             "focal_evidence_head": self.focal_evidence_head,
             "dual_decoder": self.dual_decoder,
+            "physical_support_head": self.physical_support_head,
         }
 
         if getattr(self, "text_encoder_3", None) is not None:
@@ -574,22 +591,38 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         depth_prior_norm = F.interpolate(depth_prior_norm, size=(height, width), mode="bilinear", align_corners=False)
         uncertainty_decoder = F.interpolate(uncertainty_decoder, size=(height, width), mode="bilinear", align_corners=False)
         depth_focus_norm = F.interpolate(focal_evidence["depth_focus_norm"], size=(height, width), mode="bilinear", align_corners=False)
-        focus_reliability = F.interpolate(focal_evidence["focus_reliability"], size=(height, width), mode="bilinear", align_corners=False)
         focus_entropy = F.interpolate(focal_evidence["focus_entropy"], size=(height, width), mode="bilinear", align_corners=False)
-        focus_posterior = focal_evidence["focus_posterior"]
+        focus_posterior = F.interpolate(focal_evidence["focus_posterior"], size=(height, width), mode="bilinear", align_corners=False)
+        focus_posterior = focus_posterior / focus_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
         if depth_focus_norm.shape[0] != depth_prior_norm.shape[0]:
             repeat_factor = depth_prior_norm.shape[0] // depth_focus_norm.shape[0]
             depth_focus_norm = depth_focus_norm.repeat_interleave(repeat_factor, dim=0)
-            focus_reliability = focus_reliability.repeat_interleave(repeat_factor, dim=0)
             focus_entropy = focus_entropy.repeat_interleave(repeat_factor, dim=0)
             focus_posterior = focus_posterior.repeat_interleave(repeat_factor, dim=0)
 
-        depth_final_norm = focus_reliability * depth_focus_norm + (1.0 - focus_reliability) * depth_prior_norm
+        support_inputs, support_maps = build_support_inputs(
+            focus_posterior=focus_posterior,
+            focus_entropy=focus_entropy,
+            depth_focus_norm=depth_focus_norm,
+            depth_prior_norm=depth_prior_norm,
+            uncertainty_decoder=uncertainty_decoder,
+        )
+        support_outputs = self.physical_support_head(support_inputs)
+        gate_focus = support_outputs["gate_focus"]
+        gate_prior = support_outputs["gate_prior"]
+        gate_abstain = support_outputs["gate_abstain"]
+        gate_sum = (gate_focus + gate_prior).clamp(min=1e-6)
+        gate_focus_norm = gate_focus / gate_sum
+        gate_prior_norm = gate_prior / gate_sum
+        depth_final_norm = gate_focus_norm * depth_focus_norm + gate_prior_norm * depth_prior_norm
         depth_map = depth_final_norm.squeeze(1)
+        uncertainty_final = torch.maximum(
+            support_outputs["uncertainty_final"],
+            gate_abstain,
+        ).clamp(0.0, 1.0)
+        physical_support = support_outputs["physical_support"]
         uncertainty_focus = focus_entropy
-        uncertainty_disagreement = torch.abs(depth_focus_norm - depth_prior_norm)
-        uncertainty_physical = 0.5 * uncertainty_focus + 0.5 * uncertainty_disagreement
-        uncertainty_final = (0.5 * uncertainty_decoder + 0.5 * uncertainty_physical).clamp(0.0, 1.0)
+        uncertainty_disagreement = support_maps["depth_disagreement"]
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
@@ -615,7 +648,14 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             depth_final=depth_final_norm.squeeze(1),
             focus_posterior=focus_posterior,
             focus_entropy=focus_entropy.squeeze(1),
-            focus_reliability=focus_reliability.squeeze(1),
+            focus_peakiness=support_maps["focus_peakiness"].squeeze(1),
+            posterior_margin=support_maps["posterior_margin"].squeeze(1),
+            depth_disagreement=support_maps["depth_disagreement"].squeeze(1),
+            physical_support=physical_support.squeeze(1),
+            focus_reliability=physical_support.squeeze(1),
+            gate_focus=gate_focus_norm.squeeze(1),
+            gate_prior=gate_prior_norm.squeeze(1),
+            gate_abstain=gate_abstain.squeeze(1),
             uncertainty_decoder=uncertainty_decoder.squeeze(1),
             uncertainty_focus=uncertainty_focus.squeeze(1),
             uncertainty_disagreement=uncertainty_disagreement.squeeze(1),

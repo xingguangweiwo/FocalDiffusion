@@ -41,8 +41,9 @@ class FocalDiffusionLoss(nn.Module):
         prior_depth_weight: float = 0.05,
         aif_focus_evidence_weight: float = 0.1,
         uncertainty_focus_weight: float = 0.05,
-        uncertainty_error_weight: float = 0.0,
+        uncertainty_error_weight: float = 0.05,
         focus_target_temperature: float = 0.07,
+        gate_calibration_weight: float = 0.05,
         **kwargs,
     ):
         super().__init__()
@@ -58,6 +59,7 @@ class FocalDiffusionLoss(nn.Module):
         self.uncertainty_focus_weight = uncertainty_focus_weight
         self.uncertainty_error_weight = uncertainty_error_weight
         self.focus_target_temperature = focus_target_temperature
+        self.gate_calibration_weight = gate_calibration_weight
 
     @staticmethod
     def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -86,8 +88,12 @@ class FocalDiffusionLoss(nn.Module):
         focal_stack: torch.Tensor | None = None,
         depth_mask: torch.Tensor | None = None,
         depth_range: torch.Tensor | None = None,
+        gate_focus: torch.Tensor | None = None,
+        gate_prior: torch.Tensor | None = None,
+        gate_abstain: torch.Tensor | None = None,
+        physical_support: torch.Tensor | None = None,
     ):
-        del focus_reliability
+        del focus_reliability, gate_prior, gate_abstain, physical_support
 
         losses: dict[str, torch.Tensor] = {
             "loss_flow_matching": F.mse_loss(diffusion_pred, diffusion_target),
@@ -127,6 +133,25 @@ class FocalDiffusionLoss(nn.Module):
                 uncertainty_resized = F.interpolate(uncertainty, size=depth_target.shape[-2:], mode="bilinear", align_corners=False)
                 error_norm = torch.abs(depth_final_resized.detach() - depth_gt_norm)
                 losses["loss_uncertainty_error"] = self._masked_mean(torch.abs(uncertainty_resized - error_norm), mask)
+            if gate_focus is not None and depth_focus_norm is not None and depth_prior_norm is not None:
+                focus_for_gate = depth_focus_norm.detach()
+                prior_for_gate = depth_prior_norm.detach()
+                if focus_for_gate.shape[-2:] != depth_target.shape[-2:]:
+                    focus_for_gate = F.interpolate(focus_for_gate, size=depth_target.shape[-2:], mode="bilinear", align_corners=False)
+                if prior_for_gate.shape[-2:] != depth_target.shape[-2:]:
+                    prior_for_gate = F.interpolate(prior_for_gate, size=depth_target.shape[-2:], mode="bilinear", align_corners=False)
+                err_focus = torch.abs(focus_for_gate - depth_gt_norm)
+                err_prior = torch.abs(prior_for_gate - depth_gt_norm)
+                target_focus = (err_focus < err_prior).float()
+                pred_focus = gate_focus
+                if pred_focus.shape[-2:] != target_focus.shape[-2:]:
+                    pred_focus = F.interpolate(pred_focus, size=target_focus.shape[-2:], mode="bilinear", align_corners=False)
+                loss_gate_focus = F.binary_cross_entropy(
+                    pred_focus.clamp(1e-6, 1.0 - 1e-6),
+                    target_focus,
+                    reduction="none",
+                )
+                losses["loss_gate_focus"] = self._masked_mean(loss_gate_focus, mask)
 
         if enable_supervised and rgb_pred is not None and rgb_target is not None:
             losses["loss_rgb_reconstruction"] = F.l1_loss(rgb_pred, rgb_target)
@@ -162,5 +187,6 @@ class FocalDiffusionLoss(nn.Module):
         total = total + self.aif_focus_evidence_weight * losses.get("loss_aif_focus_consistency", torch.zeros_like(total))
         total = total + self.uncertainty_focus_weight * losses.get("loss_uncertainty_focus", torch.zeros_like(total))
         total = total + self.uncertainty_error_weight * losses.get("loss_uncertainty_error", torch.zeros_like(total))
+        total = total + self.gate_calibration_weight * losses.get("loss_gate_focus", torch.zeros_like(total))
 
         return {**losses, "total": total}
