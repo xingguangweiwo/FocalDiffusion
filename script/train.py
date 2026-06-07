@@ -19,7 +19,7 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from .utils import dump_yaml_file, load_yaml_file
+from script.utils import dump_yaml_file, load_yaml_file
 
 try:
     from src.data.dataset import resolve_data_root

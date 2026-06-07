@@ -44,6 +44,7 @@ data:
   max_train_samples: null
   max_val_samples: null
   dataset_kwargs:
+    strict_data: true
     camera_defaults:
       f_number: 8.0
       focal_length: 0.05

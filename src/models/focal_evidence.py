@@ -154,6 +154,57 @@ def build_support_inputs(
     return support_inputs, support_maps
 
 
+def expected_metric_depth_from_focus_posterior(
+    focus_posterior: torch.Tensor,
+    focus_distances: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Convert a focal-plane posterior into metric depth by diopter interpolation.
+
+    Args:
+        focus_posterior: Per-pixel focal-plane posterior with shape [B, N, H, W].
+        focus_distances: Physical focus distances in meters with shape [B, N] or [N].
+        eps: Numerical clamp used to avoid division by zero.
+
+    Returns:
+        Metric depth in meters with shape [B, 1, H, W].
+
+    Note:
+        This conversion is physically meaningful only when ``focus_distances`` are
+        calibrated metric distances. Index-spaced focal coordinates should remain
+        normalized/relative outputs.
+    """
+
+    if focus_posterior.dim() != 4:
+        raise ValueError(
+            f"focus_posterior must have shape [B, N, H, W], got {tuple(focus_posterior.shape)}"
+        )
+
+    if focus_distances.dim() == 1:
+        focus_distances = focus_distances.unsqueeze(0)
+    if focus_distances.dim() != 2:
+        raise ValueError(
+            f"focus_distances must have shape [B, N] or [N], got {tuple(focus_distances.shape)}"
+        )
+
+    batch, planes = focus_posterior.shape[:2]
+    if focus_distances.shape[1] != planes:
+        raise ValueError(
+            f"focus_distances must contain {planes} planes, got {focus_distances.shape[1]}"
+        )
+    if focus_distances.shape[0] == 1 and batch != 1:
+        focus_distances = focus_distances.expand(batch, -1)
+    elif focus_distances.shape[0] != batch:
+        raise ValueError(
+            f"focus_distances batch must be 1 or {batch}, got {focus_distances.shape[0]}"
+        )
+
+    focus_distances = focus_distances.to(device=focus_posterior.device, dtype=focus_posterior.dtype)
+    diopters = 1.0 / focus_distances.clamp(min=eps)
+    diopter_pred = (focus_posterior * diopters[:, :, None, None]).sum(dim=1, keepdim=True)
+    return 1.0 / diopter_pred.clamp(min=eps)
+
+
 class PhysicalSupportHead(nn.Module):
     """Tiny head that calibrates focus/prior gates and uncertainty from physical support maps."""
 

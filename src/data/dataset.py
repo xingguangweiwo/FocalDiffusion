@@ -50,6 +50,7 @@ class FocalStackDataset(Dataset):
         simulator_kwargs: Optional[Dict[str, float]] = None,
         depth_bounds: Optional[Tuple[float, float]] = None,
         resize_mode: str = "letterbox",
+        strict_data: bool = True,
     ) -> None:
         self.data_roots = self._normalise_root_map(data_root)
         default_candidates = self._select_root_candidates("default")
@@ -62,6 +63,7 @@ class FocalStackDataset(Dataset):
         self.simulator_kwargs = simulator_kwargs or {}
         self.depth_bounds = depth_bounds
         self.resize_mode = resize_mode
+        self.strict_data = strict_data
 
         self.camera_defaults = {
             "f_number": 8.0,
@@ -78,6 +80,12 @@ class FocalStackDataset(Dataset):
             self.samples = self._scan_directory()
 
         dropped = self._prune_missing_samples(self.samples)
+        if dropped > 0 and self.strict_data:
+            raise FileNotFoundError(
+                f"Dropped {dropped} samples due to missing files. "
+                "Please check data_root and filelist. "
+                "Set strict_data=False only for debugging."
+            )
         if dropped:
             logger.warning(
                 "Dropped %d samples with missing assets; %d remain",
@@ -87,6 +95,12 @@ class FocalStackDataset(Dataset):
 
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
+
+        if len(self.samples) == 0:
+            raise ValueError(
+                f"No valid samples found for filelist={filelist_path}. "
+                "Please check data_root and file paths."
+            )
 
         logger.info("Loaded %d samples", len(self.samples))
         self._simulator: Optional[FocalStackSimulator] = None
