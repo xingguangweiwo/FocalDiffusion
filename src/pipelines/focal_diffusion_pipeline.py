@@ -42,7 +42,12 @@ from transformers import (
 from ..models.focal_attention import FocalCrossAttention
 from ..models.dual_decoder import DualOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
-from ..models.focal_evidence import FocalEvidenceHead, PhysicalSupportHead, build_support_inputs
+from ..models.focal_evidence import (
+    FocalEvidenceHead,
+    PhysicalSupportHead,
+    build_support_inputs,
+    expected_metric_depth_from_focus_posterior,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +77,7 @@ class FocalDiffusionOutput(BaseOutput):
     uncertainty_focus: Optional[torch.Tensor] = None
     uncertainty_disagreement: Optional[torch.Tensor] = None
     uncertainty_final: Optional[torch.Tensor] = None
+    depth_focus_metric: Optional[torch.Tensor] = None
 
 
 class FocalInjectedSD3Transformer(nn.Module):
@@ -623,6 +629,15 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         physical_support = support_outputs["physical_support"]
         uncertainty_focus = focus_entropy
         uncertainty_disagreement = support_maps["depth_disagreement"]
+        depth_focus_metric = None
+        metric_focus_distances = focus_distances
+        if metric_focus_distances.shape[0] == 1 and focus_posterior.shape[0] != 1:
+            metric_focus_distances = metric_focus_distances.expand(focus_posterior.shape[0], -1)
+        if torch.all(metric_focus_distances > 1e-6):
+            depth_focus_metric = expected_metric_depth_from_focus_posterior(
+                focus_posterior=focus_posterior,
+                focus_distances=metric_focus_distances,
+            ).squeeze(1)
 
         recon = self.vae.decode(rgb_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
@@ -660,6 +675,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             uncertainty_focus=uncertainty_focus.squeeze(1),
             uncertainty_disagreement=uncertainty_disagreement.squeeze(1),
             uncertainty_final=uncertainty_final.squeeze(1),
+            depth_focus_metric=depth_focus_metric,
         )
 
     @staticmethod

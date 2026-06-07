@@ -74,3 +74,88 @@ def test_pipeline_size_inference_helper():
     assert meta["inference_size"][0] % 16 == 0
     assert meta["inference_size"][1] % 16 == 0
     assert padded[0].size == (meta["inference_size"][1], meta["inference_size"][0])
+
+
+def test_load_config_base_smoke():
+    from script.train import load_config
+
+    config = load_config("configs/base.yaml")
+    assert config["model"]["feature_dim"] == 128
+    assert config["data"]["dataset_kwargs"]["strict_data"] is True
+
+
+def test_dataset_strict_data_raises_on_missing_files(tmp_path):
+    import pytest
+
+    from src.data.dataset import FocalStackDataset
+
+    filelist = tmp_path / "missing.txt"
+    filelist.write_text("missing_stack missing_depth.png\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="Dropped 1 samples due to missing files"):
+        FocalStackDataset(data_root=tmp_path, filelist_path=filelist, strict_data=True)
+
+
+def test_expected_metric_depth_from_focus_posterior_shape_and_finite():
+    from src.models.focal_evidence import expected_metric_depth_from_focus_posterior
+
+    posterior = torch.softmax(torch.randn(2, 5, 4, 3), dim=1)
+    distances = torch.tensor([0.3, 0.5, 0.8, 1.5, 3.0])
+    depth = expected_metric_depth_from_focus_posterior(posterior, distances)
+    assert depth.shape == (2, 1, 4, 3)
+    assert torch.isfinite(depth).all()
+
+
+def test_build_focal_modules_from_config_feature_dim_128():
+    from types import SimpleNamespace
+
+    from src.pipelines.pipeline_utils import _build_focal_modules_from_config
+
+    vae = SimpleNamespace(config=SimpleNamespace(latent_channels=16))
+    modules = _build_focal_modules_from_config(
+        {
+            "model": {
+                "feature_dim": 128,
+                "max_focal_stack_size": 20,
+                "focal_encoder_type": "focal_sweep",
+                "patch_size": 8,
+                "focal_attention_heads": 8,
+                "focal_attention_depth": 1,
+                "focal_evidence_hidden": 32,
+                "focal_evidence_temperature": 0.1,
+                "physical_support_hidden": 12,
+            }
+        },
+        vae,
+    )
+    assert modules["focal_processor"].feature_dim == 128
+    assert modules["focal_processor"].max_sequence_length == 20
+    assert modules["focal_evidence_head"].hidden == 32
+
+
+def test_reliability_metric_helpers_smoke():
+    import importlib.util
+    import pytest
+
+    if importlib.util.find_spec("sklearn") is None:
+        pytest.skip("scikit-learn is not installed")
+
+    from script.evaluate_reliability import evaluate_scores
+
+    depth_gt = torch.linspace(1.0, 2.0, 20).numpy()
+    depth_pred = depth_gt.copy()
+    depth_pred[-5:] += 0.5
+    uncertainty = torch.linspace(0.0, 1.0, 20).numpy()
+    results = evaluate_scores(
+        {
+            "depth_pred": depth_pred,
+            "depth_gt": depth_gt,
+            "valid_mask": torch.ones(20, dtype=torch.bool).numpy(),
+            "uncertainty_final": uncertainty,
+        },
+        high_error_mode="top_percent",
+        high_error_percent=20,
+    )
+    assert "uncertainty_final" in results
+    assert "auroc" in results["uncertainty_final"]
+    assert "ause_absrel" in results["uncertainty_final"]

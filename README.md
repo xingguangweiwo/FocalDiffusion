@@ -1,58 +1,99 @@
-# FSDiffusion: Reliable Zero-Shot Focal-Stack Diffusion via Focal Evidence
+# FSDiffusion: Zero-Shot Focal-Stack Diffusion via Focal Evidence
 
-## Short Introduction
-FSDiffusion is a focal-stack-conditioned latent diffusion framework for reliable zero-shot all-in-focus reconstruction and depth estimation. FSDiffusion uses a Focal Evidence Posterior to explicitly predict a per-pixel posterior distribution over focus planes. The posterior is converted into focus-derived depth by soft-argmax, while focus entropy is treated as posterior sharpness rather than calibrated reliability. A lightweight Physical Support Head learns selective focus/prior gates and uncertainty from compact focal evidence diagnostics.
+A focal-stack-conditioned diffusion framework for joint all-in-focus reconstruction and depth estimation.
+
+FSDiffusion uses focal stacks as physical evidence for depth prediction. It estimates a per-pixel focal-plane posterior, converts focal evidence into focus-derived depth, and fuses it with a diffusion-prior depth prediction through a lightweight physical-support gate.
 
 ## Highlights
-- Local **Focal Evidence Posterior** (`focus_posterior`) over focus planes.
-- Learned physical-support gating of focus-derived depth and diffusion-prior depth.
-- Physical-support uncertainty from focus entropy, posterior margin, prior-focus disagreement, and decoder uncertainty.
-- AIF-focus high-pass consistency for local evidence alignment.
-- Default training/inference path does **not** require PSF/NA/camera metadata.
+
+* Focal Evidence Posterior over focus planes.
+* Joint all-in-focus reconstruction and depth estimation.
+* Fusion of focus-derived depth and diffusion-prior depth.
+* Uncertainty-related outputs from focus entropy, prior-focus disagreement, and gate abstention.
+* Zero-shot evaluation on unseen scenes or datasets after training.
 
 ## Important Notes
-- A trained checkpoint is required for practical inference quality.
-- Here, zero-shot means inference on unseen focal-stack datasets without test-set fine-tuning, not training-free inference without a learned checkpoint.
-- Depth output is normalized by default.
-- Metric depth/height requires dataset/device calibration (e.g., depth range).
-- N=100 may require reducing feature_dim, patch resolution, or batch size.
+
+* A trained checkpoint is required for meaningful inference.
+* “Zero-shot” means evaluation on unseen datasets or scenes without test-time fine-tuning.
+* Depth is normalized by default.
+* Metric depth requires calibrated focus distances and camera parameters.
+* If focus distances are omitted, depth should be interpreted as relative or normalized depth.
 
 ## Installation
+
 ```bash
 pip install -e .
 ```
 
+Install the runtime dependencies required by your environment, including PyTorch, diffusers, transformers, accelerate, and optional PEFT/LoRA packages.
+
 ## Data Preparation
-- Prepare dataset file lists under `data/filelists/`.
-- Configure dataset roots, filelists, and modality options in `configs/*.yaml`.
-- Ensure `focal_stack`, `focus_distances`, and (for supervised/semi-supervised) labels are available according to your mode.
+
+Configure dataset roots and file lists in `configs/*.yaml`.
+
+Typical file-list entries may include:
+
+* `focal_stack_dir`
+* `all_in_focus`
+* `depth_path`
+* `focus_distances`
+* optional camera metadata
 
 ## Training
+
 ```bash
-python script/train.py --config configs/base.yaml
+python -m script.train --config configs/base.yaml
 ```
+
+Before full training, replace placeholder dataset paths in `configs/base.yaml` with real dataset roots and file lists.
 
 ## Inference
+
 ```bash
-python script/inference.py --model-path <path_to_checkpoint> --input <focal_stack_dir_or_images> --output <output_dir>
+python -m script.inference \
+  --model-path outputs/experiments/base/checkpoints/best.pt \
+  --input path/to/focal_stack \
+  --output outputs/demo \
+  --focus-distances 0.3,0.5,0.8,1.5,3.0 \
+  --num-inference-steps 30 \
+  --guidance-scale 1.0
 ```
 
-## Method Overview
-FSDiffusion uses a Focal Evidence Posterior to explicitly predict a per-pixel posterior distribution over focus planes. Focus entropy measures posterior sharpness rather than calibrated reliability. FSDiffusion therefore uses a lightweight Physical Support Head that calibrates the final gate and uncertainty from focus entropy, posterior margin, focus-prior disagreement, and decoder uncertainty. Reliable means evidence-aware uncertainty calibration and selective trust, not guaranteed correctness for all pixels or all scenes.
+If `--focus-distances` is omitted, index-spaced focal positions are used. In that case, the output depth should not be interpreted as metric depth.
 
-1. Estimate `focus_posterior`, `depth_focus`, `focus_entropy`, and `focus_peakiness` with a local Focal Evidence Posterior head.
-2. Decode SD3/FSDiffusion latents into `depth_prior`, AIF latents, and decoder uncertainty.
-3. Build compact physical-support inputs from focus peakiness / posterior sharpness, posterior margin, focus-prior disagreement, and decoder uncertainty.
-4. Fuse `depth_focus` and `depth_prior` with learned focus/prior gates, and report calibrated physical support plus final uncertainty.
+## Method
+
+FSDiffusion consists of three main components:
+
+1. **Focal Evidence Posterior**
+   Predicts a per-pixel posterior distribution over focus planes from the input focal stack.
+
+2. **Diffusion Prior Decoder**
+   Uses latent diffusion features to reconstruct all-in-focus images and predict prior depth.
+
+3. **Physical Support Gate**
+   Fuses focus-derived depth and diffusion-prior depth using compact focal evidence diagnostics, including focus entropy, posterior margin, prior-focus disagreement, and decoder uncertainty.
+
+## Limitations
+
+* Metric depth requires calibrated focus distances and camera parameters.
+* Without valid focus distances, output depth is relative or normalized.
+* Reliability claims should be supported by high-error detection, sparsification, and calibration evaluation.
+* Large diffusion backbones should be separated from focal-evidence contributions through ablation studies.
 
 ## Repository Structure
-- `src/models/`: focal-sweep processor, focal evidence head, attention blocks, and dual-output decoder.
-- `src/pipelines/`: FSDiffusion pipeline and injected SD3 transformer.
-- `src/training/`: trainer, FEP losses, validation, and optimization utilities.
-- `src/data/`: datasets, augmentations, simulation helpers.
-- `script/`: train / inference / evaluate entry points.
-- `configs/`: base and dataset-specific configs.
-- `tests/`: smoke and module tests.
+
+```text
+src/models/       Focal evidence, focal processor, attention blocks, decoder
+src/pipelines/    FSDiffusion pipeline and injected SD3 transformer
+src/training/     Trainer, losses, validation, optimization
+src/data/         Dataset and focal-stack simulation utilities
+script/           Training and inference entry points
+configs/          Experiment configurations
+tests/            Smoke and module tests
+```
 
 ## License
-See project license files and repository policy.
+
+See the repository license.

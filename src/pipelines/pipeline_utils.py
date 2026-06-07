@@ -65,32 +65,95 @@ def _ensure_transformer_lora(
     logger.info("Rebuilt transformer LoRA adapters before loading checkpoint")
 
 
+
+def _model_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the model section from a checkpoint config, if available."""
+    if not isinstance(config, dict):
+        return {}
+    model_config = config.get('model', config)
+    return model_config if isinstance(model_config, dict) else {}
+
+
+def _build_focal_modules_from_config(config: Optional[Dict[str, Any]], vae: torch.nn.Module) -> Dict[str, torch.nn.Module]:
+    """Build focal modules using the architecture stored in a checkpoint config.
+
+    This avoids shape mismatches when inference checkpoints were trained with
+    non-default focal-module dimensions such as ``feature_dim=128``.
+    """
+    from ..models.dual_decoder import DualOutputDecoder
+    from ..models.focal_evidence import FocalEvidenceHead, PhysicalSupportHead
+    from ..models.focal_processor import FocalStackProcessor
+
+    model_config = _model_config(config)
+    latent_channels = int(getattr(getattr(vae, 'config', object()), 'latent_channels', 16))
+
+    return {
+        'focal_processor': FocalStackProcessor(
+            feature_dim=int(model_config.get('feature_dim', 512)),
+            max_sequence_length=int(model_config.get('max_focal_stack_size', 100)),
+            focal_encoder_type=str(model_config.get('focal_encoder_type', 'focal_sweep')),
+            patch_size=int(model_config.get('patch_size', 8)),
+            focal_attention_heads=int(model_config.get('focal_attention_heads', 8)),
+            focal_attention_depth=int(model_config.get('focal_attention_depth', 2)),
+        ),
+        'focal_evidence_head': FocalEvidenceHead(
+            hidden=int(model_config.get('focal_evidence_hidden', 48)),
+            temperature=float(model_config.get('focal_evidence_temperature', 0.07)),
+        ),
+        'physical_support_head': PhysicalSupportHead(
+            in_channels=5,
+            hidden=int(model_config.get('physical_support_hidden', 16)),
+        ),
+        'dual_decoder': DualOutputDecoder(
+            in_channels=latent_channels,
+            out_channels_depth=1,
+            out_channels_rgb=latent_channels,
+        ),
+    }
+
 def load_pipeline(
         checkpoint_path: Union[str, Path],
         base_model_id: str = "stabilityai/stable-diffusion-3.5-large",
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
 ) -> 'FocalDiffusionPipeline':
-    """Load FSDiffusion pipeline from checkpoint"""
+    """Load FSDiffusion pipeline from checkpoint."""
     from .focal_diffusion_pipeline import FocalDiffusionPipeline
     from ..utils.env_utils import ensure_sentencepiece_installed
 
-    # Load base pipeline
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint_config = checkpoint.get('config')
+    if checkpoint_config is None:
+        logger.warning(
+            "Checkpoint %s does not contain a config; falling back to default focal modules. "
+            "This may fail if the checkpoint used non-default focal-module dimensions.",
+            checkpoint_path,
+        )
+
     ensure_sentencepiece_installed()
     pipeline = FocalDiffusionPipeline.from_pretrained(
         base_model_id,
         torch_dtype=dtype,
-    ).to(device)
+    )
 
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-
-    # Load config before model weights so adapter structure can be restored.
-    checkpoint_config = checkpoint.get('config')
     if checkpoint_config is not None:
+        modules = _build_focal_modules_from_config(checkpoint_config, pipeline.vae)
+        pipeline.focal_processor = modules['focal_processor']
+        pipeline.focal_evidence_head = modules['focal_evidence_head']
+        pipeline.dual_decoder = modules['dual_decoder']
+        pipeline.physical_support_head = modules['physical_support_head']
         pipeline.config = checkpoint_config
 
-    # Load component weights
+        condition_channels = getattr(pipeline.focal_processor, 'feature_dim', None)
+        if hasattr(pipeline.transformer, 'condition_adapter') and condition_channels is not None:
+            # Rebuild the condition adapter to match the reconstructed focal processor.
+            hidden_size = pipeline.transformer.config.attention_head_dim * pipeline.transformer.config.num_attention_heads
+            pipeline.transformer.condition_channels = condition_channels
+            pipeline.transformer.condition_adapter = torch.nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
+
+    pipeline = pipeline.to(device)
+
+    # Load component weights after checkpoint-compatible modules have been created.
     if 'focal_processor_state_dict' in checkpoint:
         pipeline.focal_processor.load_state_dict(checkpoint['focal_processor_state_dict'])
     if 'focal_evidence_head_state_dict' in checkpoint:
