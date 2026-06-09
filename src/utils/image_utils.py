@@ -274,7 +274,7 @@ def normalize_depth(
 
 def visualize_focal_stack(
         focal_stack: Union[np.ndarray, torch.Tensor],
-        focus_distances: Optional[List[float]] = None,
+        focal_plane_distances: Optional[List[float]] = None,
         max_images: int = 9,
         save_path: Optional[Union[str, Path]] = None,
 ) -> Optional[plt.Figure]:
@@ -283,7 +283,7 @@ def visualize_focal_stack(
 
     Args:
         focal_stack: Focal stack [N, 3, H, W] or [N, H, W, 3]
-        focus_distances: Optional focus distances for labels
+        focal_plane_distances: Optional focus distances for labels
         max_images: Maximum number of images to show
         save_path: Path to save visualization
 
@@ -312,8 +312,8 @@ def visualize_focal_stack(
 
         axes[i].imshow(img)
 
-        if focus_distances is not None:
-            axes[i].set_title(f'Focus: {focus_distances[i]:.2f}m')
+        if focal_plane_distances is not None:
+            axes[i].set_title(f'Focus: {focal_plane_distances[i]:.2f}m')
         else:
             axes[i].set_title(f'Image {i + 1}')
 

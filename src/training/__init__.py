@@ -1,14 +1,15 @@
-"""FSDiffusion training utilities"""
+"""FocalStackGeneration training utilities"""
 
-from .trainer import FocalDiffusionTrainer
+from .trainer import FocalDiffusionTrainer, FocalStackGenerationTrainer
 from .losses import (
-    FocalDiffusionLoss,
+    FocalStackGenerationLoss,
 )
 from .optimizers import get_optimizer, get_scheduler
 
 __all__ = [
+    "FocalStackGenerationTrainer",
     "FocalDiffusionTrainer",
-    "FocalDiffusionLoss",
+    "FocalStackGenerationLoss",
     "get_optimizer",
     "get_scheduler",
 ]

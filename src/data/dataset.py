@@ -1,4 +1,4 @@
-"""Dataset implementation for FocalDiffusion.
+"""Dataset implementation for FocalStackGeneration.
 
 The dataset supports loading pre-rendered focal stacks or synthesising them on the
 fly from all-in-focus RGB images and metric depth maps (including HyperSim HDF5
@@ -17,7 +17,7 @@ import torch
 from PIL import Image
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from .focal_simulator import FocalStackSimulator
+from .synthetic_focal_stack_renderer import SyntheticFocalStackRenderer
 
 logger = logging.getLogger(__name__)
 
@@ -103,19 +103,20 @@ class FocalStackDataset(Dataset):
             )
 
         logger.info("Loaded %d samples", len(self.samples))
-        self._simulator: Optional[FocalStackSimulator] = None
+        self._simulator: Optional[SyntheticFocalStackRenderer] = None
 
     # ---------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------
     @property
-    def simulator(self) -> FocalStackSimulator:
+    def simulator(self) -> SyntheticFocalStackRenderer:
         if self._simulator is None:
-            self._simulator = FocalStackSimulator(**self.simulator_kwargs)
+            self._simulator = SyntheticFocalStackRenderer(**self.simulator_kwargs)
         return self._simulator
 
     _ROOT_ALIASES: Mapping[str, Tuple[str, ...]] = {
         "default": ("default", "all_in_focus", "focal_stack", "depth"),
+        # Include the legacy "aif" root alias for backward-compatible file lists.
         "all_in_focus": ("all_in_focus", "rgb", "images", "aif", "focal_stack", "default"),
         "focal_stack": ("focal_stack", "stack", "rgb", "images", "all_in_focus", "default"),
         "depth": ("depth", "depth_map", "disparity", "default"),
@@ -338,11 +339,13 @@ class FocalStackDataset(Dataset):
         if focal_key:
             sample["focal_stack_dir"] = focal_key
 
+        # Accept legacy "aif" keys while standardizing samples to "all_in_focus".
         if entry.get("all_in_focus") or entry.get("aif") or entry.get("aif_path"):
             sample["all_in_focus"] = entry.get("all_in_focus") or entry.get("aif") or entry.get("aif_path")
 
-        if "focus_distances" in entry:
-            sample["focus_distances"] = [float(v) for v in entry["focus_distances"]]
+        if "focal_plane_distances" in entry or "focus_distances" in entry:
+            distance_values = entry.get("focal_plane_distances", entry.get("focus_distances"))
+            sample["focal_plane_distances"] = [float(v) for v in distance_values]
 
         if "focus_range" in entry and entry["focus_range"]:
             sample["focus_range"] = [float(v) for v in entry["focus_range"]]
@@ -390,21 +393,21 @@ class FocalStackDataset(Dataset):
         use_generated = self._should_generate_stack(sample_info)
 
         if use_generated:
-            focus_distances = self._get_focus_distances(sample_info, self.focal_stack_size)
+            focal_plane_distances = self._get_focal_plane_distances(sample_info, self.focal_stack_size)
             all_in_focus = self._load_all_in_focus(sample_info)
             focal_stack = self.simulator.generate(
                 all_in_focus,
                 depth.squeeze(0),
-                focus_distances,
+                focal_plane_distances,
                 sample_info.get("camera"),
             )
         else:
             focal_stack = self._load_focal_stack(sample_info)
-            focus_distances = self._get_focus_distances(sample_info, focal_stack.shape[0])
+            focal_plane_distances = self._get_focal_plane_distances(sample_info, focal_stack.shape[0])
             all_in_focus = self._load_all_in_focus(sample_info, fallback=focal_stack)
 
-        if focal_stack.shape[0] != focus_distances.numel():
-            focus_distances = self._align_focus_distances(focus_distances, focal_stack.shape[0])
+        if focal_stack.shape[0] != focal_plane_distances.numel():
+            focal_plane_distances = self._align_focal_plane_distances(focal_plane_distances, focal_stack.shape[0])
 
         camera_params = self._compose_camera_params(sample_info, depth_meta)
 
@@ -412,7 +415,7 @@ class FocalStackDataset(Dataset):
             "focal_stack": focal_stack,
             "depth": depth,
             "all_in_focus": all_in_focus,
-            "focus_distances": focus_distances,
+            "focal_plane_distances": focal_plane_distances,
             "camera_params": camera_params,
             "sample_path": sample_info.get("focal_stack_dir") or sample_info.get("depth_path", ""),
             "depth_range": torch.tensor(
@@ -516,9 +519,12 @@ class FocalStackDataset(Dataset):
 
         return torch.stack(images, dim=0)
 
-    def _get_focus_distances(self, sample_info: Dict, num_images: int) -> torch.Tensor:
-        if "focus_distances" in sample_info:
-            distances = torch.as_tensor(sample_info["focus_distances"], dtype=torch.float32)
+    def _get_focal_plane_distances(self, sample_info: Dict, num_images: int) -> torch.Tensor:
+        if "focal_plane_distances" in sample_info or "focus_distances" in sample_info:
+            distances = torch.as_tensor(
+                sample_info.get("focal_plane_distances", sample_info.get("focus_distances")),
+                dtype=torch.float32,
+            )
         else:
             focus_range = sample_info.get("focus_range", self.focal_range)
             near, far = focus_range
@@ -528,9 +534,9 @@ class FocalStackDataset(Dataset):
                 steps=max(num_images, 1),
                 dtype=torch.float32,
             )
-        return self._align_focus_distances(distances, num_images)
+        return self._align_focal_plane_distances(distances, num_images)
 
-    def _align_focus_distances(self, distances: torch.Tensor, num_images: int) -> torch.Tensor:
+    def _align_focal_plane_distances(self, distances: torch.Tensor, num_images: int) -> torch.Tensor:
         if distances.numel() == num_images:
             return distances
         if distances.numel() > num_images:

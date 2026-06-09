@@ -1,5 +1,5 @@
 """
-Evaluation script for FSDiffusion with normalized-depth aware metrics.
+Evaluation script for FocalStackGeneration with normalized-depth aware metrics.
 """
 
 import argparse
@@ -18,7 +18,7 @@ from src.utils.metrics import compute_metrics
 
 
 def evaluate(args):
-    warnings.warn("This script is deprecated and not aligned with the normalized-depth FSDiffusion pipeline. Use trainer validation until this script is updated.", DeprecationWarning, stacklevel=2)
+    warnings.warn("This script is deprecated and not aligned with the normalized-depth FocalStackGeneration pipeline. Use trainer validation until this script is updated.", DeprecationWarning, stacklevel=2)
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -50,18 +50,18 @@ def evaluate(args):
             break
 
         focal_stack = batch['focal_stack'].to(args.device)
-        focus_distances = batch['focus_distances'].to(args.device)
+        focal_plane_distances = batch['focal_plane_distances'].to(args.device)
         depth_gt = batch.get('depth')
         depth_range = batch.get('depth_range')
         with torch.no_grad():
             output = pipeline(
                 focal_stack=focal_stack,
-                focus_distances=focus_distances,
+                focal_plane_distances=focal_plane_distances,
                 num_inference_steps=args.num_inference_steps,
                 output_type='pt',
             )
 
-        depth_final_norm = output.depth_map
+        final_depth_canonical = output.depth_map
         sample_metrics = {}
 
         if depth_gt is not None and depth_range is not None:
@@ -69,22 +69,22 @@ def evaluate(args):
             depth_range = depth_range.to(args.device)
             depth_min = depth_range[:, 0].view(-1, 1, 1)
             depth_max = depth_range[:, 1].view(-1, 1, 1)
-            pred_metric = depth_final_norm * (depth_max - depth_min).clamp(min=1e-6) + depth_min
+            pred_metric = final_depth_canonical * (depth_max - depth_min).clamp(min=1e-6) + depth_min
             sample_metrics.update(compute_metrics(pred_metric, depth_gt))
             sample_metrics["loss"] = F.l1_loss(pred_metric, depth_gt).item()
         elif depth_gt is not None:
             depth_gt = depth_gt.to(args.device)
-            if depth_final_norm.dim() == 3:
-                depth_final_norm = depth_final_norm.unsqueeze(1)
+            if final_depth_canonical.dim() == 3:
+                final_depth_canonical = final_depth_canonical.unsqueeze(1)
             if depth_gt.dim() == 3:
                 depth_gt = depth_gt.unsqueeze(1)
-            sample_metrics["normalized_loss"] = F.l1_loss(depth_final_norm, depth_gt).item()
+            sample_metrics["normalized_loss"] = F.l1_loss(final_depth_canonical, depth_gt).item()
 
         uncertainty = getattr(output, "uncertainty_final", None)
         if uncertainty is None:
             uncertainty = output.uncertainty
         sample_metrics["uncertainty_mean"] = float(uncertainty.mean().item()) if uncertainty is not None else 0.0
-        sample_metrics["focus_entropy_mean"] = float(output.focus_entropy.mean().item()) if output.focus_entropy is not None else 0.0
+        sample_metrics["focal_entropy_mean"] = float(output.focal_entropy.mean().item()) if output.focal_entropy is not None else 0.0
         sample_metrics["focus_reliability_mean"] = float(output.focus_reliability.mean().item()) if output.focus_reliability is not None else 0.0
         if output.depth_prior is not None and output.depth_focus is not None:
             sample_metrics["depth_prior_focus_disagreement"] = float(torch.abs(output.depth_prior - output.depth_focus).mean().item())
@@ -108,7 +108,7 @@ def evaluate(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate FSDiffusion model")
+    parser = argparse.ArgumentParser(description="Evaluate FocalStackGeneration model")
     parser.add_argument('--config', type=str, required=True, help='Config file')
     parser.add_argument('--checkpoint', type=str, required=True, help='Model checkpoint')
     parser.add_argument('--dataset', type=str, choices=['hypersim', 'virtual_kitti'], required=True)

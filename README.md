@@ -1,24 +1,24 @@
-# FSDiffusion: Zero-Shot Focal-Stack Diffusion via Focal Evidence
+# Focal Stack Understanding as Image Generation
 
-A focal-stack-conditioned diffusion framework for joint all-in-focus reconstruction and depth estimation.
+A task-conditioned diffusion framework for focal-stack understanding, including all-in-focus reconstruction, depth generation, uncertainty estimation, focal evidence estimation, and refocused focal-plane generation.
 
-FSDiffusion uses focal stacks as physical evidence for depth prediction. It estimates a per-pixel focal-plane posterior, converts focal evidence into focus-derived depth, and fuses it with a diffusion-prior depth prediction through a lightweight physical-support gate.
+FocalStackGeneration formulates focal-stack understanding as task-conditioned image generation. It uses focal stacks as physical evidence, estimates a per-pixel focal-plane posterior, generates canonical depth and uncertainty outputs, and estimates focal evidence weighting for physically grounded outputs while preserving the Stable Diffusion 3.5 backbone.
 
 ## Highlights
 
-* Focal Evidence Posterior over focus planes.
-* Joint all-in-focus reconstruction and depth estimation.
-* Fusion of focus-derived depth and diffusion-prior depth.
-* Uncertainty-related outputs from focus entropy, prior-focus disagreement, and gate abstention.
-* Zero-shot evaluation on unseen scenes or datasets after training.
+* Task-conditioned focal-stack image generation for all-in-focus reconstruction, depth, uncertainty, focal evidence, and refocus outputs.
+* Focal evidence posterior over focal planes.
+* All-in-focus reconstruction and depth generation from focal-stack conditioning.
+* Uncertainty-related outputs from focal entropy, generated-depth disagreement, and abstention weighting.
+* Refocused focal-plane generation support for held-out focal-plane evaluation.
 
 ## Important Notes
 
 * A trained checkpoint is required for meaningful inference.
 * “Zero-shot” means evaluation on unseen datasets or scenes without test-time fine-tuning.
 * Depth is normalized by default.
-* Metric depth requires calibrated focus distances and camera parameters.
-* If focus distances are omitted, depth should be interpreted as relative or normalized depth.
+* Metric depth requires calibrated focal-plane distances and camera parameters.
+* If focal-plane distances are omitted, depth should be interpreted as relative or normalized depth.
 
 ## Installation
 
@@ -37,8 +37,10 @@ Typical file-list entries may include:
 * `focal_stack_dir`
 * `all_in_focus`
 * `depth_path`
-* `focus_distances`
+* `focal_plane_distances`
 * optional camera metadata
+
+Legacy file lists may still use `focus_distances`; loaders keep compatibility where possible.
 
 ## Training
 
@@ -60,35 +62,47 @@ python -m script.inference \
   --guidance-scale 1.0
 ```
 
-If `--focus-distances` is omitted, index-spaced focal positions are used. In that case, the output depth should not be interpreted as metric depth.
+If `--focus-distances` is omitted, index-spaced focal positions are used for backward-compatible CLI behavior. In that case, output depth should not be interpreted as metric depth.
+
+## Generation Tasks
+
+Canonical task names are centralized in `src/generation_tasks.py`:
+
+* `all_in_focus`
+* `depth`
+* `uncertainty`
+* `focal_evidence`
+* `refocus`
+
+The legacy task alias `aif` is accepted only as a compatibility alias for `all_in_focus`.
 
 ## Method
 
-FSDiffusion consists of three main components:
+FocalStackGeneration consists of three main components:
 
-1. **Focal Evidence Posterior**
-   Predicts a per-pixel posterior distribution over focus planes from the input focal stack.
+1. **Focal Evidence Encoder**
+   Predicts a per-pixel posterior distribution over focal planes from the input focal stack.
 
-2. **Diffusion Prior Decoder**
-   Uses latent diffusion features to reconstruct all-in-focus images and predict prior depth.
+2. **Task-Conditioned Generative Decoder**
+   Uses latent diffusion features to reconstruct all-in-focus images and generate canonical depth.
 
-3. **Physical Support Gate**
-   Fuses focus-derived depth and diffusion-prior depth using compact focal evidence diagnostics, including focus entropy, posterior margin, prior-focus disagreement, and decoder uncertainty.
+3. **Physical Evidence Estimator**
+   Estimates focal evidence weighting and uncertainty from compact focal evidence diagnostics, including focal entropy, posterior margin, generated-depth disagreement, and generative uncertainty.
 
 ## Limitations
 
-* Metric depth requires calibrated focus distances and camera parameters.
-* Without valid focus distances, output depth is relative or normalized.
+* Metric depth requires calibrated focal-plane distances and camera parameters.
+* Without valid focal-plane distances, output depth is relative or normalized.
 * Reliability claims should be supported by high-error detection, sparsification, and calibration evaluation.
 * Large diffusion backbones should be separated from focal-evidence contributions through ablation studies.
 
 ## Repository Structure
 
 ```text
-src/models/       Focal evidence, focal processor, attention blocks, decoder
-src/pipelines/    FSDiffusion pipeline and injected SD3 transformer
+src/models/       Focal evidence encoder, focal processor, attention blocks, decoder
+src/pipelines/    FocalStackGeneration pipeline and injected SD3 transformer
 src/training/     Trainer, losses, validation, optimization
-src/data/         Dataset and focal-stack simulation utilities
+src/data/         Dataset and synthetic focal-stack rendering utilities
 script/           Training and inference entry points
 configs/          Experiment configurations
 tests/            Smoke and module tests

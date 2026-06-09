@@ -130,7 +130,7 @@ def estimate_sensor_size(camera_model: str) -> float:
     return 43.3 / 1000
 
 
-def estimate_focus_distances(
+def estimate_focal_plane_distances(
         num_images: int,
         near_focus: float = 0.3,
         far_focus: float = 10.0,

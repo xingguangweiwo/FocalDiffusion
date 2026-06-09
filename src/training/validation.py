@@ -27,7 +27,7 @@ def _masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | No
 
     return F.l1_loss(pred[mask], target[mask])
 
-def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, float]:
+def run_validation(trainer: "FocalStackGenerationTrainer", epoch: int) -> Dict[str, float]:
     """Run one validation epoch for the provided trainer instance."""
 
     _ = epoch
@@ -37,12 +37,12 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
         'abs_rel': 0.0,
         'rmse': 0.0,
         'normalized_loss': 0.0,
-        'focus_entropy_mean': 0.0,
+        'focal_entropy_mean': 0.0,
         'focus_reliability_mean': 0.0,
-        'gate_focus_mean': 0.0,
-        'gate_prior_mean': 0.0,
-        'gate_abstain_mean': 0.0,
-        'physical_support_mean': 0.0,
+        'focal_evidence_weight_mean': 0.0,
+        'generative_prior_weight_mean': 0.0,
+        'abstention_weight_mean': 0.0,
+        'physical_evidence_support_mean': 0.0,
         'depth_disagreement_mean': 0.0,
         'posterior_margin_mean': 0.0,
         'uncertainty_final_mean': 0.0,
@@ -61,37 +61,37 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
         ):
             output = trainer.pipeline(
                 focal_stack=batch['focal_stack'],
-                focus_distances=batch['focus_distances'],
+                focal_plane_distances=batch['focal_plane_distances'],
                 num_inference_steps=trainer.config['validation']['num_inference_steps'],
                 guidance_scale=trainer.config['validation']['guidance_scale'],
                 output_type='pt',
                 return_dict=True,
             )
 
-            depth_final_norm = output.depth_map
-            if depth_final_norm.dim() == 3:
-                depth_final_norm_for_loss = depth_final_norm.unsqueeze(1)
+            final_depth_canonical = output.depth_map
+            if final_depth_canonical.dim() == 3:
+                final_depth_canonical_for_loss = final_depth_canonical.unsqueeze(1)
             else:
-                depth_final_norm_for_loss = depth_final_norm
+                final_depth_canonical_for_loss = final_depth_canonical
             uncertainty = getattr(output, "uncertainty_final", None)
             if uncertainty is None:
                 uncertainty = getattr(output, "uncertainty", None)
             if uncertainty is not None:
                 val_metrics["uncertainty_mean"] += uncertainty.mean().item()
-            if output.focus_entropy is not None:
-                val_metrics["focus_entropy_mean"] += output.focus_entropy.mean().item()
+            if output.focal_entropy is not None:
+                val_metrics["focal_entropy_mean"] += output.focal_entropy.mean().item()
             if output.focus_reliability is not None:
                 val_metrics["focus_reliability_mean"] += output.focus_reliability.mean().item()
             if output.depth_prior is not None and output.depth_focus is not None:
                 val_metrics["depth_prior_focus_disagreement"] += torch.abs(output.depth_prior - output.depth_focus).mean().item()
-            if output.gate_focus is not None:
-                val_metrics["gate_focus_mean"] += output.gate_focus.mean().item()
-            if output.gate_prior is not None:
-                val_metrics["gate_prior_mean"] += output.gate_prior.mean().item()
-            if output.gate_abstain is not None:
-                val_metrics["gate_abstain_mean"] += output.gate_abstain.mean().item()
-            if output.physical_support is not None:
-                val_metrics["physical_support_mean"] += output.physical_support.mean().item()
+            if output.focal_evidence_weight is not None:
+                val_metrics["focal_evidence_weight_mean"] += output.focal_evidence_weight.mean().item()
+            if output.generative_prior_weight is not None:
+                val_metrics["generative_prior_weight_mean"] += output.generative_prior_weight.mean().item()
+            if output.abstention_weight is not None:
+                val_metrics["abstention_weight_mean"] += output.abstention_weight.mean().item()
+            if output.physical_evidence_support is not None:
+                val_metrics["physical_evidence_support_mean"] += output.physical_evidence_support.mean().item()
             if output.depth_disagreement is not None:
                 val_metrics["depth_disagreement_mean"] += output.depth_disagreement.mean().item()
             if output.posterior_margin is not None:
@@ -103,17 +103,17 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
             depth_range = batch.get('depth_range')
             mask = batch.get('valid_mask')
             if mask is not None:
-                mask = mask.to(depth_final_norm.device)
+                mask = mask.to(final_depth_canonical.device)
 
             has_metric_target = depth_gt is not None and depth_range is not None
             if has_metric_target:
-                depth_gt = depth_gt.to(depth_final_norm.device)
+                depth_gt = depth_gt.to(final_depth_canonical.device)
                 if depth_gt.dim() == 3:
                     depth_gt = depth_gt.unsqueeze(1)
-                depth_range = depth_range.to(depth_final_norm.device)
+                depth_range = depth_range.to(final_depth_canonical.device)
                 depth_min = depth_range[:, 0].view(-1, 1, 1, 1)
                 depth_max = depth_range[:, 1].view(-1, 1, 1, 1)
-                pred_metric = depth_final_norm_for_loss * (depth_max - depth_min).clamp(min=1e-6) + depth_min
+                pred_metric = final_depth_canonical_for_loss * (depth_max - depth_min).clamp(min=1e-6) + depth_min
                 metrics = compute_metrics(pred_metric.squeeze(1), depth_gt.squeeze(1), mask=mask)
                 for key, value in metrics.items():
                     if key in ("abs_rel", "rmse"):
@@ -123,20 +123,20 @@ def run_validation(trainer: "FocalDiffusionTrainer", epoch: int) -> Dict[str, fl
                 val_metrics['loss'] += val_loss.item()
                 if uncertainty is not None:
                     uncertainty_for_error = uncertainty.unsqueeze(1) if uncertainty.dim() == 3 else uncertainty
-                    if uncertainty_for_error.shape[-2:] != depth_final_norm_for_loss.shape[-2:]:
+                    if uncertainty_for_error.shape[-2:] != final_depth_canonical_for_loss.shape[-2:]:
                         uncertainty_for_error = F.interpolate(
                             uncertainty_for_error,
-                            size=depth_final_norm_for_loss.shape[-2:],
+                            size=final_depth_canonical_for_loss.shape[-2:],
                             mode="bilinear",
                             align_corners=False,
                         )
-                    error_norm = torch.abs(depth_final_norm_for_loss.detach() - ((depth_gt - depth_min) / (depth_max - depth_min).clamp(min=1e-6)).clamp(0.0, 1.0))
+                    error_norm = torch.abs(final_depth_canonical_for_loss.detach() - ((depth_gt - depth_min) / (depth_max - depth_min).clamp(min=1e-6)).clamp(0.0, 1.0))
                     val_metrics["uncertainty_error_l1"] += _masked_l1(uncertainty_for_error, error_norm, mask).item()
             elif depth_gt is not None and depth_range is None:
-                depth_gt = depth_gt.to(depth_final_norm.device)
+                depth_gt = depth_gt.to(final_depth_canonical.device)
                 if depth_gt.dim() == 3:
                     depth_gt = depth_gt.unsqueeze(1)
-                val_metrics['normalized_loss'] += F.l1_loss(depth_final_norm_for_loss, depth_gt).item()
+                val_metrics['normalized_loss'] += F.l1_loss(final_depth_canonical_for_loss, depth_gt).item()
 
             num_batches += 1
 

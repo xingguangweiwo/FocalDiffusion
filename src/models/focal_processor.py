@@ -26,10 +26,10 @@ class FocalSweepEncoder(nn.Module):
         self.query_attn = nn.MultiheadAttention(feature_dim, num_heads, batch_first=True)
 
     @staticmethod
-    def normalize_focus_distances(focus_distances: torch.Tensor) -> torch.Tensor:
-        tau_min = focus_distances.min(dim=1, keepdim=True).values
-        tau_max = focus_distances.max(dim=1, keepdim=True).values
-        return (focus_distances - tau_min) / (tau_max - tau_min + 1e-6)
+    def normalize_focal_plane_distances(focal_plane_distances: torch.Tensor) -> torch.Tensor:
+        tau_min = focal_plane_distances.min(dim=1, keepdim=True).values
+        tau_max = focal_plane_distances.max(dim=1, keepdim=True).values
+        return (focal_plane_distances - tau_min) / (tau_max - tau_min + 1e-6)
 
     @staticmethod
     def fourier_embed(tau: torch.Tensor, bands: int = 8) -> torch.Tensor:
@@ -37,14 +37,14 @@ class FocalSweepEncoder(nn.Module):
         x = tau.unsqueeze(-1) * freq * math.pi
         return torch.cat([torch.sin(x), torch.cos(x)], dim=-1)
 
-    def forward(self, focal_stack: torch.Tensor, focus_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
         B, N, _, H, W = focal_stack.shape
         x = focal_stack.reshape(B * N, 3, H, W)
         tokens_2d = self.patch_embed(x)
         h, w = tokens_2d.shape[-2:]
         tokens = tokens_2d.flatten(2).transpose(1, 2).view(B, N, h * w, self.feature_dim)
 
-        tau = self.normalize_focus_distances(focus_distances)
+        tau = self.normalize_focal_plane_distances(focal_plane_distances)
         tau_tokens = self.tau_embed(self.fourier_embed(tau)).unsqueeze(2)
         tokens = tokens + tau_tokens
 
@@ -78,7 +78,7 @@ class FocalStackProcessor(nn.Module):
         super().__init__()
         del num_scales, dropout
         if focal_encoder_type != "focal_sweep":
-            raise ValueError("Only focal_sweep is supported in the cleaned FSDiffusion implementation.")
+            raise ValueError("Only focal_sweep is supported in the cleaned FocalStackGeneration implementation.")
         self.feature_dim = feature_dim
         self.max_sequence_length = max_sequence_length
         self.focal_encoder_type = focal_encoder_type
@@ -89,10 +89,10 @@ class FocalStackProcessor(nn.Module):
             depth=focal_attention_depth,
         )
 
-    def forward(self, focal_stack: torch.Tensor, focus_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Process a focal stack into SD3 conditioning features."""
         B, N, C, H, W = focal_stack.shape
         del B, C, H, W
         if N > self.max_sequence_length:
             raise ValueError(f"Sequence length {N} exceeds maximum {self.max_sequence_length}")
-        return self.focal_sweep_encoder(focal_stack, focus_distances)
+        return self.focal_sweep_encoder(focal_stack, focal_plane_distances)

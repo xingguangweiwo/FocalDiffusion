@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def save_checkpoint(
-    trainer: "FocalDiffusionTrainer",
+    trainer: "FocalStackGenerationTrainer",
     epoch: int,
     global_step: int,
     is_best: bool = False,
@@ -27,7 +27,7 @@ def save_checkpoint(
         'focal_processor_state_dict': trainer.accelerator.unwrap_model(trainer.focal_processor).state_dict(),
         'focal_evidence_head_state_dict': trainer.accelerator.unwrap_model(trainer.focal_evidence_head).state_dict(),
         'dual_decoder_state_dict': trainer.accelerator.unwrap_model(trainer.dual_decoder).state_dict(),
-        'physical_support_head_state_dict': trainer.accelerator.unwrap_model(trainer.physical_support_head).state_dict(),
+        'physical_evidence_support_head_state_dict': trainer.accelerator.unwrap_model(trainer.physical_evidence_support_head).state_dict(),
         'optimizer_state_dict': trainer.optimizer.state_dict(),
         'scheduler_state_dict': trainer.lr_scheduler.state_dict(),
         'config': trainer.config,
@@ -56,7 +56,7 @@ def save_checkpoint(
         cleanup_checkpoints(trainer)
 
 
-def cleanup_checkpoints(trainer: "FocalDiffusionTrainer") -> None:
+def cleanup_checkpoints(trainer: "FocalStackGenerationTrainer") -> None:
     """Keep only the latest configured checkpoint files."""
     save_top_k = trainer.config['output'].get('save_top_k', 3)
     checkpoints = list(trainer.checkpoint_dir.glob('checkpoint_epoch_*.pt'))
@@ -68,7 +68,7 @@ def cleanup_checkpoints(trainer: "FocalDiffusionTrainer") -> None:
             logger.info("Removed old checkpoint: %s", checkpoint.name)
 
 
-def load_checkpoint(trainer: "FocalDiffusionTrainer", checkpoint_path: str) -> Tuple[int, int]:
+def load_checkpoint(trainer: "FocalStackGenerationTrainer", checkpoint_path: str) -> Tuple[int, int]:
     """Load checkpoint and restore optimizer/scheduler/model states."""
     logger.info("Loading checkpoint from %s", checkpoint_path)
 
@@ -78,9 +78,9 @@ def load_checkpoint(trainer: "FocalDiffusionTrainer", checkpoint_path: str) -> T
     if 'focal_evidence_head_state_dict' in checkpoint:
         trainer.focal_evidence_head.load_state_dict(checkpoint['focal_evidence_head_state_dict'], strict=False)
     trainer.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
-    if 'physical_support_head_state_dict' in checkpoint:
-        trainer.physical_support_head.load_state_dict(
-            checkpoint['physical_support_head_state_dict'],
+    if 'physical_evidence_support_head_state_dict' in checkpoint:
+        trainer.physical_evidence_support_head.load_state_dict(
+            checkpoint['physical_evidence_support_head_state_dict'],
             strict=False,
         )
 

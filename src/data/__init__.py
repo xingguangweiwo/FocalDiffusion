@@ -1,4 +1,4 @@
-"""FocalDiffusion datasets and data utilities"""
+"""FocalStackGeneration datasets and data utilities"""
 
 from .dataset import (
     FocalStackDataset,
@@ -7,13 +7,13 @@ from .dataset import (
     create_dataloader,
 )
 from .augmentation import FocalAugmentation
-from .focal_simulator import FocalStackSimulator
+from .synthetic_focal_stack_renderer import SyntheticFocalStackRenderer
 
 __all__ = [
     "FocalStackDataset",
     "HyperSimDataset",
     "VirtualKITTIDataset",
-    "FocalStackSimulator",
+    "SyntheticFocalStackRenderer",
     "FocalAugmentation",
     "create_dataloader",
 ]

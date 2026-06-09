@@ -63,7 +63,7 @@ class CameraInvariantEncoder(nn.Module):
             self,
             camera_params: Dict[str, torch.Tensor],
             mode: str = "relative",
-            focus_distances: Optional[torch.Tensor] = None,
+            focal_plane_distances: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Encode camera parameters
@@ -71,13 +71,13 @@ class CameraInvariantEncoder(nn.Module):
         Args:
             camera_params: Dict with 'focal_length', 'aperture', 'sensor_size'
             mode: "relative" or "normalized"
-            focus_distances: [B, N] for relative encoding
+            focal_plane_distances: [B, N] for relative encoding
 
         Returns:
             camera_features: [B, output_dim]
         """
         if mode == "relative":
-            return self.encode_relative(camera_params, focus_distances)
+            return self.encode_relative(camera_params, focal_plane_distances)
         elif mode == "normalized":
             return self.encode_normalized(camera_params)
         else:
@@ -86,13 +86,13 @@ class CameraInvariantEncoder(nn.Module):
     def encode_relative(
             self,
             camera_params: Dict[str, torch.Tensor],
-            focus_distances: torch.Tensor,
+            focal_plane_distances: torch.Tensor,
     ) -> torch.Tensor:
         """
         Encode camera parameters relative to focus distances
         This creates scale-invariant representations
         """
-        B, N = focus_distances.shape
+        B, N = focal_plane_distances.shape
 
         focal_length = camera_params['focal_length']  # [B] or scalar
         aperture = camera_params['aperture']  # [B] or scalar
@@ -108,7 +108,7 @@ class CameraInvariantEncoder(nn.Module):
 
         # 1. Hyperfocal distance (scale-invariant when normalized)
         hyperfocal = (focal_length ** 2) / (aperture * 0.03)  # 0.03mm = typical CoC limit
-        hyperfocal_norm = hyperfocal.unsqueeze(1) / (focus_distances + 1e-6)  # [B, N]
+        hyperfocal_norm = hyperfocal.unsqueeze(1) / (focal_plane_distances + 1e-6)  # [B, N]
         features.append(self._embed_fourier(hyperfocal_norm) if self.use_fourier_features
                         else hyperfocal_norm.unsqueeze(-1))
 
@@ -123,7 +123,7 @@ class CameraInvariantEncoder(nn.Module):
         far_dof = []
 
         for i in range(N):
-            d = focus_distances[:, i]  # [B]
+            d = focal_plane_distances[:, i]  # [B]
 
             # Near and far DoF limits (normalized by focus distance)
             H = hyperfocal
@@ -151,11 +151,11 @@ class CameraInvariantEncoder(nn.Module):
         # The previous pair-list representation was [B, N*(N-1)/2, D], which
         # fails for common focal stack sizes (for example N=5, 8, or 9).
         if N > 1:
-            pair_ratios = focus_distances.unsqueeze(2) / (focus_distances.unsqueeze(1) + 1e-6)
-            off_diagonal = ~torch.eye(N, dtype=torch.bool, device=focus_distances.device)
+            pair_ratios = focal_plane_distances.unsqueeze(2) / (focal_plane_distances.unsqueeze(1) + 1e-6)
+            off_diagonal = ~torch.eye(N, dtype=torch.bool, device=focal_plane_distances.device)
             ratio_summary = pair_ratios[:, off_diagonal].view(B, N, N - 1).mean(dim=-1)
         else:
-            ratio_summary = torch.ones_like(focus_distances)
+            ratio_summary = torch.ones_like(focal_plane_distances)
 
         features.append(self._embed_fourier(ratio_summary) if self.use_fourier_features
                         else ratio_summary.unsqueeze(-1))

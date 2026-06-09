@@ -1,5 +1,5 @@
 """
-Pipeline utilities for FSDiffusion
+Pipeline utilities for FocalStackGeneration
 """
 
 import logging
@@ -34,7 +34,7 @@ def _state_dict_has_lora(state_dict: Dict[str, torch.Tensor]) -> bool:
 
 
 def _ensure_transformer_lora(
-        pipeline: 'FocalDiffusionPipeline',
+        pipeline: 'FocalStackGenerationPipeline',
         config: Optional[Dict[str, Any]],
         transformer_state_dict: Dict[str, torch.Tensor],
 ) -> None:
@@ -81,7 +81,7 @@ def _build_focal_modules_from_config(config: Optional[Dict[str, Any]], vae: torc
     non-default focal-module dimensions such as ``feature_dim=128``.
     """
     from ..models.dual_decoder import DualOutputDecoder
-    from ..models.focal_evidence import FocalEvidenceHead, PhysicalSupportHead
+    from ..models.focal_evidence_encoder import FocalEvidenceEncoder, PhysicalEvidenceEstimator
     from ..models.focal_processor import FocalStackProcessor
 
     model_config = _model_config(config)
@@ -96,13 +96,13 @@ def _build_focal_modules_from_config(config: Optional[Dict[str, Any]], vae: torc
             focal_attention_heads=int(model_config.get('focal_attention_heads', 8)),
             focal_attention_depth=int(model_config.get('focal_attention_depth', 2)),
         ),
-        'focal_evidence_head': FocalEvidenceHead(
+        'focal_evidence_head': FocalEvidenceEncoder(
             hidden=int(model_config.get('focal_evidence_hidden', 48)),
             temperature=float(model_config.get('focal_evidence_temperature', 0.07)),
         ),
-        'physical_support_head': PhysicalSupportHead(
+        'physical_evidence_support_head': PhysicalEvidenceEstimator(
             in_channels=5,
-            hidden=int(model_config.get('physical_support_hidden', 16)),
+            hidden=int(model_config.get('physical_evidence_support_hidden', model_config.get('physical_support_hidden', 16))),
         ),
         'dual_decoder': DualOutputDecoder(
             in_channels=latent_channels,
@@ -116,9 +116,9 @@ def load_pipeline(
         base_model_id: str = "stabilityai/stable-diffusion-3.5-large",
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
-) -> 'FocalDiffusionPipeline':
-    """Load FSDiffusion pipeline from checkpoint."""
-    from .focal_diffusion_pipeline import FocalDiffusionPipeline
+) -> 'FocalStackGenerationPipeline':
+    """Load FocalStackGeneration pipeline from checkpoint."""
+    from .focal_stack_generation_pipeline import FocalStackGenerationPipeline
     from ..utils.env_utils import ensure_sentencepiece_installed
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -131,7 +131,7 @@ def load_pipeline(
         )
 
     ensure_sentencepiece_installed()
-    pipeline = FocalDiffusionPipeline.from_pretrained(
+    pipeline = FocalStackGenerationPipeline.from_pretrained(
         base_model_id,
         torch_dtype=dtype,
     )
@@ -141,7 +141,7 @@ def load_pipeline(
         pipeline.focal_processor = modules['focal_processor']
         pipeline.focal_evidence_head = modules['focal_evidence_head']
         pipeline.dual_decoder = modules['dual_decoder']
-        pipeline.physical_support_head = modules['physical_support_head']
+        pipeline.physical_evidence_support_head = modules['physical_evidence_support_head']
         pipeline.config = checkpoint_config
 
         condition_channels = getattr(pipeline.focal_processor, 'feature_dim', None)
@@ -160,14 +160,14 @@ def load_pipeline(
         pipeline.focal_evidence_head.load_state_dict(checkpoint['focal_evidence_head_state_dict'], strict=False)
     if 'dual_decoder_state_dict' in checkpoint:
         pipeline.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
-    if 'physical_support_head_state_dict' in checkpoint:
-        pipeline.physical_support_head.load_state_dict(checkpoint['physical_support_head_state_dict'], strict=False)
+    if 'physical_evidence_support_head_state_dict' in checkpoint:
+        pipeline.physical_evidence_support_head.load_state_dict(checkpoint['physical_evidence_support_head_state_dict'], strict=False)
 
     for module_name in (
         'focal_processor',
         'focal_evidence_head',
         'dual_decoder',
-        'physical_support_head',
+        'physical_evidence_support_head',
     ):
         getattr(pipeline, module_name).to(device=device, dtype=dtype)
 
@@ -182,11 +182,11 @@ def load_pipeline(
 
 
 def save_pipeline(
-        pipeline: 'FocalDiffusionPipeline',
+        pipeline: 'FocalStackGenerationPipeline',
         save_path: Union[str, Path],
         save_full_model: bool = True,
 ) -> None:
-    """Save FSDiffusion pipeline to checkpoint"""
+    """Save FocalStackGeneration pipeline to checkpoint"""
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -194,7 +194,7 @@ def save_pipeline(
         'focal_processor_state_dict': pipeline.focal_processor.state_dict(),
         'focal_evidence_head_state_dict': pipeline.focal_evidence_head.state_dict(),
         'dual_decoder_state_dict': pipeline.dual_decoder.state_dict(),
-        'physical_support_head_state_dict': pipeline.physical_support_head.state_dict(),
+        'physical_evidence_support_head_state_dict': pipeline.physical_evidence_support_head.state_dict(),
     }
 
     if save_full_model:

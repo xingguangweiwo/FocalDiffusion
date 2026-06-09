@@ -1,6 +1,6 @@
 """
-FSDiffusion Trainer Class
-Main trainer implementation for FSDiffusion
+FocalStackGeneration Trainer Class
+Main trainer implementation for FocalStackGeneration
 """
 
 import os
@@ -25,14 +25,14 @@ from diffusers.training_utils import EMAModel
 from typing import Any, Dict, Optional, Tuple
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
-from ..models.focal_evidence import build_support_inputs
+from ..models.focal_evidence_encoder import build_physical_evidence_features
 
 
 logger = logging.getLogger(__name__)
 
 
-class FocalDiffusionTrainer:
-    """Main trainer class for FSDiffusion using file lists"""
+class FocalStackGenerationTrainer:
+    """Main trainer class for FocalStackGeneration using file lists"""
 
     def __init__(self, config: dict):
         self.config = config
@@ -147,9 +147,9 @@ class FocalDiffusionTrainer:
     def setup_model(self):
         """Initialize model components"""
         logger.info("Loading SD3.5 base model...")
-        from ..pipelines import FocalDiffusionPipeline
+        from ..pipelines import FocalStackGenerationPipeline
         from ..models import FocalStackProcessor
-        from ..models.focal_evidence import FocalEvidenceHead, PhysicalSupportHead
+        from ..models.focal_evidence_encoder import FocalEvidenceEncoder, PhysicalEvidenceEstimator
         from ..models.dual_decoder import DualOutputDecoder
 
         model_cfg = self.config['model']
@@ -215,13 +215,13 @@ class FocalDiffusionTrainer:
             focal_attention_heads=self.config['model'].get('focal_attention_heads', 8),
             focal_attention_depth=self.config['model'].get('focal_attention_depth', 2),
         )
-        self.focal_evidence_head = FocalEvidenceHead(
+        self.focal_evidence_head = FocalEvidenceEncoder(
             hidden=self.config["model"].get("focal_evidence_hidden", 48),
             temperature=self.config["model"].get("focal_evidence_temperature", 0.07),
         )
-        self.physical_support_head = PhysicalSupportHead(
+        self.physical_evidence_support_head = PhysicalEvidenceEstimator(
             in_channels=5,
-            hidden=self.config["model"].get("physical_support_hidden", 16),
+            hidden=self.config["model"].get("physical_evidence_support_hidden", self.config["model"].get("physical_support_hidden", 16)),
         )
 
         self.dual_decoder = DualOutputDecoder(
@@ -231,8 +231,8 @@ class FocalDiffusionTrainer:
         )
 
 
-        # Create FSDiffusion pipeline
-        self.pipeline = FocalDiffusionPipeline(
+        # Create FocalStackGeneration pipeline
+        self.pipeline = FocalStackGenerationPipeline(
             vae=pipe.vae,
             text_encoder=pipe.text_encoder,
             text_encoder_2=pipe.text_encoder_2,
@@ -245,7 +245,7 @@ class FocalDiffusionTrainer:
             focal_processor=self.focal_processor,
             focal_evidence_head=self.focal_evidence_head,
             dual_decoder=self.dual_decoder,
-            physical_support_head=self.physical_support_head,
+            physical_evidence_support_head=self.physical_evidence_support_head,
         )
 
         target_device = self.accelerator.device if hasattr(self, "accelerator") else torch.device("cpu")
@@ -253,7 +253,7 @@ class FocalDiffusionTrainer:
         self.focal_processor = self.pipeline.focal_processor
         self.focal_evidence_head = self.pipeline.focal_evidence_head
         self.dual_decoder = self.pipeline.dual_decoder
-        self.physical_support_head = self.pipeline.physical_support_head
+        self.physical_evidence_support_head = self.pipeline.physical_evidence_support_head
 
         # Configure trainable parameters
         self._configure_trainable_params()
@@ -294,7 +294,7 @@ class FocalDiffusionTrainer:
         self.focal_processor.requires_grad_(True)
         self.focal_evidence_head.requires_grad_(True)
         self.dual_decoder.requires_grad_(True)
-        self.physical_support_head.requires_grad_(True)
+        self.physical_evidence_support_head.requires_grad_(True)
 
         pipeline_params = list(self._iter_pipeline_parameters())
         total_params = sum(param.numel() for param in pipeline_params)
@@ -369,7 +369,7 @@ class FocalDiffusionTrainer:
                     if not only_trainable or param.requires_grad:
                         yield param
             return
-        raise AttributeError("FocalDiffusionPipeline is missing parameter accessors.")
+        raise AttributeError("FocalStackGenerationPipeline is missing parameter accessors.")
 
     def _ema_parameters(self):
         return [param for param in self._iter_pipeline_parameters(only_trainable=True)]
@@ -413,7 +413,7 @@ class FocalDiffusionTrainer:
         logger.info("Training completed!")
 
     def train_epoch(self, epoch: int, global_step: int) -> float:
-        from ..training.losses import FocalDiffusionLoss
+        from ..training.losses import FocalStackGenerationLoss
 
         self.pipeline.train()
         epoch_loss = 0.0
@@ -422,14 +422,14 @@ class FocalDiffusionTrainer:
         if supervision_mode not in {"supervised", "semi_supervised"}:
             raise ValueError("training.supervision_mode must be 'supervised' or 'semi_supervised'.")
 
-        loss_fn = FocalDiffusionLoss(
+        loss_fn = FocalStackGenerationLoss(
             diffusion_weight=self.config['losses']['diffusion_weight'],
             depth_weight=self.config['losses']['depth_weight'],
             rgb_weight=self.config['losses']['rgb_weight'],
-            focus_posterior_kl_weight=self.config['losses'].get('focus_posterior_kl_weight', 0.2),
+            focal_posterior_kl_weight=self.config['losses'].get('focal_posterior_kl_weight', 0.2),
             focus_depth_weight=self.config['losses'].get('focus_depth_weight', 0.2),
             prior_depth_weight=self.config['losses'].get('prior_depth_weight', 0.05),
-            aif_focus_evidence_weight=self.config['losses'].get('aif_focus_evidence_weight', 0.1),
+            all_in_focus_focal_evidence_weight=self.config['losses'].get('all_in_focus_focal_evidence_weight', self.config['losses'].get('aif_focus_evidence_weight', 0.1)),
             uncertainty_focus_weight=self.config['losses'].get('uncertainty_focus_weight', 0.05),
             uncertainty_error_weight=self.config['losses'].get('uncertainty_error_weight', 0.05),
             gate_calibration_weight=self.config['losses'].get('gate_calibration_weight', 0.05),
@@ -439,8 +439,8 @@ class FocalDiffusionTrainer:
             focal_axis_smoothness_weight=self.config['losses'].get('focal_axis_smoothness_weight', 0.0),
             local_affinity_sigma=self.config['losses'].get('local_affinity_sigma', 0.10),
             focus_target_temperature=self.config['losses'].get('focus_target_temperature', 0.07),
-            focus_target_type=self.config["losses"].get("focus_target_type", "normalized"),
-            coc_target_temperature=self.config["losses"].get("coc_target_temperature", 1.0),
+            focal_target_type=self.config["losses"].get("focal_target_type", "normalized"),
+            coc_posterior_temperature=self.config["losses"].get("coc_posterior_temperature", 1.0),
             supervision_mode=supervision_mode,
         )
         loss_fn = loss_fn.to(self.accelerator.device)
@@ -456,7 +456,7 @@ class FocalDiffusionTrainer:
             with self.accelerator.accumulate(self.pipeline):
                 device = self.accelerator.device
                 focal_stack = batch['focal_stack'].to(device)
-                focus_distances = batch['focus_distances'].to(device)
+                focal_plane_distances = batch['focal_plane_distances'].to(device)
                 depth_gt = batch.get('depth')
                 rgb_gt = batch.get('all_in_focus')
                 if depth_gt is not None:
@@ -495,7 +495,7 @@ class FocalDiffusionTrainer:
                 rgb_target = (rgb_gt * 2.0) - 1.0 if rgb_gt is not None else None
 
                 # Extract focal features for SD3 conditioning.
-                focal_features = self.focal_processor(focal_stack, focus_distances)
+                focal_features = self.focal_processor(focal_stack, focal_plane_distances)
 
                 focal_features = {
                     key: value.to(self.pipeline.transformer.dtype)
@@ -542,39 +542,39 @@ class FocalDiffusionTrainer:
                         raise ValueError("all_in_focus is required to compute the SD3 flow-matching reconstruction losses.")
 
                     decoder_outputs = self.dual_decoder(clean_latent_pred)
-                    depth_prior_norm = decoder_outputs["depth_prior_norm"]
+                    generated_depth_canonical = decoder_outputs["generated_depth_canonical"]
                     uncertainty = decoder_outputs["uncertainty"]
-                    focal_evidence = self.focal_evidence_head(focal_stack.float(), focus_distances.float())
-                    depth_focus_norm = F.interpolate(focal_evidence["depth_focus_norm"], size=depth_prior_norm.shape[-2:], mode="bilinear", align_corners=False)
-                    focus_entropy = F.interpolate(focal_evidence["focus_entropy"], size=depth_prior_norm.shape[-2:], mode="bilinear", align_corners=False)
-                    focus_posterior = F.interpolate(
-                        focal_evidence["focus_posterior"],
-                        size=depth_prior_norm.shape[-2:],
+                    focal_evidence = self.focal_evidence_head(focal_stack.float(), focal_plane_distances.float())
+                    focal_depth_canonical = F.interpolate(focal_evidence["focal_depth_canonical"], size=generated_depth_canonical.shape[-2:], mode="bilinear", align_corners=False)
+                    focal_entropy = F.interpolate(focal_evidence["focal_entropy"], size=generated_depth_canonical.shape[-2:], mode="bilinear", align_corners=False)
+                    focal_posterior = F.interpolate(
+                        focal_evidence["focal_posterior"],
+                        size=generated_depth_canonical.shape[-2:],
                         mode="bilinear",
                         align_corners=False,
                     )
-                    focus_posterior = focus_posterior / focus_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
-                    uncertainty_decoder = uncertainty
-                    support_inputs, support_maps = build_support_inputs(
-                        focus_posterior=focus_posterior,
-                        focus_entropy=focus_entropy,
-                        depth_focus_norm=depth_focus_norm,
-                        depth_prior_norm=depth_prior_norm,
-                        uncertainty_decoder=uncertainty_decoder,
+                    focal_posterior = focal_posterior / focal_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                    generative_uncertainty = uncertainty
+                    support_inputs, support_maps = build_physical_evidence_features(
+                        focal_posterior=focal_posterior,
+                        focal_entropy=focal_entropy,
+                        focal_depth_canonical=focal_depth_canonical,
+                        generated_depth_canonical=generated_depth_canonical,
+                        generative_uncertainty=generative_uncertainty,
                     )
-                    support_outputs = self.physical_support_head(support_inputs)
-                    gate_focus = support_outputs["gate_focus"]
-                    gate_prior = support_outputs["gate_prior"]
-                    gate_abstain = support_outputs["gate_abstain"]
-                    gate_sum = (gate_focus + gate_prior).clamp(min=1e-6)
-                    gate_focus_norm = gate_focus / gate_sum
-                    gate_prior_norm = gate_prior / gate_sum
-                    depth_final_norm = gate_focus_norm * depth_focus_norm + gate_prior_norm * depth_prior_norm
+                    support_outputs = self.physical_evidence_support_head(support_inputs)
+                    focal_evidence_weight = support_outputs["focal_evidence_weight"]
+                    generative_prior_weight = support_outputs["generative_prior_weight"]
+                    abstention_weight = support_outputs["abstention_weight"]
+                    gate_sum = (focal_evidence_weight + generative_prior_weight).clamp(min=1e-6)
+                    focal_evidence_weight_norm = focal_evidence_weight / gate_sum
+                    generative_prior_weight_norm = generative_prior_weight / gate_sum
+                    final_depth_canonical = focal_evidence_weight_norm * focal_depth_canonical + generative_prior_weight_norm * generated_depth_canonical
                     uncertainty_final = torch.maximum(
                         support_outputs["uncertainty_final"],
-                        gate_abstain,
+                        abstention_weight,
                     ).clamp(0.0, 1.0)
-                    rgb_latent_pred = decoder_outputs["aif_latents"]
+                    rgb_latent_pred = decoder_outputs["all_in_focus_latents"]
                     rgb_recon = self.pipeline.vae.decode(
                         rgb_latent_pred / self.pipeline.vae.config.scaling_factor,
                         return_dict=False
@@ -595,20 +595,20 @@ class FocalDiffusionTrainer:
                         depth_mask=depth_mask,
                         rgb_pred=rgb_recon,
                         rgb_target=rgb_target_fp32,
-                        depth_prior_norm=depth_prior_norm.float(),
-                        depth_focus_norm=depth_focus_norm.float(),
-                        depth_final_norm=depth_final_norm.float(),
+                        generated_depth_canonical=generated_depth_canonical.float(),
+                        focal_depth_canonical=focal_depth_canonical.float(),
+                        final_depth_canonical=final_depth_canonical.float(),
                         uncertainty=uncertainty_final.float(),
-                        focus_posterior=focus_posterior.float(),
-                        focus_entropy=focus_entropy.float(),
-                        focus_reliability=support_outputs["physical_support"].float(),
-                        focus_distances=focus_distances.float(),
+                        focal_posterior=focal_posterior.float(),
+                        focal_entropy=focal_entropy.float(),
+                        focus_reliability=support_outputs["physical_evidence_support"].float(),
+                        focal_plane_distances=focal_plane_distances.float(),
                         focal_stack=focal_stack.float(),
                         depth_range=depth_range_tensor.float() if depth_range_tensor is not None else None,
-                        gate_focus=gate_focus_norm.float(),
-                        gate_prior=gate_prior_norm.float(),
-                        gate_abstain=gate_abstain.float(),
-                        physical_support=support_outputs["physical_support"].float(),
+                        focal_evidence_weight=focal_evidence_weight_norm.float(),
+                        generative_prior_weight=generative_prior_weight_norm.float(),
+                        abstention_weight=abstention_weight.float(),
+                        physical_evidence_support=support_outputs["physical_evidence_support"].float(),
                         camera_params=camera_params,
                     )
                     loss = loss_dict['total']
@@ -633,12 +633,12 @@ class FocalDiffusionTrainer:
                             'train_loss_step': loss.item(),
                             'learning_rate': self.lr_scheduler.get_last_lr()[0],
                             **{f'train_{k}': v.item() for k, v in loss_dict.items() if k != 'total' and isinstance(v, torch.Tensor)},
-                            'train_focus_entropy_mean': focus_entropy.mean().item(),
-                            'train_focus_peakiness_mean': support_maps['focus_peakiness'].mean().item(),
-                            'train_gate_focus_mean': gate_focus_norm.mean().item(),
-                            'train_gate_prior_mean': gate_prior_norm.mean().item(),
-                            'train_gate_abstain_mean': gate_abstain.mean().item(),
-                            'train_physical_support_mean': support_outputs['physical_support'].mean().item(),
+                            'train_focal_entropy_mean': focal_entropy.mean().item(),
+                            'train_focal_peak_confidence_mean': support_maps['focal_peak_confidence'].mean().item(),
+                            'train_focal_evidence_weight_mean': focal_evidence_weight_norm.mean().item(),
+                            'train_generative_prior_weight_mean': generative_prior_weight_norm.mean().item(),
+                            'train_abstention_weight_mean': abstention_weight.mean().item(),
+                            'train_physical_evidence_support_mean': support_outputs['physical_evidence_support'].mean().item(),
                             'train_depth_prior_focus_disagreement': support_maps['depth_disagreement'].mean().item(),
                         }, step=global_step + step)
 
@@ -705,3 +705,6 @@ class FocalDiffusionTrainer:
     def load_checkpoint(self, checkpoint_path: str):
         from .checkpointing import load_checkpoint
         return load_checkpoint(self, checkpoint_path)
+
+# Backward-compatible alias for external scripts using the pre-rename trainer API.
+FocalDiffusionTrainer = FocalStackGenerationTrainer

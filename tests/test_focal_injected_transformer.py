@@ -2,7 +2,7 @@ import pytest
 
 from diffusers.models.transformers import SD3Transformer2DModel
 
-from src.pipelines.focal_diffusion_pipeline import FocalInjectedSD3Transformer
+from src.pipelines.focal_stack_generation_pipeline import FocalInjectedSD3Transformer
 
 
 def _tiny_sd3_transformer() -> SD3Transformer2DModel:
