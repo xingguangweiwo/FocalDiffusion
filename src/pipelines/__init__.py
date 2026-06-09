@@ -6,16 +6,10 @@ from .focal_stack_generation_pipeline import (
     FocalStackGenerationPipeline,
 )
 
-# Backward-compatible aliases for external package imports.
-FocalDiffusionOutput = FocalStackGenerationOutput
-FocalDiffusionPipeline = FocalStackGenerationPipeline
-
 __all__ = [
     "FocalStackGenerationPipeline",
     "FocalStackGenerationOutput",
     "FocalInjectedSD3Transformer",
-    "FocalDiffusionPipeline",
-    "FocalDiffusionOutput",
     "load_pipeline",
     "save_pipeline",
 ]
