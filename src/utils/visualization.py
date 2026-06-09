@@ -1,5 +1,5 @@
 """
-Visualization utilities for FocalDiffusion
+Visualization utilities for FocalStackGeneration
 """
 
 import torch
@@ -17,7 +17,7 @@ def visualize_results(
         figsize: Tuple[int, int] = (20, 10),
 ) -> Optional[plt.Figure]:
     """
-    Visualize FocalDiffusion outputs
+    Visualize FocalStackGeneration outputs
 
     Args:
         outputs: Dictionary containing results
@@ -48,12 +48,12 @@ def visualize_results(
 
     # All-in-focus image
     if 'all_in_focus' in outputs:
-        aif = to_numpy(outputs['all_in_focus'])
-        if aif.ndim == 3 and aif.shape[0] == 3:  # CHW to HWC
-            aif = np.transpose(aif, (1, 2, 0))
-        if aif.max() <= 1.0:
-            aif = (aif * 255).astype(np.uint8)
-        axes[3].imshow(aif)
+        all_in_focus = to_numpy(outputs['all_in_focus'])
+        if all_in_focus.ndim == 3 and all_in_focus.shape[0] == 3:  # CHW to HWC
+            all_in_focus = np.transpose(all_in_focus, (1, 2, 0))
+        if all_in_focus.max() <= 1.0:
+            all_in_focus = (all_in_focus * 255).astype(np.uint8)
+        axes[3].imshow(all_in_focus)
         axes[3].set_title('All-in-Focus')
         axes[3].axis('off')
 

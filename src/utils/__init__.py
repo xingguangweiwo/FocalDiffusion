@@ -1,4 +1,4 @@
-"""FSDiffusion utilities."""
+"""FocalStackGeneration utilities."""
 
 from .image_utils import (
     load_image_stack,

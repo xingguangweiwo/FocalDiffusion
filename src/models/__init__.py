@@ -1,21 +1,21 @@
-"""FSDiffusion model components exposed for training and inference."""
+"""FocalStackGeneration model components exposed for training and inference."""
 
 from .dual_decoder import DualOutputDecoder
 from .focal_attention import FocalCrossAttention
-from .focal_evidence import (
-    FocalEvidenceHead,
-    PhysicalSupportHead,
-    build_support_inputs,
-    expected_metric_depth_from_focus_posterior,
+from .focal_evidence_encoder import (
+    FocalEvidenceEncoder,
+    PhysicalEvidenceEstimator,
+    build_physical_evidence_features,
+    decode_metric_depth_from_focal_posterior,
 )
 from .focal_processor import FocalStackProcessor
 
 __all__ = [
     "FocalCrossAttention",
     "FocalStackProcessor",
-    "FocalEvidenceHead",
-    "PhysicalSupportHead",
-    "build_support_inputs",
-    "expected_metric_depth_from_focus_posterior",
+    "FocalEvidenceEncoder",
+    "PhysicalEvidenceEstimator",
+    "build_physical_evidence_features",
+    "decode_metric_depth_from_focal_posterior",
     "DualOutputDecoder",
 ]

@@ -1,5 +1,5 @@
 """
-FocalDiffusion Pipeline - Main inference pipeline with SD3.5 integration
+FocalStackGeneration Pipeline - Main inference pipeline with SD3.5 integration
 Complete implementation with proper SD3.5 architecture
 """
 
@@ -60,8 +60,8 @@ def _expand_focal_features_for_model(
 
 
 @dataclass
-class FocalDiffusionOutput(BaseOutput):
-    """Output class for FocalDiffusion Pipeline"""
+class FocalStackGenerationOutput(BaseOutput):
+    """Output class for FocalStackGeneration Pipeline"""
     depth_map: torch.Tensor
     all_in_focus_image: Union[torch.Tensor, Image.Image]
     depth_colored: Optional[Image.Image] = None
@@ -233,8 +233,8 @@ class DualOutputDecoder(nn.Module):
         return depth, rgb
 
 
-class FocalDiffusionPipeline(StableDiffusion3Pipeline):
-    """Main FocalDiffusion Pipeline with SD3.5"""
+class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
+    """Main FocalStackGeneration Pipeline with SD3.5"""
 
     def __init__(
         self,
@@ -294,7 +294,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
     def __call__(
         self,
         focal_stack: Union[torch.Tensor, List[Image.Image]],
-        focus_distances: torch.Tensor,
+        focal_plane_distances: torch.Tensor,
         camera_params: Optional[Dict[str, torch.Tensor]] = None,
         prompt: str = "",
         negative_prompt: Optional[str] = None,
@@ -321,21 +321,21 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         dtype = self.transformer.dtype
 
         focal_stack = focal_stack.to(device=device, dtype=dtype)
-        focus_distances = focus_distances.to(device=device, dtype=dtype)
+        focal_plane_distances = focal_plane_distances.to(device=device, dtype=dtype)
 
         # Extract focal features
         if camera_params is not None:
             camera_features = self.camera_encoder(
                 camera_params,
                 mode=camera_invariant_mode,
-                focus_distances=focus_distances,
+                focal_plane_distances=focal_plane_distances,
             )
         else:
             camera_features = None
 
         focal_features = self.focal_processor(
             focal_stack,
-            focus_distances,
+            focal_plane_distances,
             camera_params=camera_params,
         )
 
@@ -423,7 +423,7 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         if not return_dict:
             return depth_map, all_in_focus
 
-        return FocalDiffusionOutput(
+        return FocalStackGenerationOutput(
             depth_map=depth_map,
             all_in_focus_image=all_in_focus,
             depth_colored=depth_colored,

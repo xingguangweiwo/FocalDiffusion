@@ -1,28 +1,32 @@
-"""FSDiffusion: Reliable Zero-Shot Focal-Stack Diffusion via Focal Evidence."""
+"""FocalStackGeneration: Reliable Zero-Shot Focal-Stack Diffusion via Focal Evidence."""
 
 __version__ = "1.0.0"
 
 __all__ = [
-    "FocalDiffusionPipeline",
+    "FocalStackGenerationPipeline",
     "FocalStackProcessor",
-    "FocalEvidenceHead",
+    "FocalEvidenceEncoder",
 ]
 
 
 def __getattr__(name: str):
     """Lazily import heavy modules on demand."""
 
-    if name == "FocalDiffusionPipeline":
-        from .pipelines import FocalDiffusionPipeline
+    if name == "FocalStackGenerationPipeline":
+        from .pipelines import FocalStackGenerationPipeline
 
-        return FocalDiffusionPipeline
-    if name in {"FocalStackProcessor", "FocalEvidenceHead"}:
-        from .models import FocalEvidenceHead, FocalStackProcessor
+        return FocalStackGenerationPipeline
+    if name in {"FocalStackProcessor", "FocalEvidenceEncoder"}:
+        from .models import FocalEvidenceEncoder, FocalStackProcessor
 
         mapping = {
             "FocalStackProcessor": FocalStackProcessor,
-            "FocalEvidenceHead": FocalEvidenceHead,
+            "FocalEvidenceEncoder": FocalEvidenceEncoder,
         }
         return mapping[name]
 
     raise AttributeError(f"module 'src' has no attribute '{name}'")
+
+from .generation_tasks import GENERATION_TASKS, TASK_ALIASES, normalize_generation_task
+
+__all__ = ["GENERATION_TASKS", "TASK_ALIASES", "normalize_generation_task"]

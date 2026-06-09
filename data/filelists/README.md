@@ -1,4 +1,4 @@
-# FocalDiffusion file lists
+# FocalStackGeneration file lists
 
 Each text file enumerates the samples that compose a training split. 
 

@@ -14,7 +14,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-SCORES = ("uncertainty_final", "focus_entropy", "depth_disagreement", "gate_abstain", "random")
+SCORES = ("uncertainty_final", "focal_entropy", "depth_disagreement", "abstention_weight", "random")
 
 
 def _require_sklearn():
@@ -142,7 +142,7 @@ def _load_npz(path: Path) -> Dict[str, np.ndarray]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate FSDiffusion uncertainty maps for high-error detection")
+    parser = argparse.ArgumentParser(description="Evaluate FocalStackGeneration uncertainty maps for high-error detection")
     parser.add_argument("--pred", required=True, help="Prediction .npz containing depth_pred, depth_gt, valid_mask, and uncertainty maps")
     parser.add_argument("--output", required=True, help="Output JSON path")
     parser.add_argument("--high-error-mode", choices=["top_percent", "threshold"], default="top_percent")

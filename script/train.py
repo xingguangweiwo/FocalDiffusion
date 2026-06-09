@@ -1,6 +1,6 @@
 """
-Training script for FSDiffusion
-Uses the FocalDiffusionTrainer class from src.training.trainer
+Training script for FocalStackGeneration
+Uses the FocalStackGenerationTrainer class from src.training.trainer
 """
 
 import argparse
@@ -64,7 +64,7 @@ SUPPORTED_DATASET_TYPES = {
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Train FSDiffusion model for depth and all-in-focus generation"
+        description="Train FocalStackGeneration model for depth and all-in-focus generation"
     )
 
     # Required arguments
@@ -554,16 +554,16 @@ def main():
         return
 
     # Create trainer
-    logger.info("Initializing FSDiffusion trainer...")
+    logger.info("Initializing FocalStackGeneration trainer...")
     try:
-        from src.training.trainer import FocalDiffusionTrainer  # Lazy import to avoid heavy deps during dry-runs
+        from src.training.trainer import FocalStackGenerationTrainer  # Lazy import to avoid heavy deps during dry-runs
     except ModuleNotFoundError as exc:
         if getattr(exc, "name", None) == "torch":
             _run_stub_training(config, "PyTorch is not available")
             return
         raise
 
-    trainer = FocalDiffusionTrainer(config)
+    trainer = FocalStackGenerationTrainer(config)
 
     # Resume if specified
     start_epoch = 0
@@ -579,7 +579,7 @@ def main():
 
     # Start training
     logger.info("=" * 50)
-    logger.info("Starting FSDiffusion training")
+    logger.info("Starting FocalStackGeneration training")
     logger.info(f"Model: {config['model']['base_model_id']}")
     logger.info(f"Dataset: {config['data']['dataset_type']}")
     logger.info(f"Batch size: {config['training']['batch_size']}")

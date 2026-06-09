@@ -1,4 +1,4 @@
-"""Dual-output decoder used by FSDiffusion."""
+"""Dual-output decoder used by FocalStackGeneration."""
 
 from __future__ import annotations
 
@@ -91,13 +91,13 @@ class DualOutputDecoder(nn.Module):
         self.depth_branch = branch_block()
         self.rgb_branch = branch_block()
 
-        # Feature-level cross-task coupling: AIF features guide depth structure recovery.
-        self.aif_to_depth = nn.Sequential(
+        # Feature-level cross-task coupling: all-in-focus features guide depth structure recovery.
+        self.all_in_focus_to_depth = nn.Sequential(
             nn.Conv2d(dims[-1], dims[-1], kernel_size=1),
             nn.SiLU(),
             nn.Conv2d(dims[-1], dims[-1], kernel_size=3, padding=1),
         )
-        self.aif_coupling_gate = nn.Sequential(
+        self.all_in_focus_coupling_gate = nn.Sequential(
             nn.Conv2d(dims[-1] * 2, dims[-1], kernel_size=1),
             nn.Sigmoid(),
         )
@@ -115,7 +115,7 @@ class DualOutputDecoder(nn.Module):
         )
 
     def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return normalized depth prior, AIF latents, and uncertainty."""
+        """Return generated canonical depth, all-in-focus latents, and uncertainty."""
 
         features = latents
         skip: Optional[torch.Tensor] = None
@@ -149,41 +149,43 @@ class DualOutputDecoder(nn.Module):
             depth_features = depth_features + skip
             rgb_features = rgb_features + skip
 
-        # Feature-level coupling from AIF to depth.
-        aif_guidance = self.aif_to_depth(rgb_features)
-        coupling_gate = self.aif_coupling_gate(torch.cat([depth_features, aif_guidance], dim=1))
-        depth_features = depth_features + coupling_gate * aif_guidance
+        # Feature-level coupling from all-in-focus generation to depth.
+        all_in_focus_guidance = self.all_in_focus_to_depth(rgb_features)
+        coupling_gate = self.all_in_focus_coupling_gate(torch.cat([depth_features, all_in_focus_guidance], dim=1))
+        depth_features = depth_features + coupling_gate * all_in_focus_guidance
 
         depth_logits_coarse = self.depth_head(depth_features)
         confidence = torch.sigmoid(self.confidence_head(depth_features))
-        rgb_latents = self.rgb_head(rgb_features)
+        all_in_focus_latents = self.rgb_head(rgb_features)
 
         if self.apply_latent_scaling:
-            rgb_latents = rgb_latents * 0.18215
+            all_in_focus_latents = all_in_focus_latents * 0.18215
 
-        # Confidence-guided refinement: low confidence => stronger AIF-structure reliance.
-        aif_edges = self._compute_edges(rgb_latents)
+        # Confidence-guided refinement: low confidence => stronger all-in-focus-structure reliance.
+        all_in_focus_edges = self._compute_edges(all_in_focus_latents)
         refine_input = torch.cat(
             [
                 depth_features,
-                rgb_latents,
-                aif_edges,
+                all_in_focus_latents,
+                all_in_focus_edges,
                 1.0 - confidence,
             ],
             dim=1,
         )
         depth_delta = self.depth_refine(refine_input)
-        depth_prior_norm = torch.sigmoid(depth_logits_coarse + (1.0 - confidence) * depth_delta)
+        generated_depth_canonical = torch.sigmoid(depth_logits_coarse + (1.0 - confidence) * depth_delta)
         uncertainty = torch.sigmoid(1.5 * (1.0 - confidence))
 
         return {
-            "depth_prior_norm": depth_prior_norm,
+            "generated_depth_canonical": generated_depth_canonical,
             "uncertainty": uncertainty,
-            "aif_latents": rgb_latents,
+            "all_in_focus_latents": all_in_focus_latents,
             # Backward-compatible aliases.
-            "shape_norm": depth_prior_norm,
-            "depth_logits": depth_prior_norm,
-            "rgb_latent_pred": rgb_latents,
+            "shape_norm": generated_depth_canonical,
+            "depth_logits": generated_depth_canonical,
+            "rgb_latent_pred": all_in_focus_latents,
+            "depth_prior_norm": generated_depth_canonical,
+            "aif_latents": all_in_focus_latents,
             "confidence_map": 1.0 - uncertainty,
         }
 

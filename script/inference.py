@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Inference script for FSDiffusion
+Inference script for FocalStackGeneration
 Processes focal stacks to generate depth maps and all-in-focus images
 """
 
@@ -84,14 +84,14 @@ def unpad_tensor_spatial(tensor: torch.Tensor, pad: List[int]) -> torch.Tensor:
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Run inference with FSDiffusion model"
+        description="Run inference with FocalStackGeneration model"
     )
 
     # Model arguments
     parser.add_argument(
         '--model-path',
         type=str,
-        help='Path to trained FSDiffusion checkpoint (required for meaningful inference)'
+        help='Path to trained FocalStackGeneration checkpoint (required for meaningful inference)'
     )
     parser.add_argument(
         '--base-model',
@@ -134,9 +134,11 @@ def parse_args():
 
     # Focal stack parameters
     parser.add_argument(
+        '--focal-plane-distances',
         '--focus-distances',
+        dest='focal_plane_distances',
         type=str,
-        help='Comma-separated focus distances in meters (uses 0..N-1 index spacing if not specified)'
+        help='Comma-separated focal-plane distances in meters (uses 0..N-1 index spacing if not specified)'
     )
     # Inference parameters
     parser.add_argument(
@@ -216,14 +218,14 @@ def load_focal_stack(input_path: str) -> tuple:
     return images, [str(p) for p in image_paths]
 
 
-def extract_focus_distances(
+def extract_focal_plane_distances(
         num_images: int,
         args
 ) -> torch.Tensor:
     """Extract focus distances from CLI values or use index-spaced positions."""
 
-    if args.focus_distances:
-        distances = [float(x) for x in args.focus_distances.split(',')]
+    if args.focal_plane_distances:
+        distances = [float(x) for x in args.focal_plane_distances.split(',')]
         if len(distances) != num_images:
             raise ValueError(
                 f"Number of focus distances ({len(distances)}) must match "
@@ -238,7 +240,7 @@ def extract_focus_distances(
 def process_focal_stack(
         pipeline,
         images: List[Image.Image],
-        focus_distances: torch.Tensor,
+        focal_plane_distances: torch.Tensor,
         args,
         stack_name: str = "focal_stack"
 ) -> Dict:
@@ -259,7 +261,7 @@ def process_focal_stack(
     with torch.no_grad():
         output = pipeline(
             focal_stack=padded_images,
-            focus_distances=focus_distances,
+            focal_plane_distances=focal_plane_distances,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
             output_type="pil" if args.save_visualization else "pt",
@@ -277,11 +279,11 @@ def process_focal_stack(
         "depth_prior",
         "depth_focus",
         "depth_final",
-        "focus_entropy",
+        "focal_entropy",
         "focus_reliability",
         "uncertainty_disagreement",
         "uncertainty_final",
-        "focus_posterior",
+        "focal_posterior",
     ):
         value = getattr(output, attr, None)
         if isinstance(value, torch.Tensor):
@@ -304,12 +306,12 @@ def process_focal_stack(
         'depth_focus': getattr(output, 'depth_focus', None),
         'depth_final': getattr(output, 'depth_final', None),
         'focus_reliability': getattr(output, 'focus_reliability', None),
-        'focus_entropy': getattr(output, 'focus_entropy', None),
+        'focal_entropy': getattr(output, 'focal_entropy', None),
         'uncertainty_disagreement': getattr(output, 'uncertainty_disagreement', None),
         'uncertainty_final': getattr(output, 'uncertainty_final', None),
-        'focus_posterior': getattr(output, 'focus_posterior', None),
+        'focal_posterior': getattr(output, 'focal_posterior', None),
         'inference_time': inference_time,
-        'focus_distances': focus_distances.tolist(),
+        'focal_plane_distances': focal_plane_distances.tolist(),
         'original_size': size_meta["original_size"],
         'inference_size': size_meta["inference_size"],
         'output_size': list(output.depth_map.shape[-2:]) if isinstance(output.depth_map, torch.Tensor) else size_meta["original_size"],
@@ -365,7 +367,7 @@ def save_results(results: Dict, output_dir: Path, args):
         uncertainty = _to_numpy_map(results['uncertainty'])
         np.save(output_dir / f"{name}_uncertainty.npy", uncertainty)
 
-    for key in ("depth_prior", "depth_focus", "depth_final", "focus_reliability", "focus_entropy"):
+    for key in ("depth_prior", "depth_focus", "depth_final", "focus_reliability", "focal_entropy"):
         if results.get(key) is not None:
             value = _to_numpy_map(results[key])
             np.save(output_dir / f"{name}_{key}.npy", value)
@@ -375,16 +377,16 @@ def save_results(results: Dict, output_dir: Path, args):
         if results.get(key) is not None:
             np.save(output_dir / f"{name}_{key}.npy", _to_numpy_map(results[key]))
 
-    if args.save_focus_prob and results.get('focus_posterior') is not None:
-        focus_posterior = results['focus_posterior']
-        if isinstance(focus_posterior, torch.Tensor):
-            focus_posterior = focus_posterior.detach().cpu().numpy()
-        np.save(output_dir / f"{name}_focus_prob.npy", focus_posterior)
+    if args.save_focus_prob and results.get('focal_posterior') is not None:
+        focal_posterior = results['focal_posterior']
+        if isinstance(focal_posterior, torch.Tensor):
+            focal_posterior = focal_posterior.detach().cpu().numpy()
+        np.save(output_dir / f"{name}_focus_prob.npy", focal_posterior)
 
     # Save metadata
     metadata = {
         'name': name,
-        'focus_distances': results['focus_distances'],
+        'focal_plane_distances': results['focal_plane_distances'],
         'inference_time': results['inference_time'],
         'original_size': results.get('original_size'),
         'inference_size': results.get('inference_size'),
@@ -431,7 +433,7 @@ def main():
     dtype = dtype_map[args.dtype]
 
     if not args.model_path:
-        raise ValueError("A trained FSDiffusion checkpoint is required.")
+        raise ValueError("A trained FocalStackGeneration checkpoint is required.")
     if not os.path.exists(args.model_path):
         raise ValueError(f"Model path does not exist: {args.model_path}")
 
@@ -465,7 +467,7 @@ def main():
             images, _ = load_focal_stack(input_path)
 
             # Extract parameters
-            focus_distances = extract_focus_distances(len(images), args)
+            focal_plane_distances = extract_focal_plane_distances(len(images), args)
 
             # Process
             stack_name = Path(input_path).stem if Path(input_path).is_dir() else f"stack_{input_idx:04d}"
@@ -473,7 +475,7 @@ def main():
             results = process_focal_stack(
                 pipeline,
                 images,
-                focus_distances.to(device),
+                focal_plane_distances.to(device),
                 args,
                 stack_name,
             )
