@@ -439,6 +439,8 @@ class FocalDiffusionTrainer:
             focal_axis_smoothness_weight=self.config['losses'].get('focal_axis_smoothness_weight', 0.0),
             local_affinity_sigma=self.config['losses'].get('local_affinity_sigma', 0.10),
             focus_target_temperature=self.config['losses'].get('focus_target_temperature', 0.07),
+            focus_target_type=self.config["losses"].get("focus_target_type", "normalized"),
+            coc_target_temperature=self.config["losses"].get("coc_target_temperature", 1.0),
             supervision_mode=supervision_mode,
         )
         loss_fn = loss_fn.to(self.accelerator.device)
@@ -480,6 +482,12 @@ class FocalDiffusionTrainer:
                 depth_mask = batch.get('valid_mask')
                 if depth_mask is not None:
                     depth_mask = depth_mask.to(device=device)
+                camera_params = batch.get('camera_params')
+                if camera_params is not None:
+                    camera_params = {
+                        key: value.to(device=device) if isinstance(value, torch.Tensor) else value
+                        for key, value in camera_params.items()
+                    }
 
                 # Normalize inputs
                 if focal_stack.min() >= 0 and focal_stack.max() <= 1:
@@ -601,6 +609,7 @@ class FocalDiffusionTrainer:
                         gate_prior=gate_prior_norm.float(),
                         gate_abstain=gate_abstain.float(),
                         physical_support=support_outputs["physical_support"].float(),
+                        camera_params=camera_params,
                     )
                     loss = loss_dict['total']
 
