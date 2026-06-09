@@ -52,6 +52,16 @@ from ..models.focal_evidence import (
 logger = logging.getLogger(__name__)
 
 
+def _module_device_dtype(module: nn.Module, fallback_device: torch.device, fallback_dtype: torch.dtype) -> Tuple[torch.device, torch.dtype]:
+    """Return a module's parameter/buffer device and dtype with a safe fallback."""
+    tensor = next(module.parameters(), None)
+    if tensor is None:
+        tensor = next(module.buffers(), None)
+    if tensor is None:
+        return fallback_device, fallback_dtype
+    return tensor.device, tensor.dtype
+
+
 @dataclass
 class FocalDiffusionOutput(BaseOutput):
     """Output type returned by :class:`FocalDiffusionPipeline`."""
@@ -516,17 +526,29 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
         device = self._execution_device
         dtype = self.transformer.dtype
 
-        focal_stack = focal_stack.to(device=device, dtype=dtype)
+        focal_stack = focal_stack.to(device=device)
         input_h, input_w = focal_stack.shape[-2:]
         target_h = input_h if height is None else int(height)
         target_w = input_w if width is None else int(width)
         height, width = self._make_divisible_size(target_h, target_w, divisor=max(int(self.vae_scale_factor), 16))
         if focus_distances.dim() == 1:
             focus_distances = focus_distances.unsqueeze(0)
-        focus_distances = focus_distances.to(device=device, dtype=dtype)
+        focus_distances = focus_distances.to(device=device)
 
-        focal_evidence = self.focal_evidence_head(focal_stack, focus_distances)
-        focal_features = self.focal_processor(focal_stack, focus_distances)
+        evidence_device, evidence_dtype = _module_device_dtype(self.focal_evidence_head, torch.device(device), dtype)
+        processor_device, processor_dtype = _module_device_dtype(self.focal_processor, torch.device(device), dtype)
+        focal_evidence = self.focal_evidence_head(
+            focal_stack.to(device=evidence_device, dtype=evidence_dtype),
+            focus_distances.to(device=evidence_device, dtype=evidence_dtype),
+        )
+        focal_features = self.focal_processor(
+            focal_stack.to(device=processor_device, dtype=processor_dtype),
+            focus_distances.to(device=processor_device, dtype=processor_dtype),
+        )
+        focal_features = {
+            key: value.to(device=device, dtype=dtype) if isinstance(value, torch.Tensor) else value
+            for key, value in focal_features.items()
+        }
 
         prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = self.encode_prompt(
             prompt=prompt,
@@ -589,7 +611,8 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
 
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
-        decoder_outputs = self.dual_decoder(latents)
+        decoder_device, decoder_dtype = _module_device_dtype(self.dual_decoder, torch.device(device), dtype)
+        decoder_outputs = self.dual_decoder(latents.to(device=decoder_device, dtype=decoder_dtype))
         depth_prior_norm = decoder_outputs["depth_prior_norm"]
         uncertainty_decoder = decoder_outputs["uncertainty"]
         rgb_latents = decoder_outputs["aif_latents"]
@@ -613,6 +636,8 @@ class FocalDiffusionPipeline(StableDiffusion3Pipeline):
             depth_prior_norm=depth_prior_norm,
             uncertainty_decoder=uncertainty_decoder,
         )
+        support_device, support_dtype = _module_device_dtype(self.physical_support_head, torch.device(device), dtype)
+        support_inputs = support_inputs.to(device=support_device, dtype=support_dtype)
         support_outputs = self.physical_support_head(support_inputs)
         gate_focus = support_outputs["gate_focus"]
         gate_prior = support_outputs["gate_prior"]

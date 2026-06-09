@@ -98,6 +98,8 @@ losses:
   focal_axis_smoothness_weight: 0.0
   local_affinity_sigma: 0.10
   focus_target_temperature: 0.07
+  focus_target_type: normalized
+  coc_target_temperature: 1.0
 
 validation:
   num_inference_steps: 30

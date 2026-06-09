@@ -26,6 +26,80 @@ def build_soft_focus_target_from_depth(
     return torch.softmax(logits, dim=1), focus_coordinates
 
 
+def _safe_denominator(value: torch.Tensor, eps: float) -> torch.Tensor:
+    """Clamp denominator magnitudes while preserving sign where possible."""
+    sign = torch.where(value < 0, -torch.ones_like(value), torch.ones_like(value))
+    return torch.where(value.abs() < eps, sign * eps, value)
+
+
+def _camera_param_to_broadcast(
+    value: torch.Tensor | float,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    eps: float,
+) -> torch.Tensor:
+    """Convert scalar/[B]/[B,1] camera params to [B,1,1,1]."""
+    tensor = torch.as_tensor(value, device=device, dtype=dtype)
+    if tensor.dim() == 0:
+        tensor = tensor.expand(batch_size)
+    else:
+        tensor = tensor.reshape(tensor.shape[0], -1)[:, 0]
+        if tensor.shape[0] == 1 and batch_size != 1:
+            tensor = tensor.expand(batch_size)
+        elif tensor.shape[0] != batch_size:
+            raise ValueError(f"Camera parameter batch {tensor.shape[0]} does not match depth batch {batch_size}.")
+    return tensor.clamp(min=eps).view(batch_size, 1, 1, 1)
+
+
+def build_coc_focus_target_from_depth(
+    depth_metric: torch.Tensor,
+    focus_distances: torch.Tensor,
+    camera_params: dict[str, torch.Tensor],
+    temperature: float = 1.0,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a CoC-derived soft target posterior over metric focus planes."""
+    if "focal_length" not in camera_params or "pixel_size" not in camera_params:
+        raise ValueError("camera_params must contain focal_length and pixel_size.")
+    if "f_number" not in camera_params and "aperture" not in camera_params:
+        raise ValueError("camera_params must contain either f_number or aperture.")
+
+    depth = depth_metric.squeeze(1) if depth_metric.dim() == 4 else depth_metric
+    if depth.dim() != 3:
+        raise ValueError(f"depth_metric must have shape [B,1,H,W] or [B,H,W], got {tuple(depth_metric.shape)}.")
+
+    batch_size = depth.shape[0]
+    device = depth.device
+    dtype = depth.dtype
+    focus = focus_distances.to(device=device, dtype=dtype)
+    if focus.dim() == 1:
+        focus = focus.unsqueeze(0).expand(batch_size, -1)
+    elif focus.dim() == 2:
+        if focus.shape[0] == 1 and batch_size != 1:
+            focus = focus.expand(batch_size, -1)
+        elif focus.shape[0] != batch_size:
+            raise ValueError(f"focus_distances batch {focus.shape[0]} does not match depth batch {batch_size}.")
+    else:
+        raise ValueError(f"focus_distances must have shape [N] or [B,N], got {tuple(focus_distances.shape)}.")
+
+    focal_length = _camera_param_to_broadcast(camera_params["focal_length"], batch_size, device, dtype, eps)
+    pixel_size = _camera_param_to_broadcast(camera_params["pixel_size"], batch_size, device, dtype, eps)
+    if "aperture" in camera_params:
+        aperture = _camera_param_to_broadcast(camera_params["aperture"], batch_size, device, dtype, eps)
+    else:
+        f_number = _camera_param_to_broadcast(camera_params["f_number"], batch_size, device, dtype, eps)
+        aperture = focal_length / f_number
+
+    focus = focus[:, :, None, None]
+    depth = depth[:, None].clamp(min=eps)
+    v_focus = focus * focal_length / _safe_denominator(focus - focal_length, eps)
+    coc = aperture * v_focus.abs() * (1.0 / focal_length - 1.0 / _safe_denominator(v_focus, eps) - 1.0 / depth).abs()
+    coc_pixels = coc / pixel_size
+    focus_target = torch.softmax(-coc_pixels / max(float(temperature), eps), dim=1)
+    return focus_target, coc_pixels
+
+
 # Structure-guided focal evidence regularization implemented as training-time
 # consistency losses. It uses local image affinity from the focal stack or AIF
 # target, without external foundation models or inference-time overhead.
@@ -155,6 +229,8 @@ class FocalDiffusionLoss(nn.Module):
         uncertainty_focus_weight: float = 0.05,
         uncertainty_error_weight: float = 0.05,
         focus_target_temperature: float = 0.07,
+        focus_target_type: str = "normalized",
+        coc_target_temperature: float = 1.0,
         gate_calibration_weight: float = 0.05,
         posterior_consistency_weight: float = 0.02,
         depth_affinity_smoothness_weight: float = 0.01,
@@ -175,7 +251,11 @@ class FocalDiffusionLoss(nn.Module):
         self.aif_focus_evidence_weight = aif_focus_evidence_weight
         self.uncertainty_focus_weight = uncertainty_focus_weight
         self.uncertainty_error_weight = uncertainty_error_weight
+        if focus_target_type not in {"normalized", "coc"}:
+            raise ValueError(f"Unsupported focus_target_type: {focus_target_type}")
         self.focus_target_temperature = focus_target_temperature
+        self.focus_target_type = focus_target_type
+        self.coc_target_temperature = coc_target_temperature
         self.gate_calibration_weight = gate_calibration_weight
         self.posterior_consistency_weight = posterior_consistency_weight
         self.depth_affinity_smoothness_weight = depth_affinity_smoothness_weight
@@ -214,6 +294,7 @@ class FocalDiffusionLoss(nn.Module):
         gate_prior: torch.Tensor | None = None,
         gate_abstain: torch.Tensor | None = None,
         physical_support: torch.Tensor | None = None,
+        camera_params: dict[str, torch.Tensor] | None = None,
     ):
         del focus_reliability, gate_prior, gate_abstain, physical_support
 
@@ -244,13 +325,24 @@ class FocalDiffusionLoss(nn.Module):
                 if posterior_resized.shape[-2:] != depth_target.shape[-2:]:
                     posterior_resized = F.interpolate(posterior_resized, size=depth_target.shape[-2:], mode="bilinear", align_corners=False)
                     posterior_resized = posterior_resized / posterior_resized.sum(dim=1, keepdim=True).clamp(min=1e-6)
-                focus_target, _ = build_soft_focus_target_from_depth(
-                    depth_gt_norm,
-                    focus_distances,
-                    temperature=self.focus_target_temperature,
-                )
-                kl = focus_target * (torch.log(focus_target + 1e-6) - torch.log(posterior_resized + 1e-6))
-                losses["loss_focus_posterior_kl"] = self._masked_mean(kl.sum(dim=1, keepdim=True), mask)
+                focus_target = None
+                if self.focus_target_type == "normalized":
+                    focus_target, _ = build_soft_focus_target_from_depth(
+                        depth_gt_norm,
+                        focus_distances,
+                        temperature=self.focus_target_temperature,
+                    )
+                elif camera_params is not None:
+                    focus_target, _ = build_coc_focus_target_from_depth(
+                        depth_target,
+                        focus_distances,
+                        camera_params,
+                        temperature=self.coc_target_temperature,
+                    )
+                if focus_target is not None:
+                    focus_target = focus_target.to(device=posterior_resized.device, dtype=posterior_resized.dtype)
+                    kl = focus_target * (torch.log(focus_target + 1e-6) - torch.log(posterior_resized + 1e-6))
+                    losses["loss_focus_posterior_kl"] = self._masked_mean(kl.sum(dim=1, keepdim=True), mask)
             if uncertainty is not None and depth_final_norm is not None:
                 uncertainty_resized = F.interpolate(uncertainty, size=depth_target.shape[-2:], mode="bilinear", align_corners=False)
                 error_norm = torch.abs(depth_final_resized.detach() - depth_gt_norm)

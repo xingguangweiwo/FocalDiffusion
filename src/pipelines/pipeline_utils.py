@@ -151,7 +151,7 @@ def load_pipeline(
             pipeline.transformer.condition_channels = condition_channels
             pipeline.transformer.condition_adapter = torch.nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
 
-    pipeline = pipeline.to(device)
+    pipeline = pipeline.to(device=device, dtype=dtype)
 
     # Load component weights after checkpoint-compatible modules have been created.
     if 'focal_processor_state_dict' in checkpoint:
@@ -162,10 +162,20 @@ def load_pipeline(
         pipeline.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
     if 'physical_support_head_state_dict' in checkpoint:
         pipeline.physical_support_head.load_state_dict(checkpoint['physical_support_head_state_dict'], strict=False)
+
+    for module_name in (
+        'focal_processor',
+        'focal_evidence_head',
+        'dual_decoder',
+        'physical_support_head',
+    ):
+        getattr(pipeline, module_name).to(device=device, dtype=dtype)
+
     if 'transformer_state_dict' in checkpoint:
         transformer_state_dict = checkpoint['transformer_state_dict']
         _ensure_transformer_lora(pipeline, checkpoint_config, transformer_state_dict)
         missing, unexpected = pipeline.transformer.load_state_dict(transformer_state_dict, strict=False)
+        pipeline.transformer.to(device=device, dtype=dtype)
         logger.info("Loaded transformer: missing=%s unexpected=%s", missing, unexpected)
 
     return pipeline

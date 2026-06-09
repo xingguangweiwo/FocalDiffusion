@@ -159,3 +159,81 @@ def test_reliability_metric_helpers_smoke():
     assert "uncertainty_final" in results
     assert "auroc" in results["uncertainty_final"]
     assert "ause_absrel" in results["uncertainty_final"]
+
+
+def test_build_coc_focus_target_from_depth_smoke():
+    from src.training.losses import build_coc_focus_target_from_depth
+
+    batch, planes, height, width = 2, 4, 8, 8
+    depth = torch.rand(batch, 1, height, width) * 3.0 + 0.3
+    focus_distances = torch.linspace(0.4, 3.0, planes).unsqueeze(0).expand(batch, -1)
+    camera_params = {
+        "focal_length": torch.full((batch,), 0.05),
+        "f_number": torch.full((batch, 1), 2.8),
+        "pixel_size": torch.tensor(5e-6),
+    }
+
+    posterior, coc_pixels = build_coc_focus_target_from_depth(
+        depth,
+        focus_distances,
+        camera_params,
+        temperature=1.0,
+    )
+
+    assert posterior.shape == (batch, planes, height, width)
+    assert coc_pixels.shape == (batch, planes, height, width)
+    assert torch.allclose(posterior.sum(dim=1), torch.ones(batch, height, width), atol=1e-5)
+    assert torch.isfinite(posterior).all()
+    assert torch.isfinite(coc_pixels).all()
+
+
+def test_focal_diffusion_loss_coc_target_smoke():
+    batch, planes, height, width = 2, 4, 8, 8
+    loss_fn = FocalDiffusionLoss(
+        diffusion_weight=1.0,
+        depth_weight=1.0,
+        focus_posterior_kl_weight=0.2,
+        focus_target_type="coc",
+        coc_target_temperature=1.0,
+    )
+    focus_posterior = torch.softmax(torch.randn(batch, planes, height, width), dim=1)
+    depth_target = torch.rand(batch, 1, height, width) * 3.0 + 0.3
+    loss_dict = loss_fn(
+        diffusion_pred=torch.randn(batch, 4, height, width),
+        diffusion_target=torch.randn(batch, 4, height, width),
+        depth_target=depth_target,
+        depth_final_norm=torch.rand(batch, 1, height, width),
+        focus_posterior=focus_posterior,
+        focus_distances=torch.linspace(0.4, 3.0, planes).unsqueeze(0).expand(batch, -1),
+        depth_range=torch.tensor([[0.3, 3.3], [0.3, 3.3]]),
+        camera_params={
+            "focal_length": torch.full((batch,), 0.05),
+            "f_number": torch.full((batch,), 2.8),
+            "pixel_size": torch.tensor(5e-6),
+        },
+    )
+
+    assert torch.isfinite(loss_dict["total"])
+    assert "loss_focus_posterior_kl" in loss_dict
+
+
+def test_custom_module_half_inputs_match_half_weights_smoke():
+    from src.models.focal_evidence import FocalEvidenceHead, PhysicalSupportHead, build_support_inputs
+
+    focal_stack = torch.rand(1, 3, 3, 16, 16, dtype=torch.float16)
+    focus_distances = torch.linspace(0.4, 2.0, 3, dtype=torch.float16).unsqueeze(0)
+    evidence_head = FocalEvidenceHead(hidden=8).to(dtype=torch.float16)
+    evidence = evidence_head(focal_stack, focus_distances)
+    assert evidence["focus_posterior"].dtype == torch.float16
+
+    depth_prior = torch.rand(1, 1, 16, 16, dtype=torch.float16)
+    support_inputs, _ = build_support_inputs(
+        focus_posterior=evidence["focus_posterior"],
+        focus_entropy=evidence["focus_entropy"],
+        depth_focus_norm=evidence["depth_focus_norm"],
+        depth_prior_norm=depth_prior,
+        uncertainty_decoder=torch.rand(1, 1, 16, 16, dtype=torch.float16),
+    )
+    support_head = PhysicalSupportHead(hidden=8).to(dtype=torch.float16)
+    support = support_head(support_inputs.to(dtype=torch.float16))
+    assert support["physical_support"].dtype == torch.float16
