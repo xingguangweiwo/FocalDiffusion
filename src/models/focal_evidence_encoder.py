@@ -39,12 +39,12 @@ class FocalEvidenceEncoder(nn.Module):
             nn.Conv2d(hidden, hidden, 3, padding=1),
             nn.SiLU(),
         )
-        self.tau_mlp = nn.Sequential(
+        self.focal_distance_mlp = nn.Sequential(
             nn.Linear(1, hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
         )
-        self.score_head = nn.Conv2d(hidden, 1, 1)
+        self.posterior_logit_head = nn.Conv2d(hidden, 1, 1)
 
     def _normalize_focal_plane_distances(self, focal_plane_distances: torch.Tensor) -> torch.Tensor:
         tau_min = focal_plane_distances.min(dim=1, keepdim=True).values
@@ -65,52 +65,41 @@ class FocalEvidenceEncoder(nn.Module):
                 f"focal_plane_distances must have shape {(B, N)}, got {tuple(focal_plane_distances.shape)}"
             )
 
-        tau = self._normalize_focal_plane_distances(focal_plane_distances)
+        focal_coordinates = self._normalize_focal_plane_distances(focal_plane_distances)
 
         x = focal_stack.reshape(B * N, C, H, W)
         if self.use_highpass:
-            low = F.avg_pool2d(x, kernel_size=5, stride=1, padding=2)
-            hp = x - low
+            low_frequency = F.avg_pool2d(x, kernel_size=5, stride=1, padding=2)
+            high_frequency = x - low_frequency
         else:
-            hp = x
-        hp = hp.reshape(B, N, C, H, W)
+            high_frequency = x
+        high_frequency = high_frequency.reshape(B, N, C, H, W)
 
-        diff = torch.zeros_like(hp)
-        diff[:, 1:] = hp[:, 1:] - hp[:, :-1]
+        adjacent_focus_difference = torch.zeros_like(high_frequency)
+        adjacent_focus_difference[:, 1:] = high_frequency[:, 1:] - high_frequency[:, :-1]
 
-        physics_input = torch.cat([hp, diff], dim=2).reshape(B * N, 2 * C, H, W)
-        features = self.local_encoder(physics_input).reshape(B, N, self.hidden, H, W)
-        tau_embed = self.tau_mlp(tau.unsqueeze(-1)).to(dtype=features.dtype)
-        features = features + tau_embed[:, :, :, None, None]
+        evidence_input = torch.cat([high_frequency, adjacent_focus_difference], dim=2).reshape(B * N, 2 * C, H, W)
+        features = self.local_encoder(evidence_input).reshape(B, N, self.hidden, H, W)
+        focal_distance_embedding = self.focal_distance_mlp(focal_coordinates.unsqueeze(-1)).to(dtype=features.dtype)
+        features = features + focal_distance_embedding[:, :, :, None, None]
         features = features.reshape(B * N, self.hidden, H, W)
 
         temperature = max(float(self.temperature), self.eps)
-        focal_logits = self.score_head(features).reshape(B, N, H, W)
+        focal_logits = self.posterior_logit_head(features).reshape(B, N, H, W)
         focal_posterior = torch.softmax(focal_logits / temperature, dim=1)
-        focal_depth_canonical = (focal_posterior * tau[:, :, None, None]).sum(dim=1, keepdim=True)
+        focal_depth_canonical = (focal_posterior * focal_coordinates[:, :, None, None]).sum(dim=1, keepdim=True)
 
-        entropy = -(focal_posterior * torch.log(focal_posterior + self.eps)).sum(dim=1, keepdim=True)
-        entropy = (entropy / math.log(max(N, 2))).clamp(0.0, 1.0)
-        focal_peak_confidence = (1.0 - entropy).clamp(0.0, 1.0)
+        focal_entropy = -(focal_posterior * torch.log(focal_posterior + self.eps)).sum(dim=1, keepdim=True)
+        focal_entropy = (focal_entropy / math.log(max(N, 2))).clamp(0.0, 1.0)
+        focal_peak_confidence = (1.0 - focal_entropy).clamp(0.0, 1.0)
 
         return {
             "focal_logits": focal_logits,
             "focal_posterior": focal_posterior,
             "focal_depth_canonical": focal_depth_canonical,
-            "focal_entropy": entropy,
+            "focal_entropy": focal_entropy,
             "focal_peak_confidence": focal_peak_confidence,
-            # Backward-compatible aliases.
-            "focus_logits": focal_logits,
-            "focus_posterior": focal_posterior,
-            "depth_focus_norm": focal_depth_canonical,
-            "focus_entropy": entropy,
-            "focus_peakiness": focal_peak_confidence,
-            "focus_reliability": focal_peak_confidence,  # Compatibility alias only; not calibrated reliability.
-            "focus_coordinates": tau,
-            # Compatibility aliases for older scripts/tests.
-            "focus_prob": focal_posterior,
-            "depth_focus": focal_depth_canonical,
-            "tau": tau,
+            "focal_coordinates": focal_coordinates,
         }
 
 
@@ -121,17 +110,17 @@ def build_physical_evidence_features(
     generated_depth_canonical: torch.Tensor,
     generative_uncertainty: torch.Tensor,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Build lightweight physical support inputs.
+    """Build physical-evidence support maps for focus/prior depth fusion.
 
     Args:
-        focal_posterior: Per-pixel posterior over focus planes with shape [B, N, H, W].
+        focal_posterior: Per-pixel posterior over focal planes with shape [B, N, H, W].
         focal_entropy: Normalized posterior entropy with shape [B, 1, H, W].
         focal_depth_canonical: Focus-derived normalized depth with shape [B, 1, H, W].
         generated_depth_canonical: Decoder-prior normalized depth with shape [B, 1, H, W].
         generative_uncertainty: Decoder uncertainty with shape [B, 1, H, W].
 
     Returns:
-        A 5-channel support tensor and a dictionary of diagnostic support maps.
+        A 5-channel support tensor and diagnostic support maps.
     """
 
     if focal_posterior.shape[1] < 2:
@@ -212,7 +201,7 @@ def decode_metric_depth_from_focal_posterior(
 
 
 class PhysicalEvidenceEstimator(nn.Module):
-    """Tiny head that calibrates focus/prior gates and uncertainty from physical support maps."""
+    """Estimate focus/prior/abstention gates and fusion uncertainty from support maps."""
 
     def __init__(self, in_channels: int = 5, hidden: int = 16):
         super().__init__()
@@ -242,41 +231,4 @@ class PhysicalEvidenceEstimator(nn.Module):
             "abstention_weight": abstention_weight,
             "uncertainty_final": uncertainty_final,
             "physical_evidence_support": physical_evidence_support,
-            # Backward-compatible aliases.
-            "gate_focus": focal_evidence_weight,
-            "gate_prior": generative_prior_weight,
-            "gate_abstain": abstention_weight,
-            "physical_support": physical_evidence_support,
         }
-
-# Backward-compatible aliases and wrappers for external scripts using pre-rename APIs.
-FocalEvidenceHead = FocalEvidenceEncoder
-PhysicalSupportHead = PhysicalEvidenceEstimator
-
-
-def build_support_inputs(
-    focus_posterior: torch.Tensor,
-    focus_entropy: torch.Tensor,
-    depth_focus_norm: torch.Tensor,
-    depth_prior_norm: torch.Tensor,
-    uncertainty_decoder: torch.Tensor,
-) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    return build_physical_evidence_features(
-        focal_posterior=focus_posterior,
-        focal_entropy=focus_entropy,
-        focal_depth_canonical=depth_focus_norm,
-        generated_depth_canonical=depth_prior_norm,
-        generative_uncertainty=uncertainty_decoder,
-    )
-
-
-def expected_metric_depth_from_focus_posterior(
-    focus_posterior: torch.Tensor,
-    focus_distances: torch.Tensor,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    return decode_metric_depth_from_focal_posterior(
-        focal_posterior=focus_posterior,
-        focal_plane_distances=focus_distances,
-        eps=eps,
-    )
