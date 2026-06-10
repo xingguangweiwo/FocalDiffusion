@@ -8,15 +8,10 @@ GENERATION_TASKS = {
     "refocus": 4,
 }
 
-TASK_ALIASES = {
-    "aif": "all_in_focus",
-}
-
 
 def normalize_generation_task(generation_task: str) -> str:
-    """Return the canonical generation-task name, accepting supported legacy aliases."""
-    canonical = TASK_ALIASES.get(generation_task, generation_task)
-    if canonical not in GENERATION_TASKS:
-        valid = ", ".join(sorted([*GENERATION_TASKS, *TASK_ALIASES]))
+    """Validate and return a canonical generation-task name."""
+    if generation_task not in GENERATION_TASKS:
+        valid = ", ".join(sorted(GENERATION_TASKS))
         raise ValueError(f"Unsupported generation_task {generation_task!r}; expected one of: {valid}")
-    return canonical
+    return generation_task
