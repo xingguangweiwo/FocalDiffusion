@@ -11,6 +11,41 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+_FOCAL_MODULE_ATTRS = (
+    'focal_processor',
+    'focal_evidence_head',
+    'dual_decoder',
+    'physical_evidence_support_head',
+)
+
+
+def _register_focal_modules(
+        pipeline: 'FocalStackGenerationPipeline',
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+) -> None:
+    """Register and place only FocalStackGeneration-specific modules."""
+    focal_modules = {
+        name: getattr(pipeline, name)
+        for name in _FOCAL_MODULE_ATTRS
+        if getattr(pipeline, name, None) is not None
+    }
+
+    register_modules = getattr(pipeline, 'register_modules', None)
+    if callable(register_modules):
+        register_modules(**focal_modules)
+
+    to_kwargs: Dict[str, Any] = {}
+    if device is not None:
+        to_kwargs['device'] = device
+    if dtype is not None:
+        to_kwargs['dtype'] = dtype
+
+    if to_kwargs:
+        for module in focal_modules.values():
+            module.to(**to_kwargs)
+
 
 def _get_transformer_training_mode(config: Optional[Dict[str, Any]]) -> Optional[str]:
     """Return the checkpoint transformer training mode, if present."""
@@ -63,7 +98,6 @@ def _ensure_transformer_lora(
     )
     pipeline.transformer = get_peft_model(pipeline.transformer, lora_config)
     logger.info("Rebuilt transformer LoRA adapters before loading checkpoint")
-
 
 
 def _model_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -143,13 +177,18 @@ def load_pipeline(
         pipeline.dual_decoder = modules['dual_decoder']
         pipeline.physical_evidence_support_head = modules['physical_evidence_support_head']
         pipeline.config = checkpoint_config
+        _register_focal_modules(pipeline, device=device, dtype=dtype)
 
         condition_channels = getattr(pipeline.focal_processor, 'feature_dim', None)
         if hasattr(pipeline.transformer, 'condition_adapter') and condition_channels is not None:
             # Rebuild the condition adapter to match the reconstructed focal processor.
             hidden_size = pipeline.transformer.config.attention_head_dim * pipeline.transformer.config.num_attention_heads
             pipeline.transformer.condition_channels = condition_channels
-            pipeline.transformer.condition_adapter = torch.nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
+            pipeline.transformer.condition_adapter = torch.nn.Conv2d(
+                condition_channels,
+                hidden_size,
+                kernel_size=1,
+            ).to(device=device, dtype=dtype)
 
     pipeline = pipeline.to(device=device, dtype=dtype)
 
@@ -163,13 +202,7 @@ def load_pipeline(
     if 'physical_evidence_support_head_state_dict' in checkpoint:
         pipeline.physical_evidence_support_head.load_state_dict(checkpoint['physical_evidence_support_head_state_dict'], strict=False)
 
-    for module_name in (
-        'focal_processor',
-        'focal_evidence_head',
-        'dual_decoder',
-        'physical_evidence_support_head',
-    ):
-        getattr(pipeline, module_name).to(device=device, dtype=dtype)
+    _register_focal_modules(pipeline, device=device, dtype=dtype)
 
     if 'transformer_state_dict' in checkpoint:
         transformer_state_dict = checkpoint['transformer_state_dict']

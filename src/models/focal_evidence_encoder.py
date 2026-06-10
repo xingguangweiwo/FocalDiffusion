@@ -54,16 +54,29 @@ class FocalEvidenceEncoder(nn.Module):
     def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
         if focal_stack.dim() != 5:
             raise ValueError(f"focal_stack must have shape [B, N, C, H, W], got {tuple(focal_stack.shape)}")
+        if not torch.isfinite(focal_stack).all():
+            raise ValueError("focal_stack must contain only finite values.")
         if focal_plane_distances.dim() == 1:
             focal_plane_distances = focal_plane_distances.unsqueeze(0)
+        if focal_plane_distances.dim() != 2:
+            raise ValueError(
+                "focal_plane_distances must have shape [B, N] or [N], "
+                f"got {tuple(focal_plane_distances.shape)}"
+            )
 
         B, N, C, H, W = focal_stack.shape
+        if N < 1:
+            raise ValueError("focal_stack must contain at least one focal plane.")
         if C != self.in_channels:
             raise ValueError(f"Expected {self.in_channels} input channels, got {C}.")
+        if focal_plane_distances.shape[0] == 1 and B != 1:
+            focal_plane_distances = focal_plane_distances.expand(B, -1)
         if focal_plane_distances.shape != (B, N):
             raise ValueError(
-                f"focal_plane_distances must have shape {(B, N)}, got {tuple(focal_plane_distances.shape)}"
+                f"focal_plane_distances must have shape {(B, N)} or {(N,)}, got {tuple(focal_plane_distances.shape)}"
             )
+        if not torch.isfinite(focal_plane_distances).all():
+            raise ValueError("focal_plane_distances must contain only finite values.")
 
         focal_coordinates = self._normalize_focal_plane_distances(focal_plane_distances)
 
@@ -100,6 +113,9 @@ class FocalEvidenceEncoder(nn.Module):
             "focal_entropy": focal_entropy,
             "focal_peak_confidence": focal_peak_confidence,
             "focal_coordinates": focal_coordinates,
+            # Backward-compatible alias for checkpoints/scripts created before the
+            # canonical focal-evidence terminology was adopted.
+            "focus_reliability": focal_peak_confidence,
         }
 
 
@@ -123,8 +139,34 @@ def build_physical_evidence_features(
         A 5-channel support tensor and diagnostic support maps.
     """
 
+    if focal_posterior.dim() != 4:
+        raise ValueError(
+            f"focal_posterior must have shape [B, N, H, W], got {tuple(focal_posterior.shape)}"
+        )
     if focal_posterior.shape[1] < 2:
         raise ValueError("focal_posterior must contain at least two focal planes to compute posterior_margin.")
+
+    batch, _, height, width = focal_posterior.shape
+    expected_map_shape = (batch, 1, height, width)
+    for name, value in {
+        "focal_entropy": focal_entropy,
+        "focal_depth_canonical": focal_depth_canonical,
+        "generated_depth_canonical": generated_depth_canonical,
+        "generative_uncertainty": generative_uncertainty,
+    }.items():
+        if value.shape != expected_map_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_map_shape}, got {tuple(value.shape)}"
+            )
+    for name, value in {
+        "focal_posterior": focal_posterior,
+        "focal_entropy": focal_entropy,
+        "focal_depth_canonical": focal_depth_canonical,
+        "generated_depth_canonical": generated_depth_canonical,
+        "generative_uncertainty": generative_uncertainty,
+    }.items():
+        if not torch.isfinite(value).all():
+            raise ValueError(f"{name} must contain only finite values.")
 
     focal_peak_confidence = (1.0 - focal_entropy).clamp(0.0, 1.0)
     top2 = torch.topk(focal_posterior, k=2, dim=1).values
@@ -212,6 +254,18 @@ class PhysicalEvidenceEstimator(nn.Module):
         )
 
     def forward(self, support_inputs: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if support_inputs.dim() != 4:
+            raise ValueError(
+                f"support_inputs must have shape [B, C, H, W], got {tuple(support_inputs.shape)}"
+            )
+        expected_channels = self.net[0].in_channels
+        if support_inputs.shape[1] != expected_channels:
+            raise ValueError(
+                f"support_inputs must have {expected_channels} channels, got {support_inputs.shape[1]}"
+            )
+        if not torch.isfinite(support_inputs).all():
+            raise ValueError("support_inputs must contain only finite values.")
+
         raw = self.net(support_inputs)
         gate_logits = raw[:, :3]
         uncertainty_logit = raw[:, 3:4]

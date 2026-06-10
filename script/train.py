@@ -6,7 +6,6 @@ Uses the FocalStackGenerationTrainer class from src.training.trainer
 import argparse
 import ast
 import logging
-import os
 import sys
 from copy import deepcopy
 from datetime import datetime
@@ -20,35 +19,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from script.utils import dump_yaml_file, load_yaml_file
-
-try:
-    from src.data.dataset import resolve_data_root
-except ModuleNotFoundError as missing:
-    if missing.name not in {"torch", "numpy", "cv2"}:
-        raise
-
-    def resolve_data_root(
-        root_candidate: Any,
-        *,
-        dataset_type: Optional[str] = None,
-        source_name: Optional[str] = None,
-    ) -> Path:
-
-        del dataset_type, source_name  # placeholders for signature parity
-
-        if isinstance(root_candidate, (list, tuple, set)):
-            candidates = list(root_candidate)
-        else:
-            candidates = [root_candidate]
-
-        last_resolved: Optional[Path] = None
-        for candidate in candidates:
-            resolved = Path(os.path.expanduser(os.path.expandvars(str(candidate))))
-            if resolved.exists():
-                return resolved
-            last_resolved = resolved
-
-        return last_resolved or Path(os.path.expanduser(os.path.expandvars(str(candidates[-1]))))
+from src.data.dataset import resolve_data_root
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

@@ -10,6 +10,18 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _log_state_dict_issues(
+    module_name: str,
+    missing_keys: list[str],
+    unexpected_keys: list[str],
+) -> None:
+    """Warn when non-strict checkpoint loading leaves unmatched keys."""
+    if missing_keys:
+        logger.warning("Missing %s checkpoint keys: %s", module_name, missing_keys)
+    if unexpected_keys:
+        logger.warning("Unexpected %s checkpoint keys: %s", module_name, unexpected_keys)
+
+
 def save_checkpoint(
     trainer: "FocalStackGenerationTrainer",
     epoch: int,
@@ -76,22 +88,32 @@ def load_checkpoint(trainer: "FocalStackGenerationTrainer", checkpoint_path: str
 
     trainer.focal_processor.load_state_dict(checkpoint['focal_processor_state_dict'])
     if 'focal_evidence_head_state_dict' in checkpoint:
-        trainer.focal_evidence_head.load_state_dict(checkpoint['focal_evidence_head_state_dict'], strict=False)
-    trainer.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
+        missing_keys, unexpected_keys = trainer.focal_evidence_head.load_state_dict(
+            checkpoint['focal_evidence_head_state_dict'],
+            strict=False,
+        )
+        _log_state_dict_issues("focal_evidence_head", missing_keys, unexpected_keys)
+
+    missing_keys, unexpected_keys = trainer.dual_decoder.load_state_dict(
+        checkpoint['dual_decoder_state_dict'],
+        strict=False,
+    )
+    _log_state_dict_issues("dual_decoder", missing_keys, unexpected_keys)
+
     if 'physical_evidence_support_head_state_dict' in checkpoint:
-        trainer.physical_evidence_support_head.load_state_dict(
+        missing_keys, unexpected_keys = trainer.physical_evidence_support_head.load_state_dict(
             checkpoint['physical_evidence_support_head_state_dict'],
             strict=False,
         )
+        _log_state_dict_issues("physical_evidence_support_head", missing_keys, unexpected_keys)
 
     if 'transformer_state_dict' in checkpoint:
-        missing, unexpected = trainer.pipeline.transformer.load_state_dict(
+        missing_keys, unexpected_keys = trainer.pipeline.transformer.load_state_dict(
             checkpoint['transformer_state_dict'],
             strict=False,
         )
         logger.info("Loaded transformer state_dict")
-        logger.info("Missing transformer keys: %s", missing)
-        logger.info("Unexpected transformer keys: %s", unexpected)
+        _log_state_dict_issues("transformer", missing_keys, unexpected_keys)
 
     trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     trainer.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

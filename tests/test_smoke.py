@@ -2,7 +2,13 @@ import torch
 from PIL import Image
 
 from script.inference import resize_or_pad_to_multiple
-from src.models import DualOutputDecoder, FocalStackProcessor
+from src.models import (
+    DualOutputDecoder,
+    FocalEvidenceEncoder,
+    FocalStackProcessor,
+    PhysicalEvidenceEstimator,
+    build_physical_evidence_features,
+)
 from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationPipeline
 from src.training.losses import FocalStackGenerationLoss
 
@@ -237,3 +243,189 @@ def test_custom_module_half_inputs_match_half_weights_smoke():
     support_head = PhysicalEvidenceEstimator(hidden=8).to(dtype=torch.float16)
     support = support_head(support_inputs.to(dtype=torch.float16))
     assert support["physical_evidence_support"].dtype == torch.float16
+
+
+def test_register_focal_modules_updates_only_focal_modules():
+    import torch.nn as nn
+
+    from src.pipelines.pipeline_utils import _register_focal_modules
+
+    class DummyPipeline:
+        def __init__(self):
+            self.focal_processor = nn.Conv2d(1, 1, 1)
+            self.focal_evidence_head = nn.Conv2d(1, 1, 1)
+            self.dual_decoder = nn.Conv2d(1, 1, 1)
+            self.physical_evidence_support_head = nn.Conv2d(1, 1, 1)
+            self.text_encoder = nn.Linear(1, 1)
+            self.vae = nn.Linear(1, 1)
+            self.registered = None
+
+        def register_modules(self, **modules):
+            self.registered = modules
+
+    pipeline = DummyPipeline()
+
+    _register_focal_modules(pipeline, device="cpu", dtype=torch.float64)
+
+    assert set(pipeline.registered) == {
+        "focal_processor",
+        "focal_evidence_head",
+        "dual_decoder",
+        "physical_evidence_support_head",
+    }
+    for module in pipeline.registered.values():
+        assert next(module.parameters()).dtype == torch.float64
+    assert next(pipeline.text_encoder.parameters()).dtype == torch.float32
+    assert next(pipeline.vae.parameters()).dtype == torch.float32
+
+
+def test_pipeline_rejects_invalid_focal_distance_mode_before_inference():
+    import pytest
+
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationPipeline
+
+    with pytest.raises(ValueError, match="focal_distance_mode"):
+        FocalStackGenerationPipeline.__call__(
+            object(),
+            focal_stack=torch.empty(1, 2, 3, 8, 8),
+            focal_plane_distances=torch.ones(1, 2),
+            focal_distance_mode="calibrated",
+        )
+
+
+def test_run_validation_merges_teacher_forced_and_generative_metrics(monkeypatch):
+    from src.training import validation
+
+    def fake_teacher(trainer, epoch):
+        assert trainer == "trainer"
+        assert epoch == 3
+        return {
+            "teacher_forced_abs_rel": 1.0,
+            "teacher_forced_rmse": 2.0,
+            "teacher_forced_l1": 3.0,
+        }
+
+    def fake_generative(trainer, epoch):
+        assert trainer == "trainer"
+        assert epoch == 3
+        return {
+            "generative_abs_rel": 4.0,
+            "generative_rmse": 5.0,
+            "generative_l1": 6.0,
+        }
+
+    monkeypatch.setattr(validation, "run_teacher_forced_validation", fake_teacher)
+    monkeypatch.setattr(validation, "run_generative_validation", fake_generative)
+
+    metrics = validation.run_validation("trainer", 3)
+
+    assert metrics["teacher_forced_abs_rel"] == 1.0
+    assert metrics["generative_abs_rel"] == 4.0
+    assert metrics["loss"] == metrics["generative_l1"]
+    assert metrics["abs_rel"] == metrics["generative_abs_rel"]
+    assert metrics["rmse"] == metrics["generative_rmse"]
+
+
+# Core tensor-path smoke tests merged from tests/test_smoke_core.py.
+def test_focal_evidence_encoder_forward():
+    encoder = FocalEvidenceEncoder()
+    focal_stack = torch.randn(2, 5, 3, 64, 64)
+    focal_plane_distances = torch.linspace(0.2, 2.0, 5).repeat(2, 1)
+
+    outputs = encoder(focal_stack, focal_plane_distances)
+
+    for key in (
+        "focal_logits",
+        "focal_posterior",
+        "focal_depth_canonical",
+        "focal_entropy",
+        "focal_peak_confidence",
+        "focal_coordinates",
+    ):
+        assert key in outputs
+    assert torch.allclose(
+        outputs["focal_posterior"].sum(dim=1),
+        torch.ones(2, 64, 64),
+        atol=1e-5,
+    )
+
+
+def test_physical_evidence_estimator_forward():
+    focal_posterior = torch.softmax(torch.randn(2, 5, 64, 64), dim=1)
+    focal_entropy = torch.rand(2, 1, 64, 64)
+    focal_depth_canonical = torch.rand(2, 1, 64, 64)
+    generated_depth_canonical = torch.rand(2, 1, 64, 64)
+    generative_uncertainty = torch.rand(2, 1, 64, 64)
+    support_inputs, _ = build_physical_evidence_features(
+        focal_posterior=focal_posterior,
+        focal_entropy=focal_entropy,
+        focal_depth_canonical=focal_depth_canonical,
+        generated_depth_canonical=generated_depth_canonical,
+        generative_uncertainty=generative_uncertainty,
+    )
+    estimator = PhysicalEvidenceEstimator()
+
+    outputs = estimator(support_inputs)
+
+    for key in (
+        "focal_evidence_weight",
+        "generative_prior_weight",
+        "abstention_weight",
+        "uncertainty_final",
+        "physical_evidence_support",
+    ):
+        assert key in outputs
+    gate_weights = torch.cat(
+        [
+            outputs["focal_evidence_weight"],
+            outputs["generative_prior_weight"],
+            outputs["abstention_weight"],
+        ],
+        dim=1,
+    )
+    assert torch.allclose(
+        gate_weights.sum(dim=1),
+        torch.ones(2, 64, 64),
+        atol=1e-5,
+    )
+
+
+def test_dual_decoder_forward():
+    decoder = DualOutputDecoder(in_channels=16)
+    latent = torch.randn(2, 16, 16, 16)
+
+    outputs = decoder(latent)
+
+    for key in (
+        "generated_depth_canonical",
+        "uncertainty",
+        "all_in_focus_latents",
+    ):
+        assert key in outputs
+    assert outputs["generated_depth_canonical"].min() >= 0
+    assert outputs["generated_depth_canonical"].max() <= 1
+
+
+def test_loss_forward_minimal_supervised():
+    loss_fn = FocalStackGenerationLoss()
+    batch, planes, height, width = 2, 5, 16, 16
+    focal_posterior = torch.softmax(torch.randn(batch, planes, height, width), dim=1)
+    depth_target = torch.rand(batch, 1, height, width)
+
+    loss_dict = loss_fn(
+        diffusion_pred=torch.randn(batch, 4, height, width),
+        diffusion_target=torch.randn(batch, 4, height, width),
+        depth_target=depth_target,
+        generated_depth_canonical=torch.rand(batch, 1, height, width),
+        focal_depth_canonical=torch.rand(batch, 1, height, width),
+        final_depth_canonical=torch.rand(batch, 1, height, width),
+        uncertainty=torch.rand(batch, 1, height, width),
+        focal_posterior=focal_posterior,
+        focal_entropy=torch.rand(batch, 1, height, width),
+        focal_plane_distances=torch.linspace(0.2, 2.0, planes).repeat(batch, 1),
+        depth_range=torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+        focal_evidence_weight=torch.rand(batch, 1, height, width),
+    )
+
+    assert "total" in loss_dict
+    assert torch.isfinite(loss_dict["total"])
