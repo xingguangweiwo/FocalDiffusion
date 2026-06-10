@@ -1,6 +1,6 @@
 """FocalStackGeneration model components exposed for training and inference."""
 
-from .dual_decoder import DualOutputDecoder
+from .dual_decoder import TaskOutputDecoder
 from .focal_attention import FocalCrossAttention
 from .focal_evidence_encoder import (
     FocalEvidenceEncoder,
@@ -17,5 +17,5 @@ __all__ = [
     "PhysicalEvidenceEstimator",
     "build_physical_evidence_features",
     "decode_metric_depth_from_focal_posterior",
-    "DualOutputDecoder",
+    "TaskOutputDecoder",
 ]
