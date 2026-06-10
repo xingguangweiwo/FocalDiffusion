@@ -1,4 +1,4 @@
-"""Dual-output decoder used by FocalStackGeneration."""
+"""Task-output decoder used by FocalStackGeneration."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ class _ResidualBlock(nn.Module):
         return self.act(out + residual)
 
 
-class DualOutputDecoder(nn.Module):
+class TaskOutputDecoder(nn.Module):
     """Decode SD3.5 latents into all-in-focus latents, canonical depth, and uncertainty."""
 
     def __init__(
@@ -194,3 +194,7 @@ class DualOutputDecoder(nn.Module):
         std = magnitude.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         normalized = (magnitude - mean) / std
         return torch.cat([grad_x, grad_y], dim=1) * 0.5 + normalized
+
+
+# Temporary compatibility for modules that still import the old name directly.
+DualOutputDecoder = TaskOutputDecoder
