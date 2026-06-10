@@ -70,12 +70,11 @@ class FocalStackGenerationOutput(BaseOutput):
     all_in_focus_image: Union[torch.Tensor, Image.Image]
     depth_colored: Optional[Image.Image] = None
     uncertainty: Optional[torch.Tensor] = None
-    depth_prior: Optional[torch.Tensor] = None
-    depth_focus: Optional[torch.Tensor] = None
-    depth_final: Optional[torch.Tensor] = None
+    generated_depth_canonical: Optional[torch.Tensor] = None
+    focal_depth_canonical: Optional[torch.Tensor] = None
+    final_depth_canonical: Optional[torch.Tensor] = None
     focal_posterior: Optional[torch.Tensor] = None
     focal_entropy: Optional[torch.Tensor] = None
-    focus_reliability: Optional[torch.Tensor] = None
     focal_peak_confidence: Optional[torch.Tensor] = None
     physical_evidence_support: Optional[torch.Tensor] = None
     focal_evidence_weight: Optional[torch.Tensor] = None
@@ -88,7 +87,12 @@ class FocalStackGenerationOutput(BaseOutput):
     uncertainty_disagreement: Optional[torch.Tensor] = None
     uncertainty_final: Optional[torch.Tensor] = None
     depth_focus_metric: Optional[torch.Tensor] = None
-    # Backward-compatible output aliases.
+    # Backward-compatible output aliases. Prefer the canonical *_canonical names
+    # above in new code and checkpoint metadata.
+    depth_prior: Optional[torch.Tensor] = None
+    depth_focus: Optional[torch.Tensor] = None
+    depth_final: Optional[torch.Tensor] = None
+    focus_reliability: Optional[torch.Tensor] = None
     focus_posterior: Optional[torch.Tensor] = None
     focus_entropy: Optional[torch.Tensor] = None
     focus_peakiness: Optional[torch.Tensor] = None
@@ -527,8 +531,34 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         latents: Optional[torch.FloatTensor] = None,
         output_type: str = "pil",
         return_dict: bool = True,
+        focal_distance_mode: str = "normalized",
         **kwargs: Any,
     ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, Union[torch.Tensor, Image.Image]]]:
+        """Generate canonical depth and all-in-focus outputs from a focal stack.
+
+        Args:
+            focal_stack: Input focal stack as a tensor ``[B, N, C, H, W]`` /
+                ``[N, C, H, W]`` or a list of RGB PIL images.
+            focal_plane_distances: Per-plane focal coordinates with shape
+                ``[N]`` or ``[B, N]``. These are always used to form canonical
+                focal coordinates for the model.
+            focal_distance_mode: Set to ``"normalized"`` when focal-plane
+                values are relative/index-like coordinates; ``depth_focus_metric``
+                will be ``None``. Set to ``"metric"`` only when
+                ``focal_plane_distances`` are calibrated metric distances; then
+                metric focus depth is decoded from ``focal_posterior`` and
+                returned as ``depth_focus_metric``.
+
+        Raises:
+            ValueError: If ``focal_distance_mode`` is not ``"normalized"`` or
+                ``"metric"``.
+        """
+        if focal_distance_mode not in {"normalized", "metric"}:
+            raise ValueError(
+                "focal_distance_mode must be either 'normalized' or 'metric', "
+                f"got {focal_distance_mode!r}."
+            )
+
         if focal_plane_distances is None:
             focal_plane_distances = kwargs.pop("focus_distances", None)
         kwargs.clear()
@@ -544,8 +574,24 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         target_h = input_h if height is None else int(height)
         target_w = input_w if width is None else int(width)
         height, width = self._make_divisible_size(target_h, target_w, divisor=max(int(self.vae_scale_factor), 16))
+        if not isinstance(focal_plane_distances, torch.Tensor):
+            focal_plane_distances = torch.as_tensor(focal_plane_distances, dtype=torch.float32)
         if focal_plane_distances.dim() == 1:
             focal_plane_distances = focal_plane_distances.unsqueeze(0)
+        if focal_plane_distances.dim() != 2:
+            raise ValueError(
+                "focal_plane_distances must have shape [B, N] or [N], "
+                f"got {tuple(focal_plane_distances.shape)}"
+            )
+        if focal_plane_distances.shape[0] == 1 and focal_stack.shape[0] != 1:
+            focal_plane_distances = focal_plane_distances.expand(focal_stack.shape[0], -1)
+        if focal_plane_distances.shape != focal_stack.shape[:2]:
+            raise ValueError(
+                "focal_plane_distances must match focal_stack batch and focal-plane dimensions: "
+                f"expected {tuple(focal_stack.shape[:2])}, got {tuple(focal_plane_distances.shape)}"
+            )
+        if not torch.isfinite(focal_plane_distances).all():
+            raise ValueError("focal_plane_distances must contain only finite values")
         focal_plane_distances = focal_plane_distances.to(device=device)
 
         evidence_device, evidence_dtype = _module_device_dtype(self.focal_evidence_head, torch.device(device), dtype)
@@ -668,10 +714,13 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         uncertainty_focus = focal_entropy
         uncertainty_disagreement = support_maps["depth_disagreement"]
         depth_focus_metric = None
-        metric_focal_plane_distances = focal_plane_distances
-        if metric_focal_plane_distances.shape[0] == 1 and focal_posterior.shape[0] != 1:
-            metric_focal_plane_distances = metric_focal_plane_distances.expand(focal_posterior.shape[0], -1)
-        if torch.all(metric_focal_plane_distances > 1e-6):
+        if focal_distance_mode == "metric":
+            metric_focal_plane_distances = focal_plane_distances
+            if metric_focal_plane_distances.shape[0] == 1 and focal_posterior.shape[0] != 1:
+                metric_focal_plane_distances = metric_focal_plane_distances.expand(
+                    focal_posterior.shape[0],
+                    -1,
+                )
             depth_focus_metric = decode_metric_depth_from_focal_posterior(
                 focal_posterior=focal_posterior,
                 focal_plane_distances=metric_focal_plane_distances,
@@ -696,9 +745,9 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             all_in_focus_image=result,
             depth_colored=depth_color,
             uncertainty=uncertainty_final.squeeze(1),
-            depth_prior=generated_depth_canonical.squeeze(1),
-            depth_focus=focal_depth_canonical.squeeze(1),
-            depth_final=final_depth_canonical.squeeze(1),
+            generated_depth_canonical=generated_depth_canonical.squeeze(1),
+            focal_depth_canonical=focal_depth_canonical.squeeze(1),
+            final_depth_canonical=final_depth_canonical.squeeze(1),
             focal_posterior=focal_posterior,
             focal_entropy=focal_entropy.squeeze(1),
             focal_peak_confidence=support_maps["focal_peak_confidence"].squeeze(1),
@@ -714,6 +763,9 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             uncertainty_disagreement=uncertainty_disagreement.squeeze(1),
             uncertainty_final=uncertainty_final.squeeze(1),
             depth_focus_metric=depth_focus_metric,
+            depth_prior=generated_depth_canonical.squeeze(1),
+            depth_focus=focal_depth_canonical.squeeze(1),
+            depth_final=final_depth_canonical.squeeze(1),
             focus_posterior=focal_posterior,
             focus_entropy=focal_entropy.squeeze(1),
             focus_peakiness=support_maps["focal_peak_confidence"].squeeze(1),
@@ -740,9 +792,23 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         if isinstance(stack, torch.Tensor):
             if stack.dim() == 4:
                 stack = stack.unsqueeze(0)
+            if stack.dim() != 5:
+                raise ValueError(
+                    "focal_stack tensor must have shape [B, N, C, H, W] or [N, C, H, W], "
+                    f"got {tuple(stack.shape)}"
+                )
+            if stack.shape[1] < 1:
+                raise ValueError("focal_stack tensor must contain at least one focal plane")
+            if stack.shape[2] != 3:
+                raise ValueError(f"focal_stack tensor must contain RGB images with 3 channels, got {stack.shape[2]}")
+            if not torch.isfinite(stack).all():
+                raise ValueError("focal_stack tensor must contain only finite values")
             if stack.min() >= 0 and stack.max() <= 1:
                 stack = stack * 2.0 - 1.0
             return stack
+
+        if not stack:
+            raise ValueError("focal_stack image list must not be empty")
 
         tensors = []
         import numpy as np  # local import to avoid hard dependency at module import time

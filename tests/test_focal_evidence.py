@@ -11,7 +11,7 @@ def test_focal_evidence_shapes_probability_and_ranges():
     stack = torch.randn(B, N, C, H, W)
     focal_plane_distances = torch.linspace(0.3, 10.0, N).repeat(B, 1)
 
-    out = FocalEvidenceEncoder()(stack, focal_plane_distances)
+    out = FocalEvidenceEncoder()(stack, focal_plane_distances[0])
 
     assert out["focal_posterior"].shape == (B, N, H, W)
     assert out["focal_depth_canonical"].shape == (B, 1, H, W)
@@ -59,10 +59,13 @@ def test_pipeline_output_dataclass_exposes_focal_evidence_fields():
 
     out = FocalStackGenerationOutput(depth_map=torch.zeros(1, 8, 8), all_in_focus_image=torch.zeros(1, 3, 8, 8))
     for name in (
+        "generated_depth_canonical",
+        "focal_depth_canonical",
+        "final_depth_canonical",
+        "focal_posterior",
         "depth_prior",
         "depth_focus",
         "depth_final",
-        "focal_posterior",
         "focal_entropy",
         "focus_reliability",
         "focal_peak_confidence",
@@ -116,6 +119,27 @@ def test_focal_posterior_kl_loss_is_finite():
     assert torch.isfinite(loss_dict["loss_focal_posterior_kl"])
     assert "loss_focal_evidence_weight" in loss_dict
     assert torch.isfinite(loss_dict["total"])
+
+
+def test_physical_evidence_feature_validation_rejects_shape_mismatch():
+    focal_posterior = torch.softmax(torch.randn(2, 4, 8, 8), dim=1)
+    bad_depth = torch.rand(2, 1, 4, 4)
+
+    with pytest.raises(ValueError, match="focal_depth_canonical must have shape"):
+        build_physical_evidence_features(
+            focal_posterior=focal_posterior,
+            focal_entropy=torch.rand(2, 1, 8, 8),
+            focal_depth_canonical=bad_depth,
+            generated_depth_canonical=torch.rand(2, 1, 8, 8),
+            generative_uncertainty=torch.rand(2, 1, 8, 8),
+        )
+
+
+def test_physical_evidence_estimator_rejects_wrong_channel_count():
+    head = PhysicalEvidenceEstimator(in_channels=5, hidden=8)
+
+    with pytest.raises(ValueError, match="support_inputs must have 5 channels"):
+        head(torch.rand(1, 4, 8, 8))
 
 
 def test_physical_evidence_support_head_shapes_and_gate_normalization():

@@ -138,7 +138,17 @@ def parse_args():
         '--focus-distances',
         dest='focal_plane_distances',
         type=str,
-        help='Comma-separated focal-plane distances in meters (uses 0..N-1 index spacing if not specified)'
+        help='Comma-separated focal-plane distances (uses 0..N-1 index spacing if not specified)'
+    )
+    parser.add_argument(
+        '--focal-distance-mode',
+        type=str,
+        default='normalized',
+        choices=['normalized', 'metric'],
+        help=(
+            'Use "metric" only for calibrated focal-plane distances; '
+            'otherwise metric focus depth is not exported.'
+        )
     )
     # Inference parameters
     parser.add_argument(
@@ -266,6 +276,7 @@ def process_focal_stack(
             guidance_scale=args.guidance_scale,
             output_type="pil" if args.save_visualization else "pt",
             return_dict=True,
+            focal_distance_mode=args.focal_distance_mode,
             **pipeline_kwargs,
         )
 
@@ -284,6 +295,7 @@ def process_focal_stack(
         "uncertainty_disagreement",
         "uncertainty_final",
         "focal_posterior",
+        "depth_focus_metric",
     ):
         value = getattr(output, attr, None)
         if isinstance(value, torch.Tensor):
@@ -305,6 +317,7 @@ def process_focal_stack(
         'depth_prior': getattr(output, 'depth_prior', None),
         'depth_focus': getattr(output, 'depth_focus', None),
         'depth_final': getattr(output, 'depth_final', None),
+        'depth_focus_metric': getattr(output, 'depth_focus_metric', None),
         'focus_reliability': getattr(output, 'focus_reliability', None),
         'focal_entropy': getattr(output, 'focal_entropy', None),
         'uncertainty_disagreement': getattr(output, 'uncertainty_disagreement', None),
@@ -367,7 +380,14 @@ def save_results(results: Dict, output_dir: Path, args):
         uncertainty = _to_numpy_map(results['uncertainty'])
         np.save(output_dir / f"{name}_uncertainty.npy", uncertainty)
 
-    for key in ("depth_prior", "depth_focus", "depth_final", "focus_reliability", "focal_entropy"):
+    for key in (
+        "depth_prior",
+        "depth_focus",
+        "depth_final",
+        "depth_focus_metric",
+        "focus_reliability",
+        "focal_entropy",
+    ):
         if results.get(key) is not None:
             value = _to_numpy_map(results[key])
             np.save(output_dir / f"{name}_{key}.npy", value)
@@ -387,6 +407,7 @@ def save_results(results: Dict, output_dir: Path, args):
     metadata = {
         'name': name,
         'focal_plane_distances': results['focal_plane_distances'],
+        'focal_distance_mode': args.focal_distance_mode,
         'inference_time': results['inference_time'],
         'original_size': results.get('original_size'),
         'inference_size': results.get('inference_size'),
