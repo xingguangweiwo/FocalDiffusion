@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -41,7 +41,7 @@ class _ResidualBlock(nn.Module):
 
 
 class DualOutputDecoder(nn.Module):
-    """Decode SD3.5 latents into AIF, depth prior and confidence with cross-task coupling."""
+    """Decode SD3.5 latents into all-in-focus latents, canonical depth, and uncertainty."""
 
     def __init__(
         self,
@@ -83,15 +83,15 @@ class DualOutputDecoder(nn.Module):
             nn.Conv2d(dims[-1], dims[-1], kernel_size=1),
         )
 
-        branch_block = lambda: nn.Sequential(
-            _ResidualBlock(dims[-1], dims[-1], dilation=1, dropout=0.1),
-            _ResidualBlock(dims[-1], dims[-1], dilation=2, dropout=0.1),
-        )
+        def branch_block() -> nn.Sequential:
+            return nn.Sequential(
+                _ResidualBlock(dims[-1], dims[-1], dilation=1, dropout=0.1),
+                _ResidualBlock(dims[-1], dims[-1], dilation=2, dropout=0.1),
+            )
 
         self.depth_branch = branch_block()
         self.rgb_branch = branch_block()
 
-        # Feature-level cross-task coupling: all-in-focus features guide depth structure recovery.
         self.all_in_focus_to_depth = nn.Sequential(
             nn.Conv2d(dims[-1], dims[-1], kernel_size=1),
             nn.SiLU(),
@@ -106,7 +106,6 @@ class DualOutputDecoder(nn.Module):
         self.confidence_head = nn.Conv2d(dims[-1], 1, kernel_size=3, padding=1)
         self.rgb_head = nn.Conv2d(dims[-1], self.out_channels_rgb, kernel_size=3, padding=1)
 
-        # Confidence-guided depth refinement with AIF structure.
         refine_in_channels = dims[-1] + self.out_channels_rgb + 2 + 1
         self.depth_refine = nn.Sequential(
             _ResidualBlock(refine_in_channels, dims[-1], dilation=1, dropout=0.0),
@@ -114,7 +113,7 @@ class DualOutputDecoder(nn.Module):
             nn.Conv2d(dims[-1], out_channels_depth, kernel_size=3, padding=1),
         )
 
-    def forward(self, latents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, latents: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Return generated canonical depth, all-in-focus latents, and uncertainty."""
 
         features = latents
@@ -149,7 +148,6 @@ class DualOutputDecoder(nn.Module):
             depth_features = depth_features + skip
             rgb_features = rgb_features + skip
 
-        # Feature-level coupling from all-in-focus generation to depth.
         all_in_focus_guidance = self.all_in_focus_to_depth(rgb_features)
         coupling_gate = self.all_in_focus_coupling_gate(torch.cat([depth_features, all_in_focus_guidance], dim=1))
         depth_features = depth_features + coupling_gate * all_in_focus_guidance
@@ -161,7 +159,6 @@ class DualOutputDecoder(nn.Module):
         if self.apply_latent_scaling:
             all_in_focus_latents = all_in_focus_latents * 0.18215
 
-        # Confidence-guided refinement: low confidence => stronger all-in-focus-structure reliance.
         all_in_focus_edges = self._compute_edges(all_in_focus_latents)
         refine_input = torch.cat(
             [
@@ -180,13 +177,6 @@ class DualOutputDecoder(nn.Module):
             "generated_depth_canonical": generated_depth_canonical,
             "uncertainty": uncertainty,
             "all_in_focus_latents": all_in_focus_latents,
-            # Backward-compatible aliases.
-            "shape_norm": generated_depth_canonical,
-            "depth_logits": generated_depth_canonical,
-            "rgb_latent_pred": all_in_focus_latents,
-            "depth_prior_norm": generated_depth_canonical,
-            "aif_latents": all_in_focus_latents,
-            "confidence_map": 1.0 - uncertainty,
         }
 
     @staticmethod
