@@ -343,8 +343,8 @@ class FocalStackDataset(Dataset):
         if entry.get("all_in_focus") or entry.get("aif") or entry.get("aif_path"):
             sample["all_in_focus"] = entry.get("all_in_focus") or entry.get("aif") or entry.get("aif_path")
 
-        if "focal_plane_distances" in entry or "focus_distances" in entry:
-            distance_values = entry.get("focal_plane_distances", entry.get("focus_distances"))
+        if "focal_plane_distances" in entry:
+            distance_values = entry["focal_plane_distances"]
             sample["focal_plane_distances"] = [float(v) for v in distance_values]
 
         if "focus_range" in entry and entry["focus_range"]:
@@ -520,9 +520,9 @@ class FocalStackDataset(Dataset):
         return torch.stack(images, dim=0)
 
     def _get_focal_plane_distances(self, sample_info: Dict, num_images: int) -> torch.Tensor:
-        if "focal_plane_distances" in sample_info or "focus_distances" in sample_info:
+        if "focal_plane_distances" in sample_info:
             distances = torch.as_tensor(
-                sample_info.get("focal_plane_distances", sample_info.get("focus_distances")),
+                sample_info["focal_plane_distances"],
                 dtype=torch.float32,
             )
         else:

@@ -40,7 +40,7 @@ from transformers import (
 )
 
 from ..models.focal_attention import FocalCrossAttention
-from ..models.dual_decoder import DualOutputDecoder
+from ..models.task_output_decoder import TaskOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
 from ..models.focal_evidence_encoder import (
     FocalEvidenceEncoder,
@@ -87,20 +87,6 @@ class FocalStackGenerationOutput(BaseOutput):
     uncertainty_disagreement: Optional[torch.Tensor] = None
     uncertainty_final: Optional[torch.Tensor] = None
     depth_focus_metric: Optional[torch.Tensor] = None
-    # Backward-compatible output aliases. Prefer the canonical *_canonical names
-    # above in new code and checkpoint metadata.
-    depth_prior: Optional[torch.Tensor] = None
-    depth_focus: Optional[torch.Tensor] = None
-    depth_final: Optional[torch.Tensor] = None
-    focus_reliability: Optional[torch.Tensor] = None
-    focus_posterior: Optional[torch.Tensor] = None
-    focus_entropy: Optional[torch.Tensor] = None
-    focus_peakiness: Optional[torch.Tensor] = None
-    physical_support: Optional[torch.Tensor] = None
-    gate_focus: Optional[torch.Tensor] = None
-    gate_prior: Optional[torch.Tensor] = None
-    gate_abstain: Optional[torch.Tensor] = None
-    uncertainty_decoder: Optional[torch.Tensor] = None
 
 
 class FocalInjectedSD3Transformer(nn.Module):
@@ -302,7 +288,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         "transformer",
         "focal_processor",
         "focal_evidence_head",
-        "dual_decoder",
+        "task_output_decoder",
         "physical_evidence_support_head",
     )
 
@@ -319,7 +305,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         scheduler: FlowMatchEulerDiscreteScheduler,
         focal_processor: Optional[nn.Module] = None,
         focal_evidence_head: Optional[nn.Module] = None,
-        dual_decoder: Optional[nn.Module] = None,
+        task_output_decoder: Optional[nn.Module] = None,
         physical_evidence_support_head: Optional[nn.Module] = None,
     ) -> None:
         super().__init__(
@@ -349,7 +335,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         self._optional_components = base_optional + (
             "focal_processor",
             "focal_evidence_head",
-            "dual_decoder",
+            "task_output_decoder",
             "physical_evidence_support_head",
         )
 
@@ -358,13 +344,13 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         self.register_to_config(
             focal_processor=None,
             focal_evidence_head=None,
-            dual_decoder=None,
+            task_output_decoder=None,
             physical_evidence_support_head=None,
         )
 
         self.focal_processor = focal_processor or FocalStackProcessor()
         self.focal_evidence_head = focal_evidence_head or FocalEvidenceEncoder()
-        self.dual_decoder = dual_decoder or DualOutputDecoder(
+        self.task_output_decoder = task_output_decoder or TaskOutputDecoder(
             in_channels=self.vae.config.latent_channels,
             out_channels_depth=1,
             out_channels_rgb=self.vae.config.latent_channels,
@@ -405,7 +391,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             transformer=self.transformer,
             focal_processor=self.focal_processor,
             focal_evidence_head=self.focal_evidence_head,
-            dual_decoder=self.dual_decoder,
+            task_output_decoder=self.task_output_decoder,
             physical_evidence_support_head=self.physical_evidence_support_head,
         )
 
@@ -423,7 +409,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             "tokenizer_2": self.tokenizer_2,
             "focal_processor": self.focal_processor,
             "focal_evidence_head": self.focal_evidence_head,
-            "dual_decoder": self.dual_decoder,
+            "task_output_decoder": self.task_output_decoder,
             "physical_evidence_support_head": self.physical_evidence_support_head,
         }
 
@@ -559,8 +545,6 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
                 f"got {focal_distance_mode!r}."
             )
 
-        if focal_plane_distances is None:
-            focal_plane_distances = kwargs.pop("focus_distances", None)
         kwargs.clear()
         if focal_plane_distances is None:
             raise ValueError("focal_plane_distances is required.")
@@ -670,8 +654,8 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
 
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
 
-        decoder_device, decoder_dtype = _module_device_dtype(self.dual_decoder, torch.device(device), dtype)
-        decoder_outputs = self.dual_decoder(latents.to(device=decoder_device, dtype=decoder_dtype))
+        decoder_device, decoder_dtype = _module_device_dtype(self.task_output_decoder, torch.device(device), dtype)
+        decoder_outputs = self.task_output_decoder(latents.to(device=decoder_device, dtype=decoder_dtype))
         generated_depth_canonical = decoder_outputs["generated_depth_canonical"]
         generative_uncertainty = decoder_outputs["uncertainty"]
         all_in_focus_latents = decoder_outputs["all_in_focus_latents"]
@@ -754,7 +738,6 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             posterior_margin=support_maps["posterior_margin"].squeeze(1),
             depth_disagreement=support_maps["depth_disagreement"].squeeze(1),
             physical_evidence_support=physical_evidence_support.squeeze(1),
-            focus_reliability=physical_evidence_support.squeeze(1),
             focal_evidence_weight=focal_evidence_weight_norm.squeeze(1),
             generative_prior_weight=generative_prior_weight_norm.squeeze(1),
             abstention_weight=abstention_weight.squeeze(1),
@@ -763,17 +746,6 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             uncertainty_disagreement=uncertainty_disagreement.squeeze(1),
             uncertainty_final=uncertainty_final.squeeze(1),
             depth_focus_metric=depth_focus_metric,
-            depth_prior=generated_depth_canonical.squeeze(1),
-            depth_focus=focal_depth_canonical.squeeze(1),
-            depth_final=final_depth_canonical.squeeze(1),
-            focus_posterior=focal_posterior,
-            focus_entropy=focal_entropy.squeeze(1),
-            focus_peakiness=support_maps["focal_peak_confidence"].squeeze(1),
-            physical_support=physical_evidence_support.squeeze(1),
-            gate_focus=focal_evidence_weight_norm.squeeze(1),
-            gate_prior=generative_prior_weight_norm.squeeze(1),
-            gate_abstain=abstention_weight.squeeze(1),
-            uncertainty_decoder=generative_uncertainty.squeeze(1),
         )
 
     @staticmethod

@@ -150,7 +150,7 @@ class FocalInjectedSD3Transformer(SD3Transformer2DModel):
         return (hidden_states,)
 
 
-class DualOutputDecoder(nn.Module):
+class TaskOutputDecoder(nn.Module):
     """Decoder for generating both depth and all-in-focus images"""
 
     def __init__(
@@ -249,7 +249,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         scheduler: FlowMatchEulerDiscreteScheduler,
         focal_processor: Optional[nn.Module] = None,
         camera_encoder: Optional[nn.Module] = None,
-        dual_decoder: Optional[nn.Module] = None,
+        task_output_decoder: Optional[nn.Module] = None,
     ):
         super().__init__(
             vae=vae,
@@ -272,12 +272,12 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             from .camera_invariant import CameraInvariantEncoder
             camera_encoder = CameraInvariantEncoder()
 
-        if dual_decoder is None:
-            dual_decoder = DualOutputDecoder()
+        if task_output_decoder is None:
+            task_output_decoder = TaskOutputDecoder()
 
         self.focal_processor = focal_processor
         self.camera_encoder = camera_encoder
-        self.dual_decoder = dual_decoder
+        self.task_output_decoder = task_output_decoder
 
         # Replace transformer with focal-injected version if needed
         if not hasattr(transformer, 'focal_cross_attns'):
@@ -403,8 +403,8 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             # Compute previous noisy sample
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-        # Decode with dual decoder
-        depth_map, all_in_focus = self.dual_decoder(latents)
+        # Decode with task output decoder
+        depth_map, all_in_focus = self.task_output_decoder(latents)
 
         # VAE decode for RGB
         all_in_focus = self.vae.decode(all_in_focus / self.vae.config.scaling_factor, return_dict=False)[0]

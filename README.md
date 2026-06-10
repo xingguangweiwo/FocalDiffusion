@@ -40,7 +40,6 @@ Typical file-list entries may include:
 * `focal_plane_distances`
 * optional camera metadata
 
-Legacy file lists may still use `focus_distances`; loaders keep compatibility where possible.
 
 ## Training
 
@@ -57,15 +56,15 @@ python -m script.inference \
   --model-path outputs/experiments/base/checkpoints/best.pt \
   --input path/to/focal_stack \
   --output outputs/demo \
-  --focus-distances 0.3,0.5,0.8,1.5,3.0 \
+  --focal-plane-distances 0.3,0.5,0.8,1.5,3.0 \
   --focal-distance-mode metric \
   --num-inference-steps 30 \
   --guidance-scale 1.0
 ```
 
-Use `--focal-distance-mode metric` only when `--focus-distances` / `--focal-plane-distances` are calibrated metric distances. The default mode is `normalized`, which still uses focal-plane values for canonical model conditioning but does not expose `depth_focus_metric`.
+Use `--focal-distance-mode metric` only when `--focal-plane-distances` are calibrated metric distances. The default mode is `normalized`, which still uses focal-plane values for canonical model conditioning but does not expose `depth_focus_metric`.
 
-If `--focus-distances` is omitted, index-spaced focal positions are used for backward-compatible CLI behavior. In that case, keep `--focal-distance-mode normalized`, and output depth should not be interpreted as metric depth.
+If `--focal-plane-distances` is omitted, index-spaced focal positions are used. In that case, keep `--focal-distance-mode normalized`, and output depth should not be interpreted as metric depth.
 
 ## Generation Tasks
 

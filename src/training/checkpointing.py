@@ -38,7 +38,7 @@ def save_checkpoint(
         'global_step': global_step,
         'focal_processor_state_dict': trainer.accelerator.unwrap_model(trainer.focal_processor).state_dict(),
         'focal_evidence_head_state_dict': trainer.accelerator.unwrap_model(trainer.focal_evidence_head).state_dict(),
-        'dual_decoder_state_dict': trainer.accelerator.unwrap_model(trainer.dual_decoder).state_dict(),
+        'task_output_decoder_state_dict': trainer.accelerator.unwrap_model(trainer.task_output_decoder).state_dict(),
         'physical_evidence_support_head_state_dict': trainer.accelerator.unwrap_model(trainer.physical_evidence_support_head).state_dict(),
         'optimizer_state_dict': trainer.optimizer.state_dict(),
         'scheduler_state_dict': trainer.lr_scheduler.state_dict(),
@@ -94,11 +94,11 @@ def load_checkpoint(trainer: "FocalStackGenerationTrainer", checkpoint_path: str
         )
         _log_state_dict_issues("focal_evidence_head", missing_keys, unexpected_keys)
 
-    missing_keys, unexpected_keys = trainer.dual_decoder.load_state_dict(
-        checkpoint['dual_decoder_state_dict'],
+    missing_keys, unexpected_keys = trainer.task_output_decoder.load_state_dict(
+        checkpoint['task_output_decoder_state_dict'],
         strict=False,
     )
-    _log_state_dict_issues("dual_decoder", missing_keys, unexpected_keys)
+    _log_state_dict_issues("task_output_decoder", missing_keys, unexpected_keys)
 
     if 'physical_evidence_support_head_state_dict' in checkpoint:
         missing_keys, unexpected_keys = trainer.physical_evidence_support_head.load_state_dict(

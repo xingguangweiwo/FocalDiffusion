@@ -1,6 +1,6 @@
 """FocalStackGeneration model components exposed for training and inference."""
 
-from .dual_decoder import TaskOutputDecoder
+from .task_output_decoder import TaskOutputDecoder
 from .focal_attention import FocalCrossAttention
 from .focal_evidence_encoder import (
     FocalEvidenceEncoder,

@@ -237,17 +237,8 @@ class FocalStackGenerationLoss(nn.Module):
         gate_consistency_weight: float = 0.0,
         focal_axis_smoothness_weight: float = 0.0,
         local_affinity_sigma: float = 0.10,
-        **kwargs,
     ):
         super().__init__()
-        if "aif_focus_evidence_weight" in kwargs:
-            all_in_focus_focal_evidence_weight = kwargs.pop("aif_focus_evidence_weight")
-        if "focus_target_type" in kwargs:
-            focal_target_type = kwargs.pop("focus_target_type")
-        if "coc_target_temperature" in kwargs:
-            coc_posterior_temperature = kwargs.pop("coc_target_temperature")
-        # Ignore unknown legacy keyword arguments to preserve previous construction behavior.
-        kwargs.clear()
         self.diffusion_weight = diffusion_weight
         self.depth_weight = depth_weight
         self.rgb_weight = rgb_weight
@@ -292,7 +283,6 @@ class FocalStackGenerationLoss(nn.Module):
         uncertainty: torch.Tensor | None = None,
         focal_posterior: torch.Tensor | None = None,
         focal_entropy: torch.Tensor | None = None,
-        focus_reliability: torch.Tensor | None = None,
         focal_plane_distances: torch.Tensor | None = None,
         focal_stack: torch.Tensor | None = None,
         depth_mask: torch.Tensor | None = None,
@@ -302,20 +292,8 @@ class FocalStackGenerationLoss(nn.Module):
         abstention_weight: torch.Tensor | None = None,
         physical_evidence_support: torch.Tensor | None = None,
         camera_params: dict[str, torch.Tensor] | None = None,
-        **legacy_kwargs,
     ):
-        # Translate pre-rename keyword arguments into canonical task-conditioned names.
-        generated_depth_canonical = generated_depth_canonical if generated_depth_canonical is not None else legacy_kwargs.pop("depth_prior_norm", None)
-        focal_depth_canonical = focal_depth_canonical if focal_depth_canonical is not None else legacy_kwargs.pop("depth_focus_norm", None)
-        final_depth_canonical = final_depth_canonical if final_depth_canonical is not None else legacy_kwargs.pop("depth_final_norm", None)
-        focal_posterior = focal_posterior if focal_posterior is not None else legacy_kwargs.pop("focus_posterior", None)
-        focal_entropy = focal_entropy if focal_entropy is not None else legacy_kwargs.pop("focus_entropy", None)
-        focal_plane_distances = focal_plane_distances if focal_plane_distances is not None else legacy_kwargs.pop("focus_distances", None)
-        focal_evidence_weight = focal_evidence_weight if focal_evidence_weight is not None else legacy_kwargs.pop("gate_focus", None)
-        generative_prior_weight = generative_prior_weight if generative_prior_weight is not None else legacy_kwargs.pop("gate_prior", None)
-        abstention_weight = abstention_weight if abstention_weight is not None else legacy_kwargs.pop("gate_abstain", None)
-        physical_evidence_support = physical_evidence_support if physical_evidence_support is not None else legacy_kwargs.pop("physical_support", None)
-        del focus_reliability, generative_prior_weight, abstention_weight, physical_evidence_support, legacy_kwargs
+        del generative_prior_weight, abstention_weight, physical_evidence_support
 
         losses: dict[str, torch.Tensor] = {
             "loss_flow_matching": F.mse_loss(diffusion_pred, diffusion_target),
@@ -503,10 +481,3 @@ class FocalStackGenerationLoss(nn.Module):
         )
 
         return {**losses, "total": total}
-
-
-# Backward-compatible aliases for external scripts using pre-rename APIs.
-normalize_focus_coordinates = normalize_focal_coordinates
-build_soft_focus_target_from_depth = build_focal_axis_soft_targets
-build_coc_focus_target_from_depth = build_coc_posterior_targets
-FocalDiffusionLoss = FocalStackGenerationLoss
