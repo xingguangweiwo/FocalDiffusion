@@ -135,7 +135,6 @@ def parse_args():
     # Focal stack parameters
     parser.add_argument(
         '--focal-plane-distances',
-        '--focus-distances',
         dest='focal_plane_distances',
         type=str,
         help='Comma-separated focal-plane distances (uses 0..N-1 index spacing if not specified)'
@@ -287,11 +286,11 @@ def process_focal_stack(
         output.depth_map = unpad_tensor_spatial(output.depth_map, size_meta["pad"])
     for attr in (
         "uncertainty",
-        "depth_prior",
-        "depth_focus",
-        "depth_final",
+        "generated_depth_canonical",
+        "focal_depth_canonical",
+        "final_depth_canonical",
         "focal_entropy",
-        "focus_reliability",
+        "physical_evidence_support",
         "uncertainty_disagreement",
         "uncertainty_final",
         "focal_posterior",
@@ -314,11 +313,11 @@ def process_focal_stack(
         'all_in_focus': output.all_in_focus_image,
         'depth_colored': output.depth_colored,
         'uncertainty': output.uncertainty,
-        'depth_prior': getattr(output, 'depth_prior', None),
-        'depth_focus': getattr(output, 'depth_focus', None),
-        'depth_final': getattr(output, 'depth_final', None),
+        'generated_depth_canonical': getattr(output, 'generated_depth_canonical', None),
+        'focal_depth_canonical': getattr(output, 'focal_depth_canonical', None),
+        'final_depth_canonical': getattr(output, 'final_depth_canonical', None),
         'depth_focus_metric': getattr(output, 'depth_focus_metric', None),
-        'focus_reliability': getattr(output, 'focus_reliability', None),
+        'physical_evidence_support': getattr(output, 'physical_evidence_support', None),
         'focal_entropy': getattr(output, 'focal_entropy', None),
         'uncertainty_disagreement': getattr(output, 'uncertainty_disagreement', None),
         'uncertainty_final': getattr(output, 'uncertainty_final', None),
@@ -381,11 +380,11 @@ def save_results(results: Dict, output_dir: Path, args):
         np.save(output_dir / f"{name}_uncertainty.npy", uncertainty)
 
     for key in (
-        "depth_prior",
-        "depth_focus",
-        "depth_final",
+        "generated_depth_canonical",
+        "focal_depth_canonical",
+        "final_depth_canonical",
         "depth_focus_metric",
-        "focus_reliability",
+        "physical_evidence_support",
         "focal_entropy",
     ):
         if results.get(key) is not None:

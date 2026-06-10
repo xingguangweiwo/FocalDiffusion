@@ -27,6 +27,6 @@ def __getattr__(name: str):
 
     raise AttributeError(f"module 'src' has no attribute '{name}'")
 
-from .generation_tasks import GENERATION_TASKS, TASK_ALIASES, normalize_generation_task
+from .generation_tasks import GENERATION_TASKS, normalize_generation_task
 
-__all__ = ["GENERATION_TASKS", "TASK_ALIASES", "normalize_generation_task"]
+__all__ = ["GENERATION_TASKS", "normalize_generation_task"]

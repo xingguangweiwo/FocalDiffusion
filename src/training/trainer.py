@@ -150,7 +150,7 @@ class FocalStackGenerationTrainer:
         from ..pipelines import FocalStackGenerationPipeline
         from ..models import FocalStackProcessor
         from ..models.focal_evidence_encoder import FocalEvidenceEncoder, PhysicalEvidenceEstimator
-        from ..models.dual_decoder import DualOutputDecoder
+        from ..models.task_output_decoder import TaskOutputDecoder
 
         model_cfg = self.config['model']
         requested_model_id = model_cfg['base_model_id']
@@ -221,10 +221,10 @@ class FocalStackGenerationTrainer:
         )
         self.physical_evidence_support_head = PhysicalEvidenceEstimator(
             in_channels=5,
-            hidden=self.config["model"].get("physical_evidence_support_hidden", self.config["model"].get("physical_support_hidden", 16)),
+            hidden=self.config["model"].get("physical_evidence_support_hidden", 16),
         )
 
-        self.dual_decoder = DualOutputDecoder(
+        self.task_output_decoder = TaskOutputDecoder(
             in_channels=pipe.vae.config.latent_channels,
             out_channels_depth=1,
             out_channels_rgb=pipe.vae.config.latent_channels,
@@ -244,7 +244,7 @@ class FocalStackGenerationTrainer:
             scheduler=pipe.scheduler,
             focal_processor=self.focal_processor,
             focal_evidence_head=self.focal_evidence_head,
-            dual_decoder=self.dual_decoder,
+            task_output_decoder=self.task_output_decoder,
             physical_evidence_support_head=self.physical_evidence_support_head,
         )
 
@@ -252,7 +252,7 @@ class FocalStackGenerationTrainer:
         self.pipeline.to(target_device)
         self.focal_processor = self.pipeline.focal_processor
         self.focal_evidence_head = self.pipeline.focal_evidence_head
-        self.dual_decoder = self.pipeline.dual_decoder
+        self.task_output_decoder = self.pipeline.task_output_decoder
         self.physical_evidence_support_head = self.pipeline.physical_evidence_support_head
 
         # Configure trainable parameters
@@ -293,7 +293,7 @@ class FocalStackGenerationTrainer:
 
         self.focal_processor.requires_grad_(True)
         self.focal_evidence_head.requires_grad_(True)
-        self.dual_decoder.requires_grad_(True)
+        self.task_output_decoder.requires_grad_(True)
         self.physical_evidence_support_head.requires_grad_(True)
 
         pipeline_params = list(self._iter_pipeline_parameters())
@@ -429,7 +429,7 @@ class FocalStackGenerationTrainer:
             focal_posterior_kl_weight=self.config['losses'].get('focal_posterior_kl_weight', 0.2),
             focus_depth_weight=self.config['losses'].get('focus_depth_weight', 0.2),
             prior_depth_weight=self.config['losses'].get('prior_depth_weight', 0.05),
-            all_in_focus_focal_evidence_weight=self.config['losses'].get('all_in_focus_focal_evidence_weight', self.config['losses'].get('aif_focus_evidence_weight', 0.1)),
+            all_in_focus_focal_evidence_weight=self.config['losses'].get('all_in_focus_focal_evidence_weight', 0.1),
             uncertainty_focus_weight=self.config['losses'].get('uncertainty_focus_weight', 0.05),
             uncertainty_error_weight=self.config['losses'].get('uncertainty_error_weight', 0.05),
             gate_calibration_weight=self.config['losses'].get('gate_calibration_weight', 0.05),
@@ -541,7 +541,7 @@ class FocalStackGenerationTrainer:
                     if rgb_target is None:
                         raise ValueError("all_in_focus is required to compute the SD3 flow-matching reconstruction losses.")
 
-                    decoder_outputs = self.dual_decoder(clean_latent_pred)
+                    decoder_outputs = self.task_output_decoder(clean_latent_pred)
                     generated_depth_canonical = decoder_outputs["generated_depth_canonical"]
                     uncertainty = decoder_outputs["uncertainty"]
                     focal_evidence = self.focal_evidence_head(focal_stack.float(), focal_plane_distances.float())
@@ -601,7 +601,6 @@ class FocalStackGenerationTrainer:
                         uncertainty=uncertainty_final.float(),
                         focal_posterior=focal_posterior.float(),
                         focal_entropy=focal_entropy.float(),
-                        focus_reliability=support_outputs["physical_evidence_support"].float(),
                         focal_plane_distances=focal_plane_distances.float(),
                         focal_stack=focal_stack.float(),
                         depth_range=depth_range_tensor.float() if depth_range_tensor is not None else None,
@@ -639,7 +638,7 @@ class FocalStackGenerationTrainer:
                             'train_generative_prior_weight_mean': generative_prior_weight_norm.mean().item(),
                             'train_abstention_weight_mean': abstention_weight.mean().item(),
                             'train_physical_evidence_support_mean': support_outputs['physical_evidence_support'].mean().item(),
-                            'train_depth_prior_focus_disagreement': support_maps['depth_disagreement'].mean().item(),
+                            'train_generated_focal_depth_disagreement': support_maps['depth_disagreement'].mean().item(),
                         }, step=global_step + step)
 
         if effective_steps == 0:
@@ -705,6 +704,3 @@ class FocalStackGenerationTrainer:
     def load_checkpoint(self, checkpoint_path: str):
         from .checkpointing import load_checkpoint
         return load_checkpoint(self, checkpoint_path)
-
-# Backward-compatible alias for external scripts using the pre-rename trainer API.
-FocalDiffusionTrainer = FocalStackGenerationTrainer

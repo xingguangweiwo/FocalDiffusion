@@ -3,7 +3,7 @@ from PIL import Image
 
 from script.inference import resize_or_pad_to_multiple
 from src.models import (
-    DualOutputDecoder,
+    TaskOutputDecoder,
     FocalEvidenceEncoder,
     FocalStackProcessor,
     PhysicalEvidenceEstimator,
@@ -27,7 +27,7 @@ def test_core_smoke():
     features = processor(focal_stack * 2 - 1, focal_plane_distances)
     assert "fused_features" in features
 
-    decoder = DualOutputDecoder(in_channels=16, out_channels_rgb=16)
+    decoder = TaskOutputDecoder(in_channels=16, out_channels_rgb=16)
     decoder_out = decoder(torch.randn(1, 16, 16, 16))
     assert "generated_depth_canonical" in decoder_out and "uncertainty" in decoder_out and "all_in_focus_latents" in decoder_out
 
@@ -254,7 +254,7 @@ def test_register_focal_modules_updates_only_focal_modules():
         def __init__(self):
             self.focal_processor = nn.Conv2d(1, 1, 1)
             self.focal_evidence_head = nn.Conv2d(1, 1, 1)
-            self.dual_decoder = nn.Conv2d(1, 1, 1)
+            self.task_output_decoder = nn.Conv2d(1, 1, 1)
             self.physical_evidence_support_head = nn.Conv2d(1, 1, 1)
             self.text_encoder = nn.Linear(1, 1)
             self.vae = nn.Linear(1, 1)
@@ -270,7 +270,7 @@ def test_register_focal_modules_updates_only_focal_modules():
     assert set(pipeline.registered) == {
         "focal_processor",
         "focal_evidence_head",
-        "dual_decoder",
+        "task_output_decoder",
         "physical_evidence_support_head",
     }
     for module in pipeline.registered.values():
@@ -390,8 +390,8 @@ def test_physical_evidence_estimator_forward():
     )
 
 
-def test_dual_decoder_forward():
-    decoder = DualOutputDecoder(in_channels=16)
+def test_task_output_decoder_forward():
+    decoder = TaskOutputDecoder(in_channels=16)
     latent = torch.randn(2, 16, 16, 16)
 
     outputs = decoder(latent)

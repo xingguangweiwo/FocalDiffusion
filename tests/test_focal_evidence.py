@@ -17,7 +17,6 @@ def test_focal_evidence_shapes_probability_and_ranges():
     assert out["focal_depth_canonical"].shape == (B, 1, H, W)
     assert out["focal_entropy"].shape == (B, 1, H, W)
     assert out["focal_peak_confidence"].shape == (B, 1, H, W)
-    assert out["focus_reliability"].shape == (B, 1, H, W)
     assert torch.allclose(out["focal_posterior"].sum(dim=1), torch.ones(B, H, W), atol=1e-4)
     assert out["focal_depth_canonical"].min() >= 0
     assert out["focal_depth_canonical"].max() <= 1
@@ -25,7 +24,6 @@ def test_focal_evidence_shapes_probability_and_ranges():
     assert out["focal_entropy"].max() <= 1
     assert out["focal_peak_confidence"].min() >= 0
     assert out["focal_peak_confidence"].max() <= 1
-    assert torch.allclose(out["focus_reliability"], out["focal_peak_confidence"])
 
 
 def test_focal_evidence_supports_one_hundred_slices():
@@ -63,11 +61,7 @@ def test_pipeline_output_dataclass_exposes_focal_evidence_fields():
         "focal_depth_canonical",
         "final_depth_canonical",
         "focal_posterior",
-        "depth_prior",
-        "depth_focus",
-        "depth_final",
         "focal_entropy",
-        "focus_reliability",
         "focal_peak_confidence",
         "physical_evidence_support",
         "focal_evidence_weight",
@@ -107,7 +101,6 @@ def test_focal_posterior_kl_loss_is_finite():
         final_depth_canonical=depth_norm,
         focal_posterior=evidence["focal_posterior"],
         focal_entropy=evidence["focal_entropy"],
-        focus_reliability=evidence["focus_reliability"],
         focal_plane_distances=focal_plane_distances,
         focal_evidence_weight=torch.rand(B, 1, H, W),
         focal_stack=stack,

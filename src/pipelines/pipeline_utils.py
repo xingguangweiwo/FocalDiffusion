@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 _FOCAL_MODULE_ATTRS = (
     'focal_processor',
     'focal_evidence_head',
-    'dual_decoder',
+    'task_output_decoder',
     'physical_evidence_support_head',
 )
 
@@ -114,7 +114,7 @@ def _build_focal_modules_from_config(config: Optional[Dict[str, Any]], vae: torc
     This avoids shape mismatches when inference checkpoints were trained with
     non-default focal-module dimensions such as ``feature_dim=128``.
     """
-    from ..models.dual_decoder import DualOutputDecoder
+    from ..models.task_output_decoder import TaskOutputDecoder
     from ..models.focal_evidence_encoder import FocalEvidenceEncoder, PhysicalEvidenceEstimator
     from ..models.focal_processor import FocalStackProcessor
 
@@ -136,9 +136,9 @@ def _build_focal_modules_from_config(config: Optional[Dict[str, Any]], vae: torc
         ),
         'physical_evidence_support_head': PhysicalEvidenceEstimator(
             in_channels=5,
-            hidden=int(model_config.get('physical_evidence_support_hidden', model_config.get('physical_support_hidden', 16))),
+            hidden=int(model_config.get('physical_evidence_support_hidden', 16)),
         ),
-        'dual_decoder': DualOutputDecoder(
+        'task_output_decoder': TaskOutputDecoder(
             in_channels=latent_channels,
             out_channels_depth=1,
             out_channels_rgb=latent_channels,
@@ -174,7 +174,7 @@ def load_pipeline(
         modules = _build_focal_modules_from_config(checkpoint_config, pipeline.vae)
         pipeline.focal_processor = modules['focal_processor']
         pipeline.focal_evidence_head = modules['focal_evidence_head']
-        pipeline.dual_decoder = modules['dual_decoder']
+        pipeline.task_output_decoder = modules['task_output_decoder']
         pipeline.physical_evidence_support_head = modules['physical_evidence_support_head']
         pipeline.config = checkpoint_config
         _register_focal_modules(pipeline, device=device, dtype=dtype)
@@ -197,8 +197,8 @@ def load_pipeline(
         pipeline.focal_processor.load_state_dict(checkpoint['focal_processor_state_dict'])
     if 'focal_evidence_head_state_dict' in checkpoint:
         pipeline.focal_evidence_head.load_state_dict(checkpoint['focal_evidence_head_state_dict'], strict=False)
-    if 'dual_decoder_state_dict' in checkpoint:
-        pipeline.dual_decoder.load_state_dict(checkpoint['dual_decoder_state_dict'], strict=False)
+    if 'task_output_decoder_state_dict' in checkpoint:
+        pipeline.task_output_decoder.load_state_dict(checkpoint['task_output_decoder_state_dict'], strict=False)
     if 'physical_evidence_support_head_state_dict' in checkpoint:
         pipeline.physical_evidence_support_head.load_state_dict(checkpoint['physical_evidence_support_head_state_dict'], strict=False)
 
@@ -226,7 +226,7 @@ def save_pipeline(
     checkpoint = {
         'focal_processor_state_dict': pipeline.focal_processor.state_dict(),
         'focal_evidence_head_state_dict': pipeline.focal_evidence_head.state_dict(),
-        'dual_decoder_state_dict': pipeline.dual_decoder.state_dict(),
+        'task_output_decoder_state_dict': pipeline.task_output_decoder.state_dict(),
         'physical_evidence_support_head_state_dict': pipeline.physical_evidence_support_head.state_dict(),
     }
 

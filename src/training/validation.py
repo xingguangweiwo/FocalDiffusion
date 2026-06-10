@@ -129,11 +129,11 @@ def _final_depth_from_heads(
     """Run decoder, focal-evidence head, and physical evidence fusion."""
 
     decoder_device, decoder_dtype = _module_device_dtype(
-        trainer.dual_decoder,
+        trainer.task_output_decoder,
         clean_latent_pred.device,
         clean_latent_pred.dtype,
     )
-    decoder_outputs = trainer.dual_decoder(clean_latent_pred.to(device=decoder_device, dtype=decoder_dtype))
+    decoder_outputs = trainer.task_output_decoder(clean_latent_pred.to(device=decoder_device, dtype=decoder_dtype))
     generated_depth_canonical = decoder_outputs["generated_depth_canonical"]
     generative_uncertainty = decoder_outputs["uncertainty"]
 
@@ -306,16 +306,15 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
         **_zero_metrics(_GENERATIVE_KEYS),
         'normalized_loss': 0.0,
         'focal_entropy_mean': 0.0,
-        'focus_reliability_mean': 0.0,
+        'physical_evidence_support_mean': 0.0,
         'focal_evidence_weight_mean': 0.0,
         'generative_prior_weight_mean': 0.0,
         'abstention_weight_mean': 0.0,
-        'physical_evidence_support_mean': 0.0,
         'depth_disagreement_mean': 0.0,
         'posterior_margin_mean': 0.0,
         'uncertainty_final_mean': 0.0,
         'uncertainty_error_l1': 0.0,
-        'depth_prior_focus_disagreement': 0.0,
+        'generated_focal_depth_disagreement': 0.0,
         'uncertainty_mean': 0.0,
     }
     metric_depth_batches = 0
@@ -349,11 +348,11 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
                 metrics["uncertainty_mean"] += uncertainty.mean().item()
             if output.focal_entropy is not None:
                 metrics["focal_entropy_mean"] += output.focal_entropy.mean().item()
-            if output.focus_reliability is not None:
-                metrics["focus_reliability_mean"] += output.focus_reliability.mean().item()
-            if output.depth_prior is not None and output.depth_focus is not None:
-                metrics["depth_prior_focus_disagreement"] += torch.abs(
-                    output.depth_prior - output.depth_focus
+            if output.physical_evidence_support is not None:
+                metrics["physical_evidence_support_mean"] += output.physical_evidence_support.mean().item()
+            if output.generated_depth_canonical is not None and output.focal_depth_canonical is not None:
+                metrics["generated_focal_depth_disagreement"] += torch.abs(
+                    output.generated_depth_canonical - output.focal_depth_canonical
                 ).mean().item()
             if output.focal_evidence_weight is not None:
                 metrics["focal_evidence_weight_mean"] += output.focal_evidence_weight.mean().item()
@@ -361,8 +360,6 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
                 metrics["generative_prior_weight_mean"] += output.generative_prior_weight.mean().item()
             if output.abstention_weight is not None:
                 metrics["abstention_weight_mean"] += output.abstention_weight.mean().item()
-            if output.physical_evidence_support is not None:
-                metrics["physical_evidence_support_mean"] += output.physical_evidence_support.mean().item()
             if output.depth_disagreement is not None:
                 metrics["depth_disagreement_mean"] += output.depth_disagreement.mean().item()
             if output.posterior_margin is not None:

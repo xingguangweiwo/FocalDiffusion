@@ -85,9 +85,9 @@ def evaluate(args):
             uncertainty = output.uncertainty
         sample_metrics["uncertainty_mean"] = float(uncertainty.mean().item()) if uncertainty is not None else 0.0
         sample_metrics["focal_entropy_mean"] = float(output.focal_entropy.mean().item()) if output.focal_entropy is not None else 0.0
-        sample_metrics["focus_reliability_mean"] = float(output.focus_reliability.mean().item()) if output.focus_reliability is not None else 0.0
-        if output.depth_prior is not None and output.depth_focus is not None:
-            sample_metrics["depth_prior_focus_disagreement"] = float(torch.abs(output.depth_prior - output.depth_focus).mean().item())
+        sample_metrics["physical_evidence_support_mean"] = float(output.physical_evidence_support.mean().item()) if output.physical_evidence_support is not None else 0.0
+        if output.generated_depth_canonical is not None and output.focal_depth_canonical is not None:
+            sample_metrics["generated_focal_depth_disagreement"] = float(torch.abs(output.generated_depth_canonical - output.focal_depth_canonical).mean().item())
         all_metrics.append(sample_metrics)
 
     keys = sorted({k for m in all_metrics for k in m.keys()})
