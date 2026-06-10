@@ -11,12 +11,7 @@ import torch.nn.functional as F
 
 
 class FocalEvidenceEncoder(nn.Module):
-    """Predict a per-pixel posterior distribution over focal planes.
-
-    The head intentionally uses local high-pass and adjacent-focus differences,
-    preserving the structure of focus-measure methods while learning the local
-    scoring function.
-    """
+    """Predict a per-pixel posterior distribution over focal planes."""
 
     def __init__(
         self,
@@ -25,7 +20,7 @@ class FocalEvidenceEncoder(nn.Module):
         temperature: float = 0.07,
         use_highpass: bool = True,
         eps: float = 1e-6,
-    ):
+    ) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.hidden = hidden
@@ -64,58 +59,53 @@ class FocalEvidenceEncoder(nn.Module):
                 f"got {tuple(focal_plane_distances.shape)}"
             )
 
-        B, N, C, H, W = focal_stack.shape
-        if N < 1:
+        batch_size, num_planes, channels, height, width = focal_stack.shape
+        if num_planes < 1:
             raise ValueError("focal_stack must contain at least one focal plane.")
-        if C != self.in_channels:
-            raise ValueError(f"Expected {self.in_channels} input channels, got {C}.")
-        if focal_plane_distances.shape[0] == 1 and B != 1:
-            focal_plane_distances = focal_plane_distances.expand(B, -1)
-        if focal_plane_distances.shape != (B, N):
+        if channels != self.in_channels:
+            raise ValueError(f"Expected {self.in_channels} input channels, got {channels}.")
+        if focal_plane_distances.shape[0] == 1 and batch_size != 1:
+            focal_plane_distances = focal_plane_distances.expand(batch_size, -1)
+        if focal_plane_distances.shape != (batch_size, num_planes):
             raise ValueError(
-                f"focal_plane_distances must have shape {(B, N)} or {(N,)}, got {tuple(focal_plane_distances.shape)}"
+                "focal_plane_distances must match the focal stack batch and plane dimensions: "
+                f"expected {(batch_size, num_planes)}, got {tuple(focal_plane_distances.shape)}"
             )
         if not torch.isfinite(focal_plane_distances).all():
             raise ValueError("focal_plane_distances must contain only finite values.")
 
         focal_coordinates = self._normalize_focal_plane_distances(focal_plane_distances)
-
-        x = focal_stack.reshape(B * N, C, H, W)
+        stacked = focal_stack.reshape(batch_size * num_planes, channels, height, width)
         if self.use_highpass:
-            low_frequency = F.avg_pool2d(x, kernel_size=5, stride=1, padding=2)
-            high_frequency = x - low_frequency
+            high_frequency = stacked - F.avg_pool2d(stacked, kernel_size=5, stride=1, padding=2)
         else:
-            high_frequency = x
-        high_frequency = high_frequency.reshape(B, N, C, H, W)
+            high_frequency = stacked
+        high_frequency = high_frequency.reshape(batch_size, num_planes, channels, height, width)
 
         adjacent_focus_difference = torch.zeros_like(high_frequency)
         adjacent_focus_difference[:, 1:] = high_frequency[:, 1:] - high_frequency[:, :-1]
 
-        evidence_input = torch.cat([high_frequency, adjacent_focus_difference], dim=2).reshape(B * N, 2 * C, H, W)
-        features = self.local_encoder(evidence_input).reshape(B, N, self.hidden, H, W)
+        evidence_input = torch.cat([high_frequency, adjacent_focus_difference], dim=2)
+        evidence_input = evidence_input.reshape(batch_size * num_planes, 2 * channels, height, width)
+        features = self.local_encoder(evidence_input).reshape(batch_size, num_planes, self.hidden, height, width)
         focal_distance_embedding = self.focal_distance_mlp(focal_coordinates.unsqueeze(-1)).to(dtype=features.dtype)
         features = features + focal_distance_embedding[:, :, :, None, None]
-        features = features.reshape(B * N, self.hidden, H, W)
+        features = features.reshape(batch_size * num_planes, self.hidden, height, width)
 
         temperature = max(float(self.temperature), self.eps)
-        focal_logits = self.posterior_logit_head(features).reshape(B, N, H, W)
+        focal_logits = self.posterior_logit_head(features).reshape(batch_size, num_planes, height, width)
         focal_posterior = torch.softmax(focal_logits / temperature, dim=1)
         focal_depth_canonical = (focal_posterior * focal_coordinates[:, :, None, None]).sum(dim=1, keepdim=True)
-
         focal_entropy = -(focal_posterior * torch.log(focal_posterior + self.eps)).sum(dim=1, keepdim=True)
-        focal_entropy = (focal_entropy / math.log(max(N, 2))).clamp(0.0, 1.0)
-        focal_peak_confidence = (1.0 - focal_entropy).clamp(0.0, 1.0)
+        focal_entropy = (focal_entropy / math.log(max(num_planes, 2))).clamp(0.0, 1.0)
 
         return {
             "focal_logits": focal_logits,
             "focal_posterior": focal_posterior,
             "focal_depth_canonical": focal_depth_canonical,
             "focal_entropy": focal_entropy,
-            "focal_peak_confidence": focal_peak_confidence,
+            "focal_peak_confidence": (1.0 - focal_entropy).clamp(0.0, 1.0),
             "focal_coordinates": focal_coordinates,
-            # Backward-compatible alias for checkpoints/scripts created before the
-            # canonical focal-evidence terminology was adopted.
-            "focus_reliability": focal_peak_confidence,
         }
 
 
@@ -126,18 +116,7 @@ def build_physical_evidence_features(
     generated_depth_canonical: torch.Tensor,
     generative_uncertainty: torch.Tensor,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Build physical-evidence support maps for focus/prior depth fusion.
-
-    Args:
-        focal_posterior: Per-pixel posterior over focal planes with shape [B, N, H, W].
-        focal_entropy: Normalized posterior entropy with shape [B, 1, H, W].
-        focal_depth_canonical: Focus-derived normalized depth with shape [B, 1, H, W].
-        generated_depth_canonical: Decoder-prior normalized depth with shape [B, 1, H, W].
-        generative_uncertainty: Decoder uncertainty with shape [B, 1, H, W].
-
-    Returns:
-        A 5-channel support tensor and diagnostic support maps.
-    """
+    """Build compact support maps for focus/prior depth fusion."""
 
     if focal_posterior.dim() != 4:
         raise ValueError(
@@ -196,21 +175,7 @@ def decode_metric_depth_from_focal_posterior(
     focal_plane_distances: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Convert a focal-plane posterior into metric depth by diopter interpolation.
-
-    Args:
-        focal_posterior: Per-pixel focal-plane posterior with shape [B, N, H, W].
-        focal_plane_distances: Physical focus distances in meters with shape [B, N] or [N].
-        eps: Numerical clamp used to avoid division by zero.
-
-    Returns:
-        Metric depth in meters with shape [B, 1, H, W].
-
-    Note:
-        This conversion is physically meaningful only when ``focal_plane_distances`` are
-        calibrated metric distances. Index-spaced focal coordinates should remain
-        normalized/relative outputs.
-    """
+    """Convert a calibrated focal-plane posterior into metric depth by diopter interpolation."""
 
     if focal_posterior.dim() != 4:
         raise ValueError(
@@ -245,7 +210,7 @@ def decode_metric_depth_from_focal_posterior(
 class PhysicalEvidenceEstimator(nn.Module):
     """Estimate focus/prior/abstention gates and fusion uncertainty from support maps."""
 
-    def __init__(self, in_channels: int = 5, hidden: int = 16):
+    def __init__(self, in_channels: int = 5, hidden: int = 16) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1),
@@ -271,18 +236,13 @@ class PhysicalEvidenceEstimator(nn.Module):
         uncertainty_logit = raw[:, 3:4]
 
         gate = torch.softmax(gate_logits, dim=1)
-        focal_evidence_weight = gate[:, 0:1]
-        generative_prior_weight = gate[:, 1:2]
-        abstention_weight = gate[:, 2:3]
-
         uncertainty_final = torch.sigmoid(uncertainty_logit)
-        physical_evidence_support = 1.0 - uncertainty_final
 
         return {
             "gate_logits": gate_logits,
-            "focal_evidence_weight": focal_evidence_weight,
-            "generative_prior_weight": generative_prior_weight,
-            "abstention_weight": abstention_weight,
+            "focal_evidence_weight": gate[:, 0:1],
+            "generative_prior_weight": gate[:, 1:2],
+            "abstention_weight": gate[:, 2:3],
             "uncertainty_final": uncertainty_final,
-            "physical_evidence_support": physical_evidence_support,
+            "physical_evidence_support": 1.0 - uncertainty_final,
         }
