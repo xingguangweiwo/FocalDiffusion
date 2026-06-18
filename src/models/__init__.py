@@ -9,6 +9,8 @@ from .focal_evidence_encoder import (
     decode_metric_depth_from_focal_posterior,
 )
 from .focal_processor import FocalStackProcessor
+from .verification_trace import PhysicalVerificationTrace
+from .physics_modules import FocusMeasureBank, DefocusConsistencyVerifier, FocalPhysicalVerifier
 
 __all__ = [
     "FocalCrossAttention",
@@ -18,4 +20,8 @@ __all__ = [
     "build_physical_evidence_features",
     "decode_metric_depth_from_focal_posterior",
     "TaskOutputDecoder",
+    "PhysicalVerificationTrace",
+    "FocusMeasureBank",
+    "DefocusConsistencyVerifier",
+    "FocalPhysicalVerifier",
 ]

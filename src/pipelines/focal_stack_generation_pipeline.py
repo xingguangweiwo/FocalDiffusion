@@ -42,6 +42,8 @@ from transformers import (
 from ..models.focal_attention import FocalCrossAttention
 from ..models.task_output_decoder import TaskOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
+from ..models.physics_modules import FocalPhysicalVerifier
+from ..models.verification_trace import PhysicalVerificationTrace
 from ..models.focal_evidence_encoder import (
     FocalEvidenceEncoder,
     PhysicalEvidenceEstimator,
@@ -87,6 +89,7 @@ class FocalStackGenerationOutput(BaseOutput):
     uncertainty_disagreement: Optional[torch.Tensor] = None
     uncertainty_final: Optional[torch.Tensor] = None
     depth_focus_metric: Optional[torch.Tensor] = None
+    physical_verification_trace: Optional[PhysicalVerificationTrace] = None
 
 
 class FocalInjectedSD3Transformer(nn.Module):
@@ -290,6 +293,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         "focal_evidence_head",
         "task_output_decoder",
         "physical_evidence_support_head",
+        "physical_verifier",
     )
 
     def __init__(
@@ -307,6 +311,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         focal_evidence_head: Optional[nn.Module] = None,
         task_output_decoder: Optional[nn.Module] = None,
         physical_evidence_support_head: Optional[nn.Module] = None,
+        physical_verifier: Optional[nn.Module] = None,
     ) -> None:
         super().__init__(
             vae=vae,
@@ -337,6 +342,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             "focal_evidence_head",
             "task_output_decoder",
             "physical_evidence_support_head",
+            "physical_verifier",
         )
 
         # Ensure the extended pipeline configuration tracks focal-specific components so
@@ -346,6 +352,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             focal_evidence_head=None,
             task_output_decoder=None,
             physical_evidence_support_head=None,
+            physical_verifier=None,
         )
 
         self.focal_processor = focal_processor or FocalStackProcessor()
@@ -359,6 +366,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             in_channels=5,
             hidden=16,
         )
+        self.physical_verifier = physical_verifier or FocalPhysicalVerifier()
 
         condition_channels = getattr(self.focal_processor, "feature_dim", None)
         if condition_channels is None:
@@ -393,6 +401,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             focal_evidence_head=self.focal_evidence_head,
             task_output_decoder=self.task_output_decoder,
             physical_evidence_support_head=self.physical_evidence_support_head,
+            physical_verifier=self.physical_verifier,
         )
 
     @property
@@ -411,6 +420,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             "focal_evidence_head": self.focal_evidence_head,
             "task_output_decoder": self.task_output_decoder,
             "physical_evidence_support_head": self.physical_evidence_support_head,
+            "physical_verifier": self.physical_verifier,
         }
 
         if getattr(self, "text_encoder_3", None) is not None:
@@ -518,6 +528,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         output_type: str = "pil",
         return_dict: bool = True,
         focal_distance_mode: str = "normalized",
+        num_refinement_steps: int = 0,
         **kwargs: Any,
     ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, Union[torch.Tensor, Image.Image]]]:
         """Generate canonical depth and all-in-focus outputs from a focal stack.
@@ -534,11 +545,15 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
                 ``focal_plane_distances`` are calibrated metric distances; then
                 metric focus depth is decoded from ``focal_posterior`` and
                 returned as ``depth_focus_metric``.
+            num_refinement_steps: Optional inference-time self-refinement steps.
+                ``0`` preserves the original single-pass behavior.
 
         Raises:
             ValueError: If ``focal_distance_mode`` is not ``"normalized"`` or
                 ``"metric"``.
         """
+        if num_refinement_steps < 0:
+            raise ValueError("num_refinement_steps must be non-negative.")
         if focal_distance_mode not in {"normalized", "metric"}:
             raise ValueError(
                 "focal_distance_mode must be either 'normalized' or 'metric', "
@@ -713,6 +728,32 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         recon = self.vae.decode(all_in_focus_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
 
+
+        verifier_device, verifier_dtype = _module_device_dtype(self.physical_verifier, torch.device(device), dtype)
+        verification_trace = self.physical_verifier(
+            focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
+            focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
+            depth_canonical=final_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+            all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
+            generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+        )
+        for _ in range(num_refinement_steps):
+            final_depth_canonical, uncertainty_final = self._apply_trace_refinement(
+                final_depth_canonical=final_depth_canonical,
+                focal_depth_canonical=focal_depth_canonical,
+                generated_depth_canonical=generated_depth_canonical,
+                uncertainty_final=uncertainty_final,
+                trace=verification_trace,
+            )
+            depth_map = final_depth_canonical.squeeze(1)
+            verification_trace = self.physical_verifier(
+                focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
+                focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
+                depth_canonical=final_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+                all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
+                generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+            )
+
         if output_type == "pil":
             image = self.numpy_to_pil(recon.cpu().permute(0, 2, 3, 1).numpy())[0]
             depth_color = self._colorize_depth(depth_map[0].detach().cpu().numpy())
@@ -746,7 +787,49 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             uncertainty_disagreement=uncertainty_disagreement.squeeze(1),
             uncertainty_final=uncertainty_final.squeeze(1),
             depth_focus_metric=depth_focus_metric,
+            physical_verification_trace=verification_trace,
         )
+
+
+    @staticmethod
+    def _apply_trace_refinement(
+        final_depth_canonical: torch.Tensor,
+        focal_depth_canonical: torch.Tensor,
+        generated_depth_canonical: torch.Tensor,
+        uncertainty_final: torch.Tensor,
+        trace: PhysicalVerificationTrace,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply one conservative inference-time trace-guided refinement step."""
+        if final_depth_canonical.dim() == 3:
+            final_depth_canonical = final_depth_canonical.unsqueeze(1)
+        target_size = final_depth_canonical.shape[-2:]
+
+        def resize_map(value: torch.Tensor) -> torch.Tensor:
+            """Resize a trace or prediction map to the current depth resolution."""
+            if value.dim() == 3:
+                value = value.unsqueeze(1)
+            if value.shape[-2:] != target_size:
+                value = F.interpolate(value, size=target_size, mode="bilinear", align_corners=False)
+            return value.to(device=final_depth_canonical.device, dtype=final_depth_canonical.dtype)
+
+        focal_depth = resize_map(focal_depth_canonical).clamp(0.0, 1.0)
+        generated_depth = resize_map(generated_depth_canonical).clamp(0.0, 1.0)
+        conflict = resize_map(trace.conflict_score).detach().clamp(0.0, 1.0)
+        invalid = resize_map(trace.invalid_score).detach().clamp(0.0, 1.0)
+        focus_support = resize_map(trace.focus_support).detach().clamp(0.0, 1.0)
+        generation_support = resize_map(trace.generation_support).detach().clamp(0.0, 1.0)
+
+        reliability = (1.0 - torch.maximum(conflict, invalid)).clamp(0.0, 1.0)
+        focus_weight = (focus_support * reliability).clamp(0.0, 1.0)
+        generation_weight = (generation_support * reliability).clamp(0.0, 1.0)
+        total_weight = (focus_weight + generation_weight).clamp(min=1e-6)
+        trace_depth = (focus_weight * focal_depth + generation_weight * generated_depth) / total_weight
+        update_weight = (0.35 * reliability * (focus_support + generation_support).mul(0.5)).clamp(0.0, 0.35)
+        refined_depth = ((1.0 - update_weight) * final_depth_canonical + update_weight * trace_depth).clamp(0.0, 1.0)
+
+        uncertainty = resize_map(uncertainty_final).clamp(0.0, 1.0)
+        refined_uncertainty = torch.maximum(uncertainty, torch.maximum(conflict, invalid)).clamp(0.0, 1.0)
+        return refined_depth, refined_uncertainty
 
     @staticmethod
     def _make_divisible_size(height: int, width: int, divisor: int = 16) -> Tuple[int, int]:
