@@ -259,3 +259,77 @@ def test_focal_diffusion_loss_includes_consistency_terms():
     assert "loss_gate_consistency" in loss_dict
     assert "loss_focal_axis_smoothness" in loss_dict
     assert torch.isfinite(loss_dict["total"])
+
+
+def test_focal_physical_verifier_trace_shapes_for_batch_first_stack():
+    from src.models.physics_modules import FocalPhysicalVerifier
+
+    B, K, C, H, W = 2, 4, 3, 12, 10
+    trace = FocalPhysicalVerifier()(torch.rand(B, K, C, H, W), torch.linspace(0, 1, K), torch.rand(B, 1, H, W), torch.rand(B, C, H, W))
+
+    for name in (
+        "focus_peak",
+        "focus_margin",
+        "focus_entropy",
+        "operator_agreement",
+        "texture_confidence",
+        "depth_focus_discrepancy",
+        "defocus_residual",
+        "refocus_residual",
+        "focus_support",
+        "generation_support",
+        "conflict_score",
+        "invalid_score",
+    ):
+        assert getattr(trace, name).shape == (B, 1, H, W)
+    assert trace.verdict_logits.shape == (B, 3, H, W)
+
+
+def test_trace_refinement_preserves_output_fields():
+    from src.models.physics_modules import FocalPhysicalVerifier
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationOutput, FocalStackGenerationPipeline
+
+    B, K, C, H, W = 1, 4, 3, 12, 10
+    stack = torch.rand(B, K, C, H, W)
+    trace = FocalPhysicalVerifier()(stack, torch.linspace(0, 1, K), torch.rand(B, 1, H, W), torch.rand(B, C, H, W))
+    depth, uncertainty = FocalStackGenerationPipeline._apply_trace_refinement(
+        final_depth_canonical=torch.rand(B, 1, H, W),
+        focal_depth_canonical=torch.rand(B, 1, H, W),
+        generated_depth_canonical=torch.rand(B, 1, H, W),
+        uncertainty_final=torch.zeros(B, 1, H, W),
+        trace=trace,
+    )
+    out = FocalStackGenerationOutput(
+        depth_map=depth.squeeze(1),
+        all_in_focus_image=torch.rand(B, C, H, W),
+        uncertainty_final=uncertainty.squeeze(1),
+        final_depth_canonical=depth.squeeze(1),
+        physical_verification_trace=trace,
+    )
+
+    assert out.depth_map.shape == (B, H, W)
+    assert out.uncertainty_final.shape == (B, H, W)
+    assert out.final_depth_canonical.shape == (B, H, W)
+    assert out.physical_verification_trace is trace
+
+
+def test_evaluate_trace_metrics_computes_fcpv_pvpr():
+    from src.models.physics_modules import FocalPhysicalVerifier
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationOutput
+    from script.evaluate import compute_trace_metrics
+
+    B, K, C, H, W = 1, 3, 3, 8, 8
+    trace = FocalPhysicalVerifier()(torch.rand(B, K, C, H, W), torch.linspace(0, 1, K), torch.rand(B, 1, H, W), torch.rand(B, C, H, W))
+    output = FocalStackGenerationOutput(
+        depth_map=torch.rand(B, H, W),
+        all_in_focus_image=torch.rand(B, C, H, W),
+        uncertainty_final=torch.rand(B, H, W),
+        physical_verification_trace=trace,
+    )
+    metrics = compute_trace_metrics(output)
+
+    assert "FCPV" in metrics
+    assert "PVPR" in metrics
+    assert "uncertainty_selective_focus_consistency" in metrics
+    assert "mean_conflict_score" in metrics
+    assert "mean_invalid_score" in metrics
