@@ -12,10 +12,6 @@ from tqdm import tqdm
 import yaml
 import torch.nn.functional as F
 
-from src.pipelines import load_pipeline
-from src.data import create_dataloader
-from src.utils.metrics import compute_metrics
-
 
 def _as_bchw(value: torch.Tensor | None) -> torch.Tensor | None:
     """Convert optional tensor maps to BCHW format for metric computation."""
@@ -28,26 +24,71 @@ def _as_bchw(value: torch.Tensor | None) -> torch.Tensor | None:
     raise ValueError(f"Expected [B,H,W] or [B,C,H,W] tensor, got {tuple(value.shape)}")
 
 
+def _safe_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> torch.Tensor:
+    """Divide tensors and return NaN when a metric is undefined."""
+    if float(denominator.item()) <= 0.0:
+        return numerator.new_tensor(float("nan"))
+    return numerator / denominator
+
+
+def _per_sample_vpr_at_coverage(
+    confidence: torch.Tensor,
+    conflict: torch.Tensor,
+    invalid: torch.Tensor,
+    coverage: float,
+    conflict_threshold: float,
+    invalid_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute verification pass rate after per-sample confidence top-k retention."""
+    batch = confidence.shape[0]
+    confidence_flat = confidence.reshape(batch, -1)
+    pass_flat = ((conflict < conflict_threshold) & (invalid < invalid_threshold)).reshape(batch, -1).float()
+    coverage = min(max(float(coverage), 0.0), 1.0)
+    rates = []
+    actual_coverages = []
+    for sample_idx in range(batch):
+        total = confidence_flat.shape[1]
+        k = int(torch.ceil(confidence_flat.new_tensor(coverage * total)).item())
+        if k <= 0:
+            rates.append(confidence_flat.new_tensor(float("nan")))
+            actual_coverages.append(confidence_flat.new_tensor(0.0))
+            continue
+        topk_idx = torch.topk(confidence_flat[sample_idx], k=k, largest=True).indices
+        rates.append(pass_flat[sample_idx, topk_idx].mean())
+        actual_coverages.append(confidence_flat.new_tensor(k / total))
+    return torch.stack(rates), torch.stack(actual_coverages)
+
+
 def compute_trace_metrics(
     output,
-    confidence_threshold: float = 0.8,
-    violation_threshold: float = 0.5,
-    coverage: float = 0.2,
+    confidence_threshold: float = 0.5,
+    conflict_threshold: float = 0.5,
+    invalid_threshold: float = 0.5,
+    vpr_coverage: float = 0.8,
+    violation_threshold: float | None = None,
 ) -> dict[str, float]:
-    """Compute FocalTrace metrics from a pipeline output object."""
+    """Compute correctness-first FocalTrace physical verification metrics."""
+    if violation_threshold is not None:
+        conflict_threshold = violation_threshold
+        invalid_threshold = violation_threshold
     trace = getattr(output, "physical_verification_trace", None)
     if trace is None:
+        nan = float("nan")
         return {
-            "PHR": 0.0,
-            "false_confident_violation_rate": 0.0,
-            "VPR_at_coverage": 0.0,
-            "focus_supported_valid_mass": 0.0,
-            "uncertainty_selective_focus_consistency": 0.0,
+            "PHR": nan,
+            "IOR": nan,
+            "VPR_at_coverage_mean": nan,
+            "VPR_at_coverage_std": nan,
+            "accepted_coverage": 0.0,
+            "coverage": 0.0,
             "mean_conflict_score": 0.0,
             "mean_invalid_score": 0.0,
+            "uncertainty_violation_alignment": nan,
+            "FCPV": nan,
+            "FCPV_soft": nan,
+            "PVPR_at_coverage": nan,
         }
 
-    focus_support = trace.focus_support.detach().float().clamp(0.0, 1.0)
     conflict = trace.conflict_score.detach().float().clamp(0.0, 1.0)
     invalid = trace.invalid_score.detach().float().clamp(0.0, 1.0)
     uncertainty = _as_bchw(getattr(output, "uncertainty_final", None))
@@ -55,41 +96,64 @@ def compute_trace_metrics(
         uncertainty = _as_bchw(getattr(output, "uncertainty", None))
     if uncertainty is None:
         uncertainty = torch.zeros_like(conflict)
-    elif uncertainty.shape[-2:] != conflict.shape[-2:]:
-        uncertainty = F.interpolate(
-            uncertainty.float(),
-            size=conflict.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
+    else:
+        uncertainty = uncertainty.detach().float().clamp(0.0, 1.0)
+        if uncertainty.shape[-2:] != conflict.shape[-2:]:
+            uncertainty = F.interpolate(uncertainty, size=conflict.shape[-2:], mode="bilinear", align_corners=False)
 
-    uncertainty = uncertainty.float().clamp(0.0, 1.0)
-    violation = torch.maximum(conflict, invalid).clamp(0.0, 1.0)
     confidence = (1.0 - uncertainty).clamp(0.0, 1.0)
     high_confidence = confidence >= confidence_threshold
-    physical_violation = violation >= violation_threshold
-    high_confidence_count = high_confidence.sum().clamp(min=1)
-    false_confident_violation_rate = (high_confidence & physical_violation).float().sum() / high_confidence_count
+    physically_valid_evidence = invalid < invalid_threshold
+    conflict_event = conflict >= conflict_threshold
+    invalid_event = invalid >= invalid_threshold
+    accepted = high_confidence & physically_valid_evidence
 
-    flat_confidence = confidence.flatten()
-    flat_violation = violation.flatten()
-    coverage = min(max(float(coverage), 0.0), 1.0)
-    coverage_count = max(1, min(flat_confidence.numel(), int(math.ceil(flat_confidence.numel() * coverage))))
-    top_indices = torch.topk(flat_confidence, k=coverage_count).indices
-    vpr_at_coverage = (flat_violation[top_indices] < violation_threshold).float().mean()
+    phr = _safe_ratio((accepted & conflict_event).float().sum(), accepted.float().sum())
+    ior = _safe_ratio((high_confidence & invalid_event).float().sum(), invalid_event.float().sum())
+    accepted_coverage = accepted.float().mean()
 
-    physically_valid = (1.0 - violation).clamp(0.0, 1.0)
-    focus_supported_valid_mass = (focus_support * physically_valid).mean()
-    selective_consistency = (1.0 - torch.abs(uncertainty - violation)).mean()
+    vpr_rates, vpr_coverages = _per_sample_vpr_at_coverage(
+        confidence=confidence,
+        conflict=conflict,
+        invalid=invalid,
+        coverage=vpr_coverage,
+        conflict_threshold=conflict_threshold,
+        invalid_threshold=invalid_threshold,
+    )
+    finite_vpr = vpr_rates[torch.isfinite(vpr_rates)]
+    if finite_vpr.numel() == 0:
+        vpr_mean = confidence.new_tensor(float("nan"))
+        vpr_std = confidence.new_tensor(float("nan"))
+    else:
+        vpr_mean = finite_vpr.mean()
+        vpr_std = finite_vpr.std(unbiased=False)
+
+    physical_risk = (0.5 * (conflict + invalid)).clamp(0.0, 1.0)
+    uncertainty_flat = uncertainty.reshape(-1)
+    risk_flat = physical_risk.reshape(-1)
+    if uncertainty_flat.numel() < 2 or float(uncertainty_flat.std(unbiased=False).item()) <= 1e-12 or float(risk_flat.std(unbiased=False).item()) <= 1e-12:
+        alignment = uncertainty.new_tensor(float("nan"))
+    else:
+        uncertainty_centered = uncertainty_flat - uncertainty_flat.mean()
+        risk_centered = risk_flat - risk_flat.mean()
+        alignment = (uncertainty_centered * risk_centered).mean() / (
+            uncertainty_flat.std(unbiased=False) * risk_flat.std(unbiased=False) + 1e-8
+        )
 
     return {
-        "PHR": float(false_confident_violation_rate.item()),
-        "false_confident_violation_rate": float(false_confident_violation_rate.item()),
-        "VPR_at_coverage": float(vpr_at_coverage.item()),
-        "focus_supported_valid_mass": float(focus_supported_valid_mass.item()),
-        "uncertainty_selective_focus_consistency": float(selective_consistency.item()),
+        "PHR": float(phr.item()),
+        "IOR": float(ior.item()),
+        "VPR_at_coverage_mean": float(vpr_mean.item()),
+        "VPR_at_coverage_std": float(vpr_std.item()),
+        "accepted_coverage": float(accepted_coverage.item()),
+        "coverage": float(vpr_coverages.mean().item()),
         "mean_conflict_score": float(conflict.mean().item()),
         "mean_invalid_score": float(invalid.mean().item()),
+        "uncertainty_violation_alignment": float(alignment.item()),
+        # Backward-compatible names now follow correctness-first definitions.
+        "FCPV": float(phr.item()),
+        "FCPV_soft": float((confidence * conflict * (1.0 - invalid)).sum().div((confidence * (1.0 - invalid)).sum().clamp(min=1e-6)).item()),
+        "PVPR_at_coverage": float(vpr_mean.item()),
     }
 
 
@@ -165,6 +229,10 @@ def _serialize_refinement_history(history: list[dict]) -> list[dict]:
 
 
 def evaluate(args):
+    from src.pipelines import load_pipeline
+    from src.data import create_dataloader
+    from src.utils.metrics import compute_metrics
+
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
