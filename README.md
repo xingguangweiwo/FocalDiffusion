@@ -7,7 +7,7 @@ The system uses focal stacks as physical evidence, estimates a per-pixel focal-p
 ## Highlights
 
 * Task-conditioned focal-stack image generation for all-in-focus reconstruction, depth, uncertainty, and focal evidence outputs.
-* Physical Verification Trace outputs for focus confidence/index/coordinate, depth-focus discrepancy, defocus rendering residuals, support, conflict, invalidity, and verdict logits.
+* Physical Verification Trace outputs for focus confidence/index/coordinate, depth-focus discrepancy, defocus rendering residuals, support, conflict, invalidity, and verdict scores.
 * Inference-time self-refinement driven by physical verification traces.
 * Evaluation metrics for physical hallucination, valid physical reconstruction at coverage, and conflict/invalid trace scores.
 * Minimal M0→M1 verifier-guided self-improvement workflow: M0 is trained on labeled `train_sources`, mines frozen-verifier trace targets from unlabeled `self_improvement_sources`, and M1 is initialized from `parent_checkpoint` while replaying the manifest alongside source supervision.
@@ -84,8 +84,9 @@ The evaluator writes `metrics.json`, `trace_metrics.json`, and a `visualizations
 
 Trace metrics include:
 
-* **Physical Hallucination Rate** (`physical_hallucination_rate`): the fraction of high-confidence predictions whose physical violation score exceeds the configured threshold.
-* **VPR@Coverage** (`VPR_at_coverage`): among the top-confidence coverage fraction, the proportion of pixels/patches whose violation is below threshold.
+* **High-Confidence Physical Violation Rate** (`high_confidence_physical_violation_rate`, HCPVR): verifier-derived violation rate among high-confidence predictions; reported with `reference_type` and not treated as absolute correctness unless the reference is ground truth or human annotation.
+* **Selective Physical Risk at Coverage** (`selective_physical_risk_at_coverage`): mean verifier risk over the top-confidence coverage fraction.
+* **Physical Risk Coverage AUC** (`physical_risk_coverage_auc`, Physical-AURC): threshold-free risk/coverage summary for selective prediction.
 * **`mean_conflict_score`**: average physical conflict score from the trace.
 * **`mean_invalid_score`**: average invalid/physically unreliable score from the trace.
 

@@ -5,6 +5,7 @@ Uses the FocalStackGenerationTrainer class from src.training.trainer
 
 import argparse
 import ast
+import json
 import logging
 import sys
 from copy import deepcopy
@@ -250,6 +251,109 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
         output_block['save_dir'] = _resolve(output_block['save_dir'])
 
 
+_FOCAL_COORDINATE_TYPES = {"distance", "inverse_distance", "diopter", "z_position", "index", "normalized_rank"}
+_FOCAL_COORDINATE_UNITS = {"m", "mm", "um", "1_per_m", "index", "none"}
+_DEPTH_COORDINATE_TYPES = {"metric_depth", "inverse_depth", "disparity", "canonical", "normalized_rank"}
+_LINEAR_UNIT_GROUPS = [
+    {"m", "mm", "um"},
+    {"index"},
+    {"none"},
+    {"1_per_m"},
+]
+
+
+def _unit_group(unit: str) -> frozenset[str]:
+    for group in _LINEAR_UNIT_GROUPS:
+        if unit in group:
+            return frozenset(group)
+    return frozenset({unit})
+
+
+def _validate_coordinate_protocols(data_cfg: dict) -> None:
+    """Ensure every source declares coordinate semantics and only compatible protocols are grouped."""
+    grouped: dict[str, list[tuple[str, str, str]]] = {}
+    for split_key in ("train_sources", "self_improvement_sources", "val_sources", "test_sources"):
+        for source in data_cfg.get(split_key, []) or []:
+            name = str(source.get("name", f"{split_key}_source"))
+            missing = [key for key in ("focal_coordinate_type", "focal_coordinate_unit", "depth_coordinate_type", "camera_calibration") if key not in source]
+            if missing:
+                raise ValueError(f"data.{split_key}.{name} is missing coordinate protocol fields: {missing}")
+            coord_type = str(source["focal_coordinate_type"])
+            unit = str(source["focal_coordinate_unit"])
+            depth_type = str(source["depth_coordinate_type"])
+            if coord_type not in _FOCAL_COORDINATE_TYPES:
+                raise ValueError(f"Unsupported focal_coordinate_type for {name}: {coord_type}")
+            if unit not in _FOCAL_COORDINATE_UNITS:
+                raise ValueError(f"Unsupported focal_coordinate_unit for {name}: {unit}")
+            if depth_type not in _DEPTH_COORDINATE_TYPES:
+                raise ValueError(f"Unsupported depth_coordinate_type for {name}: {depth_type}")
+            evaluation_mode = str(source.get("evaluation_mode", data_cfg.get("evaluation_mode", "canonical")))
+            if evaluation_mode == "calibrated" and not bool(source.get("camera_calibration")):
+                raise ValueError(f"calibrated evaluation requires camera_calibration for {name}")
+            grouped.setdefault(split_key, []).append((coord_type, unit, name))
+    for split_key, protocols in grouped.items():
+        if not protocols:
+            continue
+        reference_type, reference_unit, reference_name = protocols[0]
+        reference_group = _unit_group(reference_unit)
+        for coord_type, unit, name in protocols[1:]:
+            if coord_type != reference_type:
+                raise ValueError(
+                    f"Cannot aggregate mixed focal coordinate types in {split_key}: "
+                    f"{reference_name} uses {reference_type}, {name} uses {coord_type}"
+                )
+            if _unit_group(unit) != reference_group:
+                raise ValueError(
+                    f"Cannot aggregate non-linear focal coordinate units in {split_key}: "
+                    f"{reference_name} uses {reference_unit}, {name} uses {unit}"
+                )
+
+def _read_filelist_identity_sets(sources: list[dict]) -> dict[str, set[str]]:
+    """Load sample/scene/hash identities from source filelists for split isolation."""
+    identities = {"sample_ids": set(), "scenes": set(), "image_hashes": set()}
+    for source in sources or []:
+        filelist = Path(source.get("filelist", ""))
+        if not filelist.exists():
+            continue
+        for line_number, raw_line in enumerate(filelist.read_text(encoding="utf-8").splitlines()):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("{"):
+                entry = json.loads(line)
+                sample_id = entry.get("sample_id") or entry.get("id") or entry.get("focal_stack") or entry.get("focal_stack_dir") or entry.get("depth") or entry.get("depth_path")
+                scene = entry.get("scene") or entry.get("scene_id") or entry.get("sequence") or entry.get("sequence_id")
+                image_hash = entry.get("image_hash") or entry.get("sha256") or entry.get("all_in_focus_sha256")
+            else:
+                tokens = [part.strip() for part in line.replace(",", " ").split() if part.strip()]
+                sample_id = tokens[0] if tokens else f"{filelist}:{line_number}"
+                scene = Path(sample_id).parts[0] if Path(sample_id).parts else None
+                image_hash = None
+                for token in tokens[2:]:
+                    if token.startswith("image_hash=") or token.startswith("sha256="):
+                        image_hash = token.split("=", 1)[1]
+            identities["sample_ids"].add(str(sample_id))
+            if scene:
+                identities["scenes"].add(str(scene))
+            if image_hash:
+                identities["image_hashes"].add(str(image_hash))
+    return identities
+
+
+def _check_split_identity_isolation(data_cfg: dict) -> None:
+    """Reject train/adapt/test overlap by sample ID, scene/sequence, or image hash."""
+    split_identities = {
+        "train": _read_filelist_identity_sets(data_cfg.get("train_sources", [])),
+        "adapt": _read_filelist_identity_sets(data_cfg.get("self_improvement_sources", [])),
+        "test": _read_filelist_identity_sets(data_cfg.get("test_sources", [])),
+    }
+    for left, right in (("train", "adapt"), ("train", "test"), ("adapt", "test")):
+        for field, label in (("sample_ids", "sample ID"), ("scenes", "scene/sequence"), ("image_hashes", "duplicate image hash")):
+            overlap = split_identities[left][field] & split_identities[right][field]
+            if overlap:
+                preview = ", ".join(sorted(overlap)[:5])
+                raise ValueError(f"data split isolation failed: {left}/{right} share {label}: {preview}")
+
 def deep_merge(dict1: dict, dict2: dict) -> dict:
     """Deep merge two dictionaries"""
     result = dict1.copy()
@@ -426,13 +530,14 @@ def validate_config(config: dict) -> None:
                 if 'filelist' not in source:
                     raise ValueError(f"data.{split_key} entry is missing filelist")
 
-        train_files = {str(source.get('filelist')) for source in data_cfg.get('train_sources', [])}
         adapt_files = {str(source.get('filelist')) for source in data_cfg.get('self_improvement_sources', [])}
         test_files = {str(source.get('filelist')) for source in data_cfg.get('test_sources', [])}
         if adapt_files & test_files:
             raise ValueError("data.self_improvement_sources must not overlap data.test_sources")
         if not adapt_files:
             raise ValueError("data.self_improvement_sources must be a non-empty list when source-style data config is used")
+        _validate_coordinate_protocols(data_cfg)
+        _check_split_identity_isolation(data_cfg)
     else:
         for key in ('data_root', 'train_filelist', 'val_filelist', 'test_filelist'):
             if key not in data_cfg:

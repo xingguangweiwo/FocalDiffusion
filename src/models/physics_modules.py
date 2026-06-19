@@ -12,13 +12,37 @@ import torch.nn.functional as F
 from .verification_trace import PhysicalVerificationTrace
 
 
+def _split_unit_and_signed_ranges(image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(unit, signed)`` views for images in either ``[0, 1]`` or ``[-1, 1]``.
+
+    Range detection intentionally runs before any clamping so signed inputs are
+    not misclassified as unit-range tensors.
+    """
+    if not torch.isfinite(image).all():
+        raise ValueError("image tensors must contain only finite values.")
+    min_value = image.amin()
+    max_value = image.amax()
+    if min_value >= 0.0 and max_value <= 1.0:
+        unit = image
+        signed = image * 2.0 - 1.0
+    elif min_value >= -1.0 and max_value <= 1.0:
+        signed = image
+        unit = (image + 1.0) * 0.5
+    else:
+        raise ValueError("image tensors must be in [0, 1] or [-1, 1] range.")
+    return unit, signed
+
+
 class FocusMeasureBank(nn.Module):
     """Compute interpretable focus measures with fixed derivative operators."""
 
-    def __init__(self, eps: float = 1e-6) -> None:
-        """Initialize the fixed Sobel/Laplacian focus-measure bank."""
+    def __init__(self, eps: float = 1e-6, operator_variant: str = "sobel_laplacian") -> None:
+        """Initialize the fixed focus-measure bank."""
         super().__init__()
+        if operator_variant not in {"sobel_laplacian", "gradient_variance"}:
+            raise ValueError(f"Unsupported focus operator variant: {operator_variant}")
         self.eps = eps
+        self.operator_variant = operator_variant
         self.register_buffer("sobel_x", torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]).view(1, 1, 3, 3) / 8.0)
         self.register_buffer("sobel_y", torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]).view(1, 1, 3, 3) / 8.0)
         self.register_buffer("laplacian", torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]).view(1, 1, 3, 3))
@@ -46,10 +70,15 @@ class FocusMeasureBank(nn.Module):
         gx = self._filter_gray(gray, self.sobel_x)
         gy = self._filter_gray(gray, self.sobel_y)
         lap = self._filter_gray(gray, self.laplacian)
-        tenengrad = gx.square() + gy.square()
-        lap_energy = lap.abs()
         local_var = (gray - F.avg_pool3d(gray, kernel_size=(1, 5, 5), stride=1, padding=(0, 2, 2))).square()
-        measures = torch.cat([tenengrad, lap_energy, local_var], dim=2)
+        if self.operator_variant == "sobel_laplacian":
+            tenengrad = gx.square() + gy.square()
+            lap_energy = lap.abs()
+            measures = torch.cat([tenengrad, lap_energy, local_var], dim=2)
+        else:
+            gradient_l1 = gx.abs() + gy.abs()
+            local_mean_abs = (gray - F.avg_pool3d(gray, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1))).abs()
+            measures = torch.cat([gradient_l1, local_var, local_mean_abs], dim=2)
         plane_scores = measures.mean(dim=2)
         normalized_scores = plane_scores / plane_scores.amax(dim=1, keepdim=True).clamp(min=self.eps)
         posterior = torch.softmax(normalized_scores / 0.1, dim=1)
@@ -66,7 +95,6 @@ class FocusMeasureBank(nn.Module):
             "focus_scores": normalized_scores,
             "focus_posterior": posterior,
             "focus_peak_confidence": peak,
-            "focus_peak": peak,  # Deprecated alias; prefer focus_peak_confidence.
             "focus_peak_index": peak_index,
             "focus_margin": margin.clamp(0.0, 1.0),
             "focus_entropy": entropy.clamp(0.0, 1.0),
@@ -112,32 +140,38 @@ class DefocusConsistencyVerifier(nn.Module):
         batch, planes, _, height, width = focal_stack.shape
         if depth_canonical.dim() == 3:
             depth_canonical = depth_canonical.unsqueeze(1)
-        def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
-            if image.amin() < 0:
-                image = (image + 1.0) * 0.5
-            return image
-
-        focal_stack_unit = _to_unit_range(focal_stack)
+        focal_stack_unit, _ = _split_unit_and_signed_ranges(focal_stack)
         depth = F.interpolate(depth_canonical, size=(height, width), mode="bilinear", align_corners=False).clamp(0.0, 1.0)
-        aif = F.interpolate(_to_unit_range(all_in_focus), size=(height, width), mode="bilinear", align_corners=False)
+        all_in_focus_unit, _ = _split_unit_and_signed_ranges(all_in_focus)
+        aif = F.interpolate(all_in_focus_unit, size=(height, width), mode="bilinear", align_corners=False)
         coords = self._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype)
         blur_amount = (depth[:, None] - coords[:, :, None, None, None]).abs().clamp(0.0, 1.0)
         blurred = self._multi_blur(aif)[:, None]
         rendered = (1.0 - blur_amount) * aif[:, None] + blur_amount * blurred
-        defocus_residual = (rendered - focal_stack_unit).abs().mean(dim=2).mean(dim=1, keepdim=True).clamp(0.0, 1.0)
-        stack_reprojection_residual = defocus_residual
-        return {"defocus_residual": defocus_residual, "stack_reprojection_residual": stack_reprojection_residual, "rendered_stack": rendered}
+        stack_reprojection_residual = (rendered - focal_stack_unit).abs().mean(dim=2).mean(dim=1, keepdim=True).clamp(0.0, 1.0)
+        return {"stack_reprojection_residual": stack_reprojection_residual, "rendered_stack": rendered}
 
 
 class FocalPhysicalVerifier(nn.Module):
     """Fuse fixed focus and defocus checks into a PhysicalVerificationTrace."""
 
-    def __init__(self, eps: float = 1e-6) -> None:
+    def __init__(self, eps: float = 1e-6, focus_operator: str = "sobel_laplacian") -> None:
         """Initialize the conservative FocalTrace physical verifier."""
         super().__init__()
         self.eps = eps
-        self.focus_bank = FocusMeasureBank(eps=eps)
+        self.focus_operator = focus_operator
+        self.focus_bank = FocusMeasureBank(eps=eps, operator_variant=focus_operator)
         self.defocus_verifier = DefocusConsistencyVerifier(eps=eps)
+
+    def config_dict(self) -> dict[str, object]:
+        """Return stable non-learned verifier configuration for manifest hashing."""
+        return {
+            "class": type(self).__name__,
+            "eps": float(self.eps),
+            "focus_operator": self.focus_operator,
+            "defocus_max_blur_radius": int(self.defocus_verifier.max_blur_radius),
+            "defocus_eps": float(self.defocus_verifier.eps),
+        }
 
     def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor, generated_depth_canonical: torch.Tensor | None = None) -> PhysicalVerificationTrace:
         """Compute a batch-first physical verification trace for FocalTrace."""
@@ -156,12 +190,12 @@ class FocalPhysicalVerifier(nn.Module):
         discrepancy = (depth - focus_depth).abs().clamp(0.0, 1.0)
         generation_discrepancy = (prior - focus_depth).abs().clamp(0.0, 1.0)
         focus_support = (focus["focus_peak_confidence"] * focus["focus_margin"] * (1.0 - focus["focus_entropy"]) * focus["operator_agreement"] * focus["texture_confidence"]).clamp(0.0, 1.0)
-        physical_penalty = torch.maximum(discrepancy, residuals["defocus_residual"])
+        physical_penalty = torch.maximum(discrepancy, residuals["stack_reprojection_residual"])
         generation_support = ((1.0 - generation_discrepancy) * (1.0 - residuals["stack_reprojection_residual"])).clamp(0.0, 1.0)
         conflict_score = torch.maximum(discrepancy, generation_discrepancy).clamp(0.0, 1.0)
         invalid_score = torch.maximum(focus["focus_entropy"], residuals["stack_reprojection_residual"]).clamp(0.0, 1.0)
-        support_logit = focus_support + generation_support - physical_penalty
-        verdict_logits = torch.cat([support_logit, conflict_score, invalid_score], dim=1)
+        support_score = focus_support + generation_support - physical_penalty
+        verdict_scores = torch.cat([support_score, conflict_score, invalid_score], dim=1)
         return PhysicalVerificationTrace(
             focus_peak_confidence=focus["focus_peak_confidence"],
             focus_peak_index=focus["focus_peak_index"],
@@ -171,11 +205,10 @@ class FocalPhysicalVerifier(nn.Module):
             operator_agreement=focus["operator_agreement"],
             texture_confidence=focus["texture_confidence"],
             depth_focus_discrepancy=discrepancy,
-            defocus_residual=residuals["defocus_residual"],
             stack_reprojection_residual=residuals["stack_reprojection_residual"],
             focus_support=focus_support,
             generation_support=generation_support,
             conflict_score=conflict_score,
             invalid_score=invalid_score,
-            verdict_logits=verdict_logits,
+            verdict_scores=verdict_scores,
         )

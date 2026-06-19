@@ -466,8 +466,8 @@ def test_defocus_consistency_range_invariant_residuals():
     )
 
     assert torch.allclose(
-        unit_outputs["defocus_residual"],
-        signed_outputs["defocus_residual"],
+        unit_outputs["stack_reprojection_residual"],
+        signed_outputs["stack_reprojection_residual"],
         atol=1e-6,
     )
     assert torch.allclose(
@@ -631,3 +631,117 @@ def test_tiny_one_batch_overfit_cpu():
     assert last_loss is not None and first_loss is not None
     final_loss = torch.nn.functional.mse_loss(model(x), y).item()
     assert final_loss < first_loss
+
+
+def test_static_loss_constructor_matches_trainer_call_and_no_preference_config():
+    import ast
+    import inspect
+    import yaml
+    from pathlib import Path
+    from src.training.losses import FocalStackGenerationLoss
+
+    trainer_tree = ast.parse(Path("src/training/trainer.py").read_text(encoding="utf-8"))
+    call_keywords = None
+    for node in ast.walk(trainer_tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "FocalStackGenerationLoss":
+            call_keywords = {keyword.arg for keyword in node.keywords if keyword.arg is not None}
+            break
+    assert call_keywords is not None
+    constructor_params = set(inspect.signature(FocalStackGenerationLoss.__init__).parameters) - {"self"}
+    assert call_keywords <= constructor_params
+    assert constructor_params - call_keywords <= {"diffusion_weight", "depth_weight", "rgb_weight"}
+
+    for path in Path("configs").rglob("*.yaml"):
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        assert "lambda_preference" not in str(config)
+
+
+def test_static_evaluation_metrics_have_no_undefined_focus_support():
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("script/evaluate.py").read_text(encoding="utf-8"))
+    function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "compute_trace_metrics")
+    loaded = {node.id for node in ast.walk(function) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    stored = {node.id for node in ast.walk(function) if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Param))}
+    assert "focus_support" not in loaded - stored
+
+
+def test_static_config_keys_are_referenced_by_source():
+    import yaml
+    from pathlib import Path
+
+    config = yaml.safe_load(Path("configs/base.yaml").read_text(encoding="utf-8"))
+    source_text = "\n".join(path.read_text(encoding="utf-8") for root in (Path("src"), Path("script")) for path in root.rglob("*.py"))
+    ignored_sections = {"model", "data", "training", "optimizer", "losses", "validation", "logging", "hardware", "inference"}
+    missing = []
+    for section, values in config.items():
+        if not isinstance(values, dict):
+            continue
+        for key in values:
+            if key in ignored_sections:
+                continue
+            if key not in source_text and section not in source_text:
+                missing.append(f"{section}.{key}")
+    assert missing == []
+
+
+def test_trace_manifest_metadata_and_full_replay_targets_drive_generation_outputs(tmp_path):
+    from types import SimpleNamespace
+
+    from src.training.trainer import TraceMiningBuffer
+
+    buffer = TraceMiningBuffer(max_items=4, round_id="M1", round_index=1, manifest_path=tmp_path / "manifest.jsonl", patch_size=1)
+    buffer.set_metadata(parent_checkpoint_sha256="parent-sha", verifier_config_hash="verifier-sha")
+    trace = SimpleNamespace(
+        conflict_score=torch.tensor([[[[0.9, 0.1], [0.1, 0.1]]]]),
+        invalid_score=torch.zeros(1, 1, 2, 2),
+        depth_focus_discrepancy=torch.tensor([[[[0.8, 0.1], [0.1, 0.1]]]]),
+        stack_reprojection_residual=torch.tensor([[[[0.4, 0.1], [0.1, 0.1]]]]),
+        focus_support=torch.ones(1, 1, 2, 2),
+        generation_support=torch.ones(1, 1, 2, 2) * 0.5,
+    )
+    stats = buffer.mine(
+        trace=trace,
+        uncertainty=torch.zeros(1, 1, 2, 2),
+        sample_ids=["adapt_a"],
+        batch_index=0,
+        focal_plane_coordinates=torch.tensor([[0.0, 0.5, 1.0]]),
+        conflict_threshold=0.5,
+        confidence_threshold=0.5,
+        generated_depth=torch.ones(1, 1, 2, 2) * 0.8,
+        focal_depth=torch.ones(1, 1, 2, 2) * 0.2,
+        final_depth=torch.ones(1, 1, 2, 2) * 0.7,
+        focal_gate=torch.ones(1, 1, 2, 2) * 0.3,
+        generative_gate=torch.ones(1, 1, 2, 2) * 0.7,
+        abstention=torch.ones(1, 1, 2, 2) * 0.1,
+    )
+    assert stats["mined_trace_items"] > 0
+    buffer.save(buffer.manifest_path)
+    reloaded = TraceMiningBuffer(max_items=4, manifest_path=buffer.manifest_path)
+    assert reloaded.metadata["parent_checkpoint_sha256"] == "parent-sha"
+    assert reloaded.metadata["verifier_config_hash"] == "verifier-sha"
+    assert all("stack_reprojection_residual_target" in item for item in reloaded.items)
+    assert all("focal_gate_target" in item and "generative_gate_target" in item for item in reloaded.items)
+
+    final_depth = torch.full((1, 1, 2, 2), 0.9, requires_grad=True)
+    generated_depth = torch.full((1, 1, 2, 2), 0.9, requires_grad=True)
+    focal_gate = torch.full((1, 1, 2, 2), 0.2, requires_grad=True)
+    generative_gate = torch.full((1, 1, 2, 2), 0.8, requires_grad=True)
+    uncertainty = torch.full((1, 1, 2, 2), 0.1, requires_grad=True)
+    support = torch.full((1, 1, 2, 2), 0.5, requires_grad=True)
+    loss = reloaded.replay_loss(
+        predicted_support=support,
+        predicted_invalid=uncertainty,
+        predicted_final_depth=final_depth,
+        predicted_generated_depth=generated_depth,
+        predicted_focal_gate=focal_gate,
+        predicted_generative_gate=generative_gate,
+        predicted_abstention=uncertainty,
+        sample_ids=["adapt_a"],
+    )
+    assert loss is not None
+    loss.backward()
+    for tensor in (final_depth, generated_depth, focal_gate, generative_gate, uncertainty):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()

@@ -847,6 +847,13 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         return float((0.5 * conflict + 0.5 * invalid + 0.25 * (1.0 - support)).mean().item())
 
 
+    @staticmethod
+    def _should_accept_refinement(current_risk: torch.Tensor | float, candidate_risk: torch.Tensor | float, epsilon: float = 1e-4) -> bool:
+        """Accept a candidate only when its scalar risk improves by ``epsilon``."""
+        current = float(current_risk.detach().item()) if isinstance(current_risk, torch.Tensor) else float(current_risk)
+        candidate = float(candidate_risk.detach().item()) if isinstance(candidate_risk, torch.Tensor) else float(candidate_risk)
+        return candidate <= current - epsilon
+
     @classmethod
     def _accept_refinement_candidate(
         cls,
@@ -857,7 +864,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         """Accept a candidate only when physical risk decreases by ``epsilon``."""
         current_risk = cls._physical_risk(current_trace)
         candidate_risk = cls._physical_risk(candidate_trace)
-        return candidate_risk <= current_risk - epsilon, current_risk, candidate_risk
+        return cls._should_accept_refinement(current_risk, candidate_risk, epsilon), current_risk, candidate_risk
 
     @staticmethod
     def _apply_trace_refinement(

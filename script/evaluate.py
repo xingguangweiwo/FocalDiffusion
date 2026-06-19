@@ -31,69 +31,151 @@ def _safe_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> float:
     return float((numerator / denominator).item())
 
 
-def _sample_vpr_at_coverage(
-    confidence: torch.Tensor,
-    conflict: torch.Tensor,
-    invalid: torch.Tensor,
-    coverage: float,
-    conflict_threshold: float,
-    invalid_threshold: float,
-) -> tuple[float, float]:
-    """Compute per-sample VPR@coverage mean/std and accepted coverage."""
-    batch = confidence.shape[0]
-    coverage = min(max(float(coverage), 0.0), 1.0)
-    sample_rates: list[float] = []
-    accepted_coverages: list[float] = []
-    for index in range(batch):
-        flat_confidence = confidence[index].flatten()
-        flat_conflict = conflict[index].flatten()
-        flat_invalid = invalid[index].flatten()
-        if flat_confidence.numel() == 0:
-            sample_rates.append(float("nan"))
-            accepted_coverages.append(float("nan"))
-            continue
-        coverage_count = max(1, min(flat_confidence.numel(), int(math.ceil(flat_confidence.numel() * coverage))))
-        top_indices = torch.topk(flat_confidence, k=coverage_count).indices
-        pass_mask = (flat_conflict[top_indices] < conflict_threshold) & (flat_invalid[top_indices] < invalid_threshold)
-        sample_rates.append(float(pass_mask.float().mean().item()))
-        accepted_coverages.append(float(coverage_count / flat_confidence.numel()))
-    rates = torch.tensor(sample_rates, dtype=torch.float32)
-    valid_rates = rates[torch.isfinite(rates)]
-    if valid_rates.numel() == 0:
-        return float("nan"), float("nan")
-    std = float(valid_rates.std(unbiased=False).item()) if valid_rates.numel() > 1 else 0.0
-    return float(valid_rates.mean().item()), std
+def _finite_mean(values: list[float]) -> float:
+    finite = torch.tensor([value for value in values if math.isfinite(value)], dtype=torch.float32)
+    if finite.numel() == 0:
+        return float("nan")
+    return float(finite.mean().item())
+
+
+def _binary_auroc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    scores = scores.flatten().float()
+    labels = labels.flatten().bool()
+    valid = torch.isfinite(scores)
+    scores = scores[valid]
+    labels = labels[valid]
+    positives = labels.sum()
+    negatives = (~labels).sum()
+    if positives == 0 or negatives == 0:
+        return float("nan")
+    order = torch.argsort(scores)
+    ranks = torch.empty_like(scores, dtype=torch.float32)
+    ranks[order] = torch.arange(1, scores.numel() + 1, device=scores.device, dtype=torch.float32)
+    pos_ranks = ranks[labels].sum()
+    auc = (pos_ranks - positives.float() * (positives.float() + 1.0) / 2.0) / (positives.float() * negatives.float())
+    return float(auc.item())
+
+
+def _binary_auprc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    scores = scores.flatten().float()
+    labels = labels.flatten().bool()
+    valid = torch.isfinite(scores)
+    scores = scores[valid]
+    labels = labels[valid]
+    positives = labels.sum().float()
+    if positives == 0 or scores.numel() == 0:
+        return float("nan")
+    order = torch.argsort(scores, descending=True)
+    sorted_labels = labels[order].float()
+    tp = torch.cumsum(sorted_labels, dim=0)
+    precision = tp / torch.arange(1, sorted_labels.numel() + 1, device=scores.device, dtype=torch.float32)
+    recall = tp / positives.clamp(min=1.0)
+    recall_prev = torch.cat([recall.new_zeros(1), recall[:-1]])
+    return float(((recall - recall_prev) * precision).sum().item())
+
+
+def _spearman_correlation(a: torch.Tensor, b: torch.Tensor) -> float:
+    a = a.flatten().float()
+    b = b.flatten().float()
+    valid = torch.isfinite(a) & torch.isfinite(b)
+    a = a[valid]
+    b = b[valid]
+    if a.numel() < 2:
+        return float("nan")
+    a_order = torch.argsort(a)
+    b_order = torch.argsort(b)
+    a_rank = torch.empty_like(a, dtype=torch.float32)
+    b_rank = torch.empty_like(b, dtype=torch.float32)
+    a_rank[a_order] = torch.arange(a.numel(), device=a.device, dtype=torch.float32)
+    b_rank[b_order] = torch.arange(b.numel(), device=b.device, dtype=torch.float32)
+    a_rank = a_rank - a_rank.mean()
+    b_rank = b_rank - b_rank.mean()
+    denom = a_rank.norm() * b_rank.norm()
+    if float(denom.item()) == 0.0:
+        return float("nan")
+    return float((a_rank * b_rank).sum().div(denom).item())
+
+
+def _selective_risk_for_sample(confidence: torch.Tensor, risk: torch.Tensor, coverage: float) -> float:
+    flat_confidence = confidence.flatten()
+    flat_risk = risk.flatten()
+    if flat_confidence.numel() == 0:
+        return float("nan")
+    coverage_count = max(1, min(flat_confidence.numel(), int(math.ceil(flat_confidence.numel() * min(max(float(coverage), 0.0), 1.0)))))
+    top_indices = torch.topk(flat_confidence, k=coverage_count).indices
+    return float(flat_risk[top_indices].mean().item())
+
+
+def _physical_aurc_for_sample(confidence: torch.Tensor, risk: torch.Tensor) -> float:
+    flat_confidence = confidence.flatten()
+    flat_risk = risk.flatten()
+    if flat_confidence.numel() == 0:
+        return float("nan")
+    order = torch.argsort(flat_confidence, descending=True)
+    sorted_risk = flat_risk[order]
+    cumulative_risk = torch.cumsum(sorted_risk, dim=0) / torch.arange(1, sorted_risk.numel() + 1, device=sorted_risk.device, dtype=sorted_risk.dtype)
+    return float(cumulative_risk.mean().item())
+
+
+def _agreement_metrics(predicted_verdict: torch.Tensor, reference_verdict: torch.Tensor) -> dict[str, float]:
+    pred = predicted_verdict.detach().flatten().long()
+    ref = reference_verdict.detach().flatten().long().to(device=pred.device)
+    valid = torch.isfinite(ref.float())
+    pred = pred[valid]
+    ref = ref[valid]
+    if pred.numel() == 0:
+        return {"verifier_agreement_accuracy": float("nan"), "verifier_agreement_macro_f1": float("nan")}
+    accuracy = float((pred == ref).float().mean().item())
+    classes = torch.unique(torch.cat([pred, ref])).tolist()
+    f1s: list[float] = []
+    for cls in classes:
+        pred_pos = pred == int(cls)
+        ref_pos = ref == int(cls)
+        tp = (pred_pos & ref_pos).float().sum()
+        fp = (pred_pos & ~ref_pos).float().sum()
+        fn = (~pred_pos & ref_pos).float().sum()
+        denom = 2 * tp + fp + fn
+        f1s.append(float("nan") if float(denom.item()) == 0.0 else float((2 * tp / denom).item()))
+    return {"verifier_agreement_accuracy": accuracy, "verifier_agreement_macro_f1": _finite_mean(f1s)}
 
 
 def compute_trace_metrics(
     output,
     confidence_threshold: float = 0.8,
     violation_threshold: float = 0.5,
-    coverage: float = 0.2,
+    coverage: float = 1.0,
     invalid_threshold: float | None = None,
     conflict_threshold: float | None = None,
-) -> dict[str, float]:
-    """Compute FocalTrace metrics from a pipeline output object."""
+    reference_type: str = "internal_verifier",
+) -> dict[str, object]:
+    """Compute verifier-derived FocalTrace metrics with explicit reference semantics."""
+    allowed_reference_types = {"internal_verifier", "heldout_verifier", "synthetic_ground_truth", "human_annotation"}
+    if reference_type not in allowed_reference_types:
+        raise ValueError(f"reference_type must be one of {sorted(allowed_reference_types)}, got {reference_type!r}")
     invalid_threshold = violation_threshold if invalid_threshold is None else invalid_threshold
     conflict_threshold = violation_threshold if conflict_threshold is None else conflict_threshold
     trace = getattr(output, "physical_verification_trace", None)
     if trace is None:
         nan = float("nan")
         return {
-            "physical_hallucination_rate": float("nan"),
-            "invalid_overconfidence_rate": float("nan"),
-            "VPR_at_coverage": float("nan"),
-            "VPR_at_coverage_std": float("nan"),
+            "reference_type": reference_type,
+            "high_confidence_physical_violation_rate": nan,
+            "HCPVR": nan,
+            "selective_physical_risk_at_coverage": nan,
+            "physical_risk_coverage_auc": nan,
+            "Physical-AURC": nan,
+            "invalid_overconfidence_rate": nan,
+            "accepted_coverage": nan,
             "coverage": float(coverage),
-            "accepted_coverage": float("nan"),
-            "mean_conflict_score": float("nan"),
-            "mean_invalid_score": float("nan"),
-            "invalid_calibration_error": float("nan"),
+            "error_violation_detection_auroc": nan,
+            "error_violation_detection_auprc": nan,
+            "uncertainty_error_spearman": nan,
             "diagnostics": {},
         }
 
     conflict = trace.conflict_score.detach().float().clamp(0.0, 1.0)
     invalid = trace.invalid_score.detach().float().clamp(0.0, 1.0)
+    physical_risk = torch.maximum(conflict, invalid).clamp(0.0, 1.0)
     uncertainty = _as_bchw(getattr(output, "uncertainty_final", None))
     if uncertainty is None:
         uncertainty = _as_bchw(getattr(output, "uncertainty", None))
@@ -103,50 +185,99 @@ def compute_trace_metrics(
         uncertainty = uncertainty.detach().float().clamp(0.0, 1.0)
         if uncertainty.shape[-2:] != conflict.shape[-2:]:
             uncertainty = F.interpolate(uncertainty, size=conflict.shape[-2:], mode="bilinear", align_corners=False)
-
-    uncertainty = uncertainty.float().clamp(0.0, 1.0)
-    confidence = (1.0 - uncertainty).clamp(0.0, 1.0)
+    confidence = (1.0 - uncertainty.float().clamp(0.0, 1.0)).clamp(0.0, 1.0)
     high_confidence = confidence >= confidence_threshold
-    physically_valid_evidence = invalid < invalid_threshold
-    conflict_event = conflict >= conflict_threshold
-    phr_denominator = (high_confidence & physically_valid_evidence).float().sum()
-    phr_numerator = (high_confidence & physically_valid_evidence & conflict_event).float().sum()
-    ior_denominator = (invalid >= invalid_threshold).float().sum()
-    ior_numerator = (high_confidence & (invalid >= invalid_threshold)).float().sum()
-    phr = _safe_ratio(phr_numerator, phr_denominator)
-    ior = _safe_ratio(ior_numerator, ior_denominator)
+    violation_event = (conflict >= conflict_threshold) | (invalid >= invalid_threshold)
+    physically_accepted = invalid < invalid_threshold
 
-    vpr_mean, vpr_std = _sample_vpr_at_coverage(
-        confidence=confidence,
-        conflict=conflict,
-        invalid=invalid,
-        coverage=coverage,
-        conflict_threshold=conflict_threshold,
-        invalid_threshold=invalid_threshold,
-    )
+    sample_hcpvr: list[float] = []
+    sample_ior: list[float] = []
+    sample_accepted_coverage: list[float] = []
+    sample_selective_risk: list[float] = []
+    sample_aurc: list[float] = []
+    for index in range(conflict.shape[0]):
+        high = high_confidence[index]
+        violation = violation_event[index]
+        invalid_event = invalid[index] >= invalid_threshold
+        accepted = physically_accepted[index]
+        high_count = high.float().sum()
+        invalid_count = invalid_event.float().sum()
+        sample_hcpvr.append(_safe_ratio((high & violation).float().sum(), high_count))
+        sample_ior.append(_safe_ratio((high & invalid_event).float().sum(), invalid_count))
+        sample_accepted_coverage.append(float((high & accepted).float().sum().item() / max(high.numel(), 1)))
+        sample_selective_risk.append(_selective_risk_for_sample(confidence[index], physical_risk[index], coverage))
+        sample_aurc.append(_physical_aurc_for_sample(confidence[index], physical_risk[index]))
 
-    physically_valid = (invalid < invalid_threshold).to(dtype=focus_support.dtype)
-    focus_supported_valid_mass = (focus_support * physically_valid).mean()
-    invalid_calibration_error = torch.abs(uncertainty - invalid).mean()
-    accepted_coverage = float(phr_denominator.item() / max(high_confidence.numel(), 1))
-
-    return {
-        "physical_hallucination_rate": phr,
-        "invalid_overconfidence_rate": ior,
-        "VPR_at_coverage": vpr_mean,
-        "VPR_at_coverage_std": vpr_std,
+    auroc = _binary_auroc(uncertainty, violation_event)
+    auprc = _binary_auprc(uncertainty, violation_event)
+    spearman = _spearman_correlation(uncertainty, physical_risk)
+    hcpvr = _finite_mean(sample_hcpvr)
+    physical_aurc = _finite_mean(sample_aurc)
+    metrics: dict[str, object] = {
+        "reference_type": reference_type,
+        "high_confidence_physical_violation_rate": hcpvr,
+        "HCPVR": hcpvr,
+        "selective_physical_risk_at_coverage": _finite_mean(sample_selective_risk),
+        "physical_risk_coverage_auc": physical_aurc,
+        "Physical-AURC": physical_aurc,
+        "invalid_overconfidence_rate": _finite_mean(sample_ior),
+        "accepted_coverage": _finite_mean(sample_accepted_coverage),
         "coverage": float(coverage),
-        "accepted_coverage": accepted_coverage,
         "mean_conflict_score": float(conflict.mean().item()),
         "mean_invalid_score": float(invalid.mean().item()),
-        "invalid_calibration_error": float(invalid_calibration_error.item()),
+        "error_violation_detection_auroc": auroc,
+        "error_violation_detection_auprc": auprc,
+        "uncertainty_error_spearman": spearman,
         "diagnostics": {
-            "focus_supported_valid_mass": float(focus_supported_valid_mass.item()),
-            "phr_denominator": float(phr_denominator.item()),
-            "ior_denominator": float(ior_denominator.item()),
+            "high_confidence_denominator": float(high_confidence.float().sum().item()),
+            "invalid_denominator": float((invalid >= invalid_threshold).float().sum().item()),
+            "sample_count": int(conflict.shape[0]),
         },
     }
+    reference_verdict = getattr(output, "reference_verdict", None)
+    if reference_verdict is None:
+        reference_verdict = getattr(trace, "reference_verdict", None)
+    if reference_verdict is not None:
+        predicted_verdict = torch.stack([
+            1.0 - physical_risk.squeeze(1),
+            conflict.squeeze(1),
+            invalid.squeeze(1),
+        ], dim=1).argmax(dim=1)
+        metrics.update(_agreement_metrics(predicted_verdict, _as_bchw(reference_verdict).squeeze(1)))
+    return metrics
 
+
+def _summarize_numeric_metrics(metric_rows: list[dict[str, object]]) -> dict[str, object]:
+    """Summarize sample-level numeric metrics without flattening pixels across samples."""
+    summary: dict[str, object] = {}
+    keys = sorted({key for row in metric_rows for key in row.keys()})
+    for key in keys:
+        values = [row[key] for row in metric_rows if key in row and isinstance(row[key], (int, float))]
+        if not values:
+            continue
+        array = np.asarray(values, dtype=np.float64)
+        summary[key] = {
+            "mean": float(np.nanmean(array)),
+            "std": float(np.nanstd(array)),
+            "median": float(np.nanmedian(array)),
+        }
+    reference_types = sorted({str(row.get("reference_type")) for row in metric_rows if row.get("reference_type") is not None})
+    if reference_types:
+        summary["reference_type"] = reference_types[0] if len(reference_types) == 1 else reference_types
+    summary["aggregation"] = "sample_mean"
+    return summary
+
+
+def aggregate_dataset_metric_groups(dataset_metrics: dict[str, list[dict[str, object]]]) -> dict[str, object]:
+    """Aggregate per-dataset sample metrics as dataset macro means, never pixel-flattened."""
+    per_dataset = {name: _summarize_numeric_metrics(rows) for name, rows in dataset_metrics.items()}
+    macro: dict[str, object] = {}
+    numeric_keys = sorted({key for metrics in per_dataset.values() for key, value in metrics.items() if isinstance(value, dict) and "mean" in value})
+    for key in numeric_keys:
+        values = [metrics[key]["mean"] for metrics in per_dataset.values() if key in metrics and isinstance(metrics[key], dict)]
+        if values:
+            macro[key] = float(np.nanmean(np.asarray(values, dtype=np.float64)))
+    return {"per_dataset": per_dataset, "dataset_macro_mean": macro, "aggregation": "sample_mean_then_dataset_macro_mean"}
 
 def _to_numpy_map(value: torch.Tensor) -> np.ndarray:
     """Convert a tensor map to a normalized 2-D numpy array for visualization."""
@@ -183,7 +314,7 @@ def save_trace_visualizations(output, output_dir: Path, prefix: str) -> None:
     _save_map_png(trace.focus_support, output_dir / f"{prefix}_focus_support.png", cmap="viridis")
     _save_map_png(trace.conflict_score, output_dir / f"{prefix}_conflict_score.png", cmap="inferno")
     _save_map_png(trace.invalid_score, output_dir / f"{prefix}_invalid_score.png", cmap="inferno")
-    physical_verdict = trace.verdict_logits.detach().argmax(dim=1, keepdim=True).float()
+    physical_verdict = trace.verdict_scores.detach().argmax(dim=1, keepdim=True).float()
     _save_map_png(physical_verdict, output_dir / f"{prefix}_physical_verdict.png", cmap="tab10")
 
 
@@ -324,17 +455,14 @@ def evaluate(args):
             sample_metrics["generated_focal_depth_disagreement"] = float(torch.abs(output.generated_depth_canonical - output.focal_depth_canonical).mean().item())
         all_metrics.append(sample_metrics)
 
-    keys = sorted({k for m in all_metrics for k in m.keys()})
-    final_metrics = {}
-    for key in keys:
-        values = [m[key] for m in all_metrics if key in m]
-        final_metrics[key] = {'mean': float(np.mean(values)), 'std': float(np.std(values)), 'median': float(np.median(values))}
-
-    trace_keys = sorted({k for m in all_trace_metrics for k in m.keys()})
-    final_trace_metrics = {}
-    for key in trace_keys:
-        values = [m[key] for m in all_trace_metrics if key in m]
-        final_trace_metrics[key] = {'mean': float(np.mean(values)), 'std': float(np.std(values)), 'median': float(np.median(values))}
+    final_metrics = _summarize_numeric_metrics(all_metrics)
+    final_trace_metrics = _summarize_numeric_metrics(all_trace_metrics)
+    final_trace_metrics["dataset"] = args.dataset
+    final_trace_metrics["thresholds"] = {
+        "confidence_threshold": float(args.confidence_threshold),
+        "violation_threshold": float(args.violation_threshold),
+        "coverage": float(args.coverage),
+    }
 
     with open(output_dir / 'metrics.json', 'w') as f:
         json.dump(final_metrics, f, indent=2)
@@ -381,7 +509,7 @@ def main():
         '--coverage',
         type=float,
         default=0.2,
-        help='Top-confidence coverage fraction for VPR_at_coverage',
+        help='Top-confidence coverage fraction for selective_physical_risk_at_coverage',
     )
     args = parser.parse_args()
     evaluate(args)

@@ -294,7 +294,6 @@ def test_focal_physical_verifier_trace_shapes_for_batch_first_stack():
         "operator_agreement",
         "texture_confidence",
         "depth_focus_discrepancy",
-        "defocus_residual",
         "stack_reprojection_residual",
         "focus_support",
         "generation_support",
@@ -305,9 +304,7 @@ def test_focal_physical_verifier_trace_shapes_for_batch_first_stack():
     assert trace.focus_peak_index.dtype == torch.long
     assert trace.focus_peak_coordinate.min() >= 0
     assert trace.focus_peak_coordinate.max() <= 1
-    with pytest.warns(DeprecationWarning, match="focus_peak is deprecated"):
-        assert torch.equal(trace.focus_peak, trace.focus_peak_confidence)
-    assert trace.verdict_logits.shape == (B, 3, H, W)
+    assert trace.verdict_scores.shape == (B, 3, H, W)
     for value in trace.__dict__.values():
         if isinstance(value, torch.Tensor) and value.is_floating_point():
             assert torch.isfinite(value).all()
@@ -368,7 +365,7 @@ def test_trace_refinement_accepts_only_improved_physical_risk():
     assert after_reject > before_reject
 
 
-def test_evaluate_trace_metrics_computes_phr_vpr_at_coverage():
+def test_evaluate_trace_metrics_computes_hcpvr_selective_risk_at_coverage():
     from types import SimpleNamespace
 
     from script.evaluate import compute_trace_metrics
@@ -383,13 +380,16 @@ def test_evaluate_trace_metrics_computes_phr_vpr_at_coverage():
         physical_verification_trace=trace,
     )
 
-    assert "FCPV" in metrics
-    assert "FCPV_soft" in metrics
-    assert "PVPR_at_coverage" in metrics
-    assert "coverage" in metrics
-    assert "mean_conflict_score" in metrics
-    assert "mean_invalid_score" in metrics
-    assert "uncertainty_violation_alignment" in metrics
+    metrics = compute_trace_metrics(output, confidence_threshold=0.5, violation_threshold=0.5, coverage=0.5)
+
+    assert metrics["high_confidence_physical_violation_rate"] == pytest.approx(2 / 3)
+    assert metrics["selective_physical_risk_at_coverage"] == pytest.approx(0.45)
+    assert metrics["invalid_overconfidence_rate"] == pytest.approx(0.0)
+    assert metrics["accepted_coverage"] == pytest.approx(0.75)
+    assert metrics["coverage"] == pytest.approx(0.5)
+    assert metrics["mean_conflict_score"] == pytest.approx(0.4)
+    assert metrics["mean_invalid_score"] == pytest.approx(0.375)
+    assert "error_violation_detection_auroc" in metrics
 
 
 def test_training_trace_loss_uses_detached_verifier_targets_and_backpropagates_proxies():
@@ -418,23 +418,37 @@ def test_training_trace_loss_uses_detached_verifier_targets_and_backpropagates_p
     diffusion_pred = torch.zeros(B, 4, requires_grad=True)
     diffusion_target = torch.zeros(B, 4)
 
-    assert "FCPV" not in metrics
-    assert "PVPR" not in metrics
-    assert "PHR" not in metrics
-    assert "false_confident_violation_rate" not in metrics
-    assert metrics["physical_hallucination_rate"] == pytest.approx(2 / 3)
-    assert metrics["VPR_at_coverage"] == pytest.approx(0.5)
-    assert metrics["VPR_at_coverage_std"] == pytest.approx(0.0)
-    assert metrics["invalid_overconfidence_rate"] == pytest.approx(0.0)
-    assert metrics["accepted_coverage"] == pytest.approx(0.75)
-    assert metrics["coverage"] == pytest.approx(0.5)
-    assert metrics["diagnostics"]["focus_supported_valid_mass"] == pytest.approx(0.75)
-    assert metrics["mean_conflict_score"] == pytest.approx(0.4)
-    assert metrics["mean_invalid_score"] == pytest.approx(0.375)
-    assert "invalid_calibration_error" in metrics
+    from src.training.losses import FocalStackGenerationLoss
+
+    loss_fn = FocalStackGenerationLoss(lambda_trace=0.5, lambda_violation=0.5, lambda_invalid=0.5)
+    loss_dict = loss_fn(
+        diffusion_pred=diffusion_pred,
+        diffusion_target=diffusion_target,
+        physical_verification_trace=trace,
+        physical_evidence_support=predicted_support,
+        predicted_verification_support=predicted_support,
+        predicted_verification_invalid=predicted_invalid,
+        uncertainty=predicted_invalid,
+    )
+
+    assert trace.conflict_score.shape == (B, 1, H, W)
+    assert trace.invalid_score.shape == (B, 1, H, W)
+    assert trace.verdict_scores.shape == (B, 3, H, W)
+    assert not trace.conflict_score.requires_grad
+    assert loss_dict["loss_trace"].item() > 0.0
+    assert torch.isfinite(loss_dict["loss_violation"])
+    assert torch.isfinite(loss_dict["mean_conflict_score"])
+    assert torch.isfinite(loss_dict["false_confident_violation_rate"])
+
+    loss_dict["total"].backward()
+
+    assert support_logits.grad is not None
+    assert invalid_logits.grad is not None
+    assert torch.isfinite(support_logits.grad).all()
+    assert torch.isfinite(invalid_logits.grad).all()
 
 
-def test_evaluate_trace_metrics_returns_nan_for_empty_phr_denominator():
+def test_evaluate_trace_metrics_returns_hcpvr_for_high_confidence_invalid():
     from types import SimpleNamespace
 
     from script.evaluate import compute_trace_metrics
@@ -451,12 +465,12 @@ def test_evaluate_trace_metrics_returns_nan_for_empty_phr_denominator():
 
     metrics = compute_trace_metrics(output, confidence_threshold=0.5, violation_threshold=0.5, coverage=0.5)
 
-    assert math.isnan(metrics["physical_hallucination_rate"])
+    assert metrics["high_confidence_physical_violation_rate"] == pytest.approx(1.0)
     assert metrics["invalid_overconfidence_rate"] == pytest.approx(1.0)
     assert metrics["accepted_coverage"] == pytest.approx(0.0)
 
 
-def test_evaluate_trace_metrics_vpr_is_per_sample_mean_and_std():
+def test_evaluate_trace_metrics_selective_risk_is_per_sample_mean():
     from types import SimpleNamespace
 
     from script.evaluate import compute_trace_metrics
@@ -473,8 +487,8 @@ def test_evaluate_trace_metrics_vpr_is_per_sample_mean_and_std():
 
     metrics = compute_trace_metrics(output, confidence_threshold=0.5, violation_threshold=0.5, coverage=0.5)
 
-    assert metrics["VPR_at_coverage"] == pytest.approx(0.25)
-    assert metrics["VPR_at_coverage_std"] == pytest.approx(0.25)
+    assert metrics["selective_physical_risk_at_coverage"] == pytest.approx(0.65)
+    assert "physical_risk_coverage_auc" in metrics
 
 
 def test_serialize_refinement_history_compacts_tensors_for_json():
@@ -493,31 +507,9 @@ def test_serialize_refinement_history_compacts_tensors_for_json():
             }
         ]
     )
-    loss_dict = loss_fn(
-        diffusion_pred=diffusion_pred,
-        diffusion_target=diffusion_target,
-        physical_verification_trace=trace,
-        physical_evidence_support=predicted_support,
-        predicted_verification_support=predicted_support,
-        predicted_verification_invalid=predicted_invalid,
-        uncertainty=predicted_invalid,
-    )
-
-    assert trace.conflict_score.shape == (B, 1, H, W)
-    assert trace.invalid_score.shape == (B, 1, H, W)
-    assert trace.verdict_logits.shape == (B, 3, H, W)
-    assert not trace.conflict_score.requires_grad
-    assert loss_dict["loss_trace"].item() > 0.0
-    assert torch.isfinite(loss_dict["loss_violation"])
-    assert torch.isfinite(loss_dict["mean_conflict_score"])
-    assert torch.isfinite(loss_dict["false_confident_violation_rate"])
-
-    loss_dict["total"].backward()
-
-    assert support_logits.grad is not None
-    assert invalid_logits.grad is not None
-    assert torch.isfinite(support_logits.grad).all()
-    assert torch.isfinite(invalid_logits.grad).all()
+    assert curve[0]["step"] == 2
+    assert curve[0]["final_depth_canonical"]["shape"] == [1, 1, 2, 2]
+    assert curve[0]["uncertainty_final"]["mean"] == pytest.approx(1.0)
 
 
 def test_trace_refinement_accepts_only_when_risk_improves_by_epsilon():
