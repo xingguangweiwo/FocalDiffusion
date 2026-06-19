@@ -90,6 +90,10 @@ class FocalStackGenerationOutput(BaseOutput):
     uncertainty_final: Optional[torch.Tensor] = None
     depth_focus_metric: Optional[torch.Tensor] = None
     physical_verification_trace: Optional[PhysicalVerificationTrace] = None
+    accepted_refinement_steps: int = 0
+    rejected_refinement_steps: int = 0
+    physical_risk_before: Optional[torch.Tensor] = None
+    physical_risk_after: Optional[torch.Tensor] = None
 
 
 class FocalInjectedSD3Transformer(nn.Module):
@@ -120,7 +124,6 @@ class FocalInjectedSD3Transformer(nn.Module):
         self.post_scale = nn.Parameter(torch.tensor(1.0))
 
         self.condition_adapter = nn.Conv2d(condition_channels, hidden_size, kernel_size=1)
-        self._condition_adapters = nn.ModuleDict()
         self.dtype = getattr(base, "dtype", torch.float32)
         self.condition_adapter.to(device=self._base_device, dtype=self.dtype)
 
@@ -217,11 +220,13 @@ class FocalInjectedSD3Transformer(nn.Module):
         return (result,)
 
     def _get_condition_adapter(self, channels: int) -> nn.Conv2d:
-        key = str(channels)
-        if key not in self._condition_adapters:
-            adapter = nn.Conv2d(channels, self.config.attention_head_dim * self.config.num_attention_heads, kernel_size=1)
-            self._condition_adapters[key] = adapter
-        return self._condition_adapters[key]
+        if channels != self.condition_channels:
+            raise ValueError(
+                "Focal condition channel mismatch: "
+                f"expected {self.condition_channels}, got {channels}. "
+                "Condition adapters are fixed at initialization; rebuild the pipeline with a matching focal_processor."
+            )
+        return self.condition_adapter
 
     @staticmethod
     def _match_condition_batch(condition: torch.Tensor, target_batch: int) -> torch.Tensor:
@@ -250,11 +255,8 @@ class FocalInjectedSD3Transformer(nn.Module):
         if fused.shape[-2:] != spatial_size:
             fused = F.interpolate(fused, size=spatial_size, mode="bilinear", align_corners=False)
 
-        if fused.shape[1] == self.condition_channels:
-            conditioned = self.condition_adapter.to(device=fused.device, dtype=fused.dtype)(fused)
-        else:
-            adapter = self._get_condition_adapter(fused.shape[1]).to(device=fused.device, dtype=fused.dtype)
-            conditioned = adapter(fused)
+        adapter = self._get_condition_adapter(fused.shape[1]).to(device=fused.device, dtype=fused.dtype)
+        conditioned = adapter(fused)
 
         spatial_maps = focal_features.get("temporal_attention_maps")
         if spatial_maps is not None:
@@ -529,6 +531,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         return_dict: bool = True,
         focal_distance_mode: str = "normalized",
         num_refinement_steps: int = 0,
+        trace_refinement_epsilon: float = 1e-4,
         **kwargs: Any,
     ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, Union[torch.Tensor, Image.Image]]]:
         """Generate canonical depth and all-in-focus outputs from a focal stack.
@@ -560,7 +563,9 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
                 f"got {focal_distance_mode!r}."
             )
 
-        kwargs.clear()
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected FocalStackGenerationPipeline arguments: {unexpected}")
         if focal_plane_distances is None:
             raise ValueError("focal_plane_distances is required.")
 
@@ -730,29 +735,41 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
 
 
         verifier_device, verifier_dtype = _module_device_dtype(self.physical_verifier, torch.device(device), dtype)
-        verification_trace = self.physical_verifier(
-            focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
-            focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
-            depth_canonical=final_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
-            all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
-            generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
-        )
+
+        def run_verifier(depth: torch.Tensor) -> PhysicalVerificationTrace:
+            return self.physical_verifier(
+                focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
+                focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
+                depth_canonical=depth.to(device=verifier_device, dtype=verifier_dtype),
+                all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
+                generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+            )
+
+        verification_trace = run_verifier(final_depth_canonical)
+        initial_physical_risk = self._physical_risk(verification_trace).detach()
+        current_physical_risk = initial_physical_risk
+        accepted_refinement_steps = 0
+        rejected_refinement_steps = 0
         for _ in range(num_refinement_steps):
-            final_depth_canonical, uncertainty_final = self._apply_trace_refinement(
+            candidate_depth, candidate_uncertainty = self._apply_trace_refinement(
                 final_depth_canonical=final_depth_canonical,
                 focal_depth_canonical=focal_depth_canonical,
                 generated_depth_canonical=generated_depth_canonical,
                 uncertainty_final=uncertainty_final,
                 trace=verification_trace,
             )
-            depth_map = final_depth_canonical.squeeze(1)
-            verification_trace = self.physical_verifier(
-                focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
-                focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
-                depth_canonical=final_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
-                all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
-                generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
-            )
+            candidate_trace = run_verifier(candidate_depth)
+            candidate_physical_risk = self._physical_risk(candidate_trace).detach()
+            if self._should_accept_refinement(current_physical_risk, candidate_physical_risk, trace_refinement_epsilon):
+                final_depth_canonical = candidate_depth
+                uncertainty_final = candidate_uncertainty
+                verification_trace = candidate_trace
+                current_physical_risk = candidate_physical_risk
+                accepted_refinement_steps += 1
+                depth_map = final_depth_canonical.squeeze(1)
+            else:
+                rejected_refinement_steps += 1
+                break
 
         if output_type == "pil":
             image = self.numpy_to_pil(recon.cpu().permute(0, 2, 3, 1).numpy())[0]
@@ -788,7 +805,23 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             uncertainty_final=uncertainty_final.squeeze(1),
             depth_focus_metric=depth_focus_metric,
             physical_verification_trace=verification_trace,
+            accepted_refinement_steps=accepted_refinement_steps,
+            rejected_refinement_steps=rejected_refinement_steps,
+            physical_risk_before=initial_physical_risk,
+            physical_risk_after=current_physical_risk,
         )
+
+
+    @staticmethod
+    def _physical_risk(trace: PhysicalVerificationTrace) -> torch.Tensor:
+        conflict = trace.conflict_score.detach().float().clamp(0.0, 1.0)
+        invalid = trace.invalid_score.detach().float().clamp(0.0, 1.0)
+        return (0.5 * (conflict + invalid)).mean()
+
+
+    @staticmethod
+    def _should_accept_refinement(current_risk: torch.Tensor, candidate_risk: torch.Tensor, epsilon: float) -> bool:
+        return bool((candidate_risk <= current_risk - float(epsilon)).item())
 
 
     @staticmethod

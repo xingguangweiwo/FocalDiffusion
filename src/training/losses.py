@@ -424,10 +424,10 @@ class FocalStackGenerationLoss(nn.Module):
         local_affinity_sigma: float = 0.10,
         verification_conflict_weight: float = 0.02,
         verification_invalid_weight: float = 0.02,
-        lambda_trace: float = 1.0,
-        lambda_violation: float = 1.0,
-        lambda_preference: float = 1.0,
-        lambda_invalid: float = 1.0,
+        lambda_trace: float = 0.05,
+        lambda_violation: float = 0.05,
+        lambda_preference: float = 0.05,
+        lambda_invalid: float = 0.05,
     ) -> None:
         super().__init__()
         self.diffusion_weight = diffusion_weight

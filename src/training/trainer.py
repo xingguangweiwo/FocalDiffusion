@@ -11,7 +11,6 @@ import json
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from accelerate import Accelerator
@@ -254,6 +253,8 @@ class FocalStackGenerationTrainer:
         self.focal_evidence_head = self.pipeline.focal_evidence_head
         self.task_output_decoder = self.pipeline.task_output_decoder
         self.physical_evidence_support_head = self.pipeline.physical_evidence_support_head
+        self.pipeline.physical_verifier.requires_grad_(False)
+        self.pipeline.physical_verifier.eval()
 
         # Configure trainable parameters
         self._configure_trainable_params()
@@ -355,7 +356,6 @@ class FocalStackGenerationTrainer:
             self.val_dataloader,
             self.lr_scheduler,
         )
-        self.scaler = GradScaler() if self.config['training']['mixed_precision'] == 'fp16' else None
 
     def _iter_pipeline_parameters(self, only_trainable: bool = False):
         if hasattr(self.pipeline, "parameters"):
@@ -394,8 +394,7 @@ class FocalStackGenerationTrainer:
         best_val_loss = float('inf')
         for epoch in range(self.config['training']['num_epochs']):
             self.current_epoch = epoch
-            train_loss = self.train_epoch(epoch, self.global_step)
-            self.global_step += len(self.train_dataloader)
+            train_loss = self.train_epoch(epoch)
             if epoch % self.config['training']['val_every_n_epochs'] == 0:
                 val_metrics = self.validate(epoch)
                 if self.accelerator.is_main_process:
@@ -412,10 +411,11 @@ class FocalStackGenerationTrainer:
         self.save_checkpoint(epoch, self.global_step, is_final=True)
         logger.info("Training completed!")
 
-    def train_epoch(self, epoch: int, global_step: int) -> float:
+    def train_epoch(self, epoch: int, global_step: int | None = None) -> float:
         from ..training.losses import FocalStackGenerationLoss
 
         self.pipeline.train()
+        self.pipeline.physical_verifier.eval()
         epoch_loss = 0.0
         effective_steps = 0
         supervision_mode = self.config['training'].get('supervision_mode', 'supervised')
@@ -441,6 +441,10 @@ class FocalStackGenerationTrainer:
             focus_target_temperature=self.config['losses'].get('focus_target_temperature', 0.07),
             focal_target_type=self.config["losses"].get("focal_target_type", "normalized"),
             coc_posterior_temperature=self.config["losses"].get("coc_posterior_temperature", 1.0),
+            lambda_trace=self.config["losses"].get("lambda_trace", 0.05),
+            lambda_violation=self.config["losses"].get("lambda_violation", 0.05),
+            lambda_invalid=self.config["losses"].get("lambda_invalid", 0.05),
+            lambda_preference=self.config["losses"].get("lambda_preference", 0.05),
             supervision_mode=supervision_mode,
         )
         loss_fn = loss_fn.to(self.accelerator.device)
@@ -451,6 +455,9 @@ class FocalStackGenerationTrainer:
             desc=f"Epoch {epoch}",
             disable=not self.accelerator.is_local_main_process,
         )
+
+        if global_step is not None:
+            self.global_step = global_step
 
         for step, batch in enumerate(progress_bar):
             with self.accelerator.accumulate(self.pipeline):
@@ -524,7 +531,7 @@ class FocalStackGenerationTrainer:
                     batch_size=model_input.shape[0],
                 )
 
-                with autocast(enabled=self.scaler is not None):
+                with self.accelerator.autocast():
                     diffusion_pred = self.pipeline.transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
@@ -580,6 +587,14 @@ class FocalStackGenerationTrainer:
                         return_dict=False
                     )[0]
                     rgb_recon = rgb_recon.clamp(-1, 1)
+                    with torch.no_grad():
+                        physical_verification_trace = self.pipeline.physical_verifier(
+                            focal_stack.detach().float(),
+                            focal_plane_distances.detach().float(),
+                            final_depth_canonical.detach().float(),
+                            rgb_recon.detach().float(),
+                            generated_depth_canonical.detach().float(),
+                        )
 
                     # Cast tensors for stable loss computation
                     diffusion_pred = diffusion_pred.float()
@@ -608,6 +623,9 @@ class FocalStackGenerationTrainer:
                         generative_prior_weight=generative_prior_weight_norm.float(),
                         abstention_weight=abstention_weight.float(),
                         physical_evidence_support=support_outputs["physical_evidence_support"].float(),
+                        physical_verification_trace=physical_verification_trace,
+                        predicted_verification_support=support_outputs["physical_evidence_support"].float(),
+                        predicted_verification_invalid=uncertainty_final.float(),
                         camera_params=camera_params,
                     )
                     loss = loss_dict['total']
@@ -622,6 +640,8 @@ class FocalStackGenerationTrainer:
                 self.optimizer.zero_grad()
                 if self.ema is not None:
                     self.ema.step(self._ema_parameters())
+                if self.accelerator.sync_gradients:
+                    self.global_step += 1
 
                 effective_steps += 1
                 epoch_loss += loss.item()
@@ -639,7 +659,7 @@ class FocalStackGenerationTrainer:
                             'train_abstention_weight_mean': abstention_weight.mean().item(),
                             'train_physical_evidence_support_mean': support_outputs['physical_evidence_support'].mean().item(),
                             'train_generated_focal_depth_disagreement': support_maps['depth_disagreement'].mean().item(),
-                        }, step=global_step + step)
+                        }, step=self.global_step)
 
         if effective_steps == 0:
             return 0.0

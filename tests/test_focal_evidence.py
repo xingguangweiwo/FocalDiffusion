@@ -313,7 +313,7 @@ def test_trace_refinement_preserves_output_fields():
     assert out.physical_verification_trace is trace
 
 
-def test_evaluate_trace_metrics_computes_fcpv_pvpr():
+def test_evaluate_trace_metrics_computes_fcpv_pvpr_at_coverage():
     from src.models.physics_modules import FocalPhysicalVerifier
     from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationOutput
     from script.evaluate import compute_trace_metrics
@@ -329,7 +329,81 @@ def test_evaluate_trace_metrics_computes_fcpv_pvpr():
     metrics = compute_trace_metrics(output)
 
     assert "FCPV" in metrics
-    assert "PVPR" in metrics
-    assert "uncertainty_selective_focus_consistency" in metrics
+    assert "FCPV_soft" in metrics
+    assert "PVPR_at_coverage" in metrics
+    assert "coverage" in metrics
     assert "mean_conflict_score" in metrics
     assert "mean_invalid_score" in metrics
+    assert "uncertainty_violation_alignment" in metrics
+
+
+def test_training_trace_loss_uses_detached_verifier_targets_and_backpropagates_proxies():
+    from src.models.physics_modules import FocalPhysicalVerifier
+
+    B, N, C, H, W = 2, 4, 3, 12, 10
+    focal_stack = torch.rand(B, N, C, H, W) * 2.0 - 1.0
+    focal_plane_distances = torch.linspace(0.2, 1.0, N).repeat(B, 1)
+    final_depth_canonical = torch.rand(B, 1, H, W, requires_grad=True)
+    generated_depth_canonical = torch.rand(B, 1, H, W, requires_grad=True)
+    rgb_recon = torch.rand(B, C, H, W, requires_grad=True) * 2.0 - 1.0
+
+    with torch.no_grad():
+        trace = FocalPhysicalVerifier()(
+            focal_stack,
+            focal_plane_distances,
+            final_depth_canonical.detach(),
+            rgb_recon.detach(),
+            generated_depth_canonical.detach(),
+        )
+
+    support_logits = torch.randn(B, 1, H, W, requires_grad=True)
+    invalid_logits = torch.randn(B, 1, H, W, requires_grad=True)
+    predicted_support = torch.sigmoid(support_logits)
+    predicted_invalid = torch.sigmoid(invalid_logits)
+    diffusion_pred = torch.zeros(B, 4, requires_grad=True)
+    diffusion_target = torch.zeros(B, 4)
+
+    loss_fn = FocalStackGenerationLoss(
+        diffusion_weight=0.0,
+        depth_weight=0.0,
+        rgb_weight=0.0,
+        lambda_trace=0.05,
+        lambda_violation=0.05,
+        lambda_invalid=0.05,
+    )
+    loss_dict = loss_fn(
+        diffusion_pred=diffusion_pred,
+        diffusion_target=diffusion_target,
+        physical_verification_trace=trace,
+        physical_evidence_support=predicted_support,
+        predicted_verification_support=predicted_support,
+        predicted_verification_invalid=predicted_invalid,
+        uncertainty=predicted_invalid,
+    )
+
+    assert trace.conflict_score.shape == (B, 1, H, W)
+    assert trace.invalid_score.shape == (B, 1, H, W)
+    assert trace.verdict_logits.shape == (B, 3, H, W)
+    assert not trace.conflict_score.requires_grad
+    assert loss_dict["loss_trace"].item() > 0.0
+    assert torch.isfinite(loss_dict["loss_violation"])
+    assert torch.isfinite(loss_dict["mean_conflict_score"])
+    assert torch.isfinite(loss_dict["false_confident_violation_rate"])
+
+    loss_dict["total"].backward()
+
+    assert support_logits.grad is not None
+    assert invalid_logits.grad is not None
+    assert torch.isfinite(support_logits.grad).all()
+    assert torch.isfinite(invalid_logits.grad).all()
+
+
+def test_trace_refinement_accepts_only_when_risk_improves_by_epsilon():
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationPipeline
+
+    current_risk = torch.tensor(0.5)
+    improved_risk = torch.tensor(0.45)
+    marginal_risk = torch.tensor(0.499)
+
+    assert FocalStackGenerationPipeline._should_accept_refinement(current_risk, improved_risk, epsilon=0.01)
+    assert not FocalStackGenerationPipeline._should_accept_refinement(current_risk, marginal_risk, epsilon=0.01)
