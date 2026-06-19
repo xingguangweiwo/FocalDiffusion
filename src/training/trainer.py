@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
 from ..models.focal_evidence_encoder import build_physical_evidence_features
+from ..models.physics_modules import FocalPhysicalVerifier, _split_unit_and_signed_ranges
 
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,10 @@ class FocalStackGenerationTrainer:
             round_index=int(self.self_improvement_cfg.get('round_index', 0)),
             manifest_path=self.self_improvement_cfg.get('mining_manifest'),
         )
+        self.parent_checkpoint_sha256: str | None = None
+        self.mining_verifier_config_hash = self._verifier_config_hash(self.pipeline.physical_verifier)
         if bool(self.self_improvement_cfg.get('enabled', False)):
+            self._validate_self_improvement_round()
             self._freeze_physical_verifier()
 
         self.current_epoch = 0
@@ -191,6 +195,46 @@ class FocalStackGenerationTrainer:
                 f"overlapping filelists: {sorted(overlap)}"
             )
 
+
+    @staticmethod
+    def _verifier_config_hash(verifier: torch.nn.Module) -> str:
+        """Hash non-learned verifier configuration for manifest compatibility checks."""
+        if hasattr(verifier, "config_dict"):
+            payload = verifier.config_dict()
+        else:
+            payload = {"class": type(verifier).__name__, "repr": repr(verifier)}
+        encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _validate_self_improvement_round(self) -> None:
+        """Enforce M0→M1+ self-improvement round provenance before training."""
+        round_index = int(self.self_improvement_cfg.get("round_index", 0))
+        if round_index < 1:
+            raise ValueError("training.self_improvement.enabled=true requires round_index >= 1; train M0 with enabled=false.")
+        parent_checkpoint = self.self_improvement_cfg.get("parent_checkpoint")
+        if not parent_checkpoint:
+            raise ValueError("training.self_improvement.enabled=true requires parent_checkpoint.")
+        parent_path = Path(parent_checkpoint)
+        if not parent_path.exists():
+            raise FileNotFoundError(f"training.self_improvement.parent_checkpoint does not exist: {parent_path}")
+        self.parent_checkpoint_sha256 = checkpoint_sha256(parent_path)
+        manifest_path = self.trace_mining_buffer.manifest_path
+        if manifest_path is None:
+            raise ValueError("training.self_improvement.enabled=true requires mining_manifest for checkpoint/verifier provenance.")
+        if manifest_path and self.trace_mining_buffer.metadata:
+            manifest_parent = self.trace_mining_buffer.metadata.get("parent_checkpoint_sha256")
+            manifest_verifier = self.trace_mining_buffer.metadata.get("verifier_config_hash")
+            if manifest_parent != self.parent_checkpoint_sha256:
+                raise ValueError("mining manifest parent checkpoint SHA256 does not match training.self_improvement.parent_checkpoint")
+            if manifest_verifier != self.mining_verifier_config_hash:
+                raise ValueError("mining manifest verifier config hash does not match current mining verifier")
+        elif manifest_path and manifest_path.exists():
+            raise ValueError("existing mining manifest is missing parent checkpoint/verifier metadata")
+        self.trace_mining_buffer.set_metadata(
+            parent_checkpoint_sha256=self.parent_checkpoint_sha256,
+            verifier_config_hash=self.mining_verifier_config_hash,
+        )
+
     def _freeze_physical_verifier(self) -> None:
         """Freeze the non-learned verifier during verifier-guided adaptation."""
         verifier = getattr(self.pipeline, "physical_verifier", None)
@@ -312,6 +356,11 @@ class FocalStackGenerationTrainer:
         self.physical_evidence_support_head = self.pipeline.physical_evidence_support_head
         self.pipeline.physical_verifier.requires_grad_(False)
         self.pipeline.physical_verifier.eval()
+        evaluation_cfg = self.config.get("validation", {}).get("evaluation_verifier", {}) or {}
+        eval_focus_operator = str(evaluation_cfg.get("focus_operator", "gradient_variance"))
+        self.evaluation_verifier = FocalPhysicalVerifier(focus_operator=eval_focus_operator).to(target_device)
+        self.evaluation_verifier.requires_grad_(False)
+        self.evaluation_verifier.eval()
 
         # Configure trainable parameters
         self._configure_trainable_params()
@@ -501,7 +550,6 @@ class FocalStackGenerationTrainer:
             lambda_trace=self.config["losses"].get("lambda_trace", 0.05),
             lambda_violation=self.config["losses"].get("lambda_violation", 0.05),
             lambda_invalid=self.config["losses"].get("lambda_invalid", 0.05),
-            lambda_preference=self.config["losses"].get("lambda_preference", 0.05),
             supervision_mode=supervision_mode,
         )
         loss_fn = loss_fn.to(self.accelerator.device)
@@ -567,10 +615,11 @@ class FocalStackGenerationTrainer:
                         for key, value in camera_params.items()
                     }
 
-                # Normalize inputs
-                if focal_stack.min() >= 0 and focal_stack.max() <= 1:
-                    focal_stack = (focal_stack * 2.0) - 1.0
-                rgb_target = (rgb_gt * 2.0) - 1.0 if rgb_gt is not None else None
+                # Normalize inputs without clamping before range detection.
+                focal_stack_unit, focal_stack = _split_unit_and_signed_ranges(focal_stack.float())
+                rgb_target = None
+                if rgb_gt is not None:
+                    _, rgb_target = _split_unit_and_signed_ranges(rgb_gt.float())
 
                 # Extract focal features for SD3 conditioning.
                 focal_features = self.focal_processor(focal_stack, focal_plane_distances)
@@ -658,23 +707,14 @@ class FocalStackGenerationTrainer:
                         return_dict=False
                     )[0]
                     rgb_recon = rgb_recon.clamp(-1, 1)
-                    with torch.no_grad():
-                        physical_verification_trace = self.pipeline.physical_verifier(
-                            focal_stack.detach().float(),
-                            focal_plane_distances.detach().float(),
-                            final_depth_canonical.detach().float(),
-                            rgb_recon.detach().float(),
-                            generated_depth_canonical.detach().float(),
-                        )
-
                     # Cast tensors for stable loss computation
                     diffusion_pred = diffusion_pred.float()
                     diffusion_target = flow_target.float()
                     depth_target = depth_gt.float() if depth_gt is not None else None
                     rgb_recon = rgb_recon.float()
                     rgb_target_fp32 = rgb_target.float()
-                    focal_stack_for_trace = ((focal_stack.float() + 1.0) * 0.5).clamp(0.0, 1.0)
-                    rgb_recon_for_trace = ((rgb_recon + 1.0) * 0.5).clamp(0.0, 1.0)
+                    focal_stack_for_trace = focal_stack_unit.float()
+                    rgb_recon_for_trace, _ = _split_unit_and_signed_ranges(rgb_recon.float())
                     with torch.no_grad():
                         physical_verification_trace = self.pipeline.physical_verifier(
                             focal_stack=focal_stack_for_trace,
@@ -788,6 +828,89 @@ class FocalStackGenerationTrainer:
             return 0.0
         return epoch_loss / effective_steps
 
+
+    def _forward_adaptation_generation(self, batch: dict[str, Any], *, requires_grad: bool) -> dict[str, torch.Tensor | object]:
+        """Run the focal-conditioned generation path used for mining/replay."""
+        device = self.accelerator.device
+        focal_stack = batch["focal_stack"].to(device)
+        focal_plane_distances = batch["focal_plane_distances"].to(device)
+        focal_stack_unit, focal_stack_signed = _split_unit_and_signed_ranges(focal_stack.float())
+        prompt_embeds, pooled_prompt_embeds = self._get_empty_prompt_embeddings()
+        batch_size = focal_stack.shape[0]
+        height, width = focal_stack.shape[-2:]
+        latent_h = max(1, height // int(self.pipeline.vae_scale_factor))
+        latent_w = max(1, width // int(self.pipeline.vae_scale_factor))
+        dtype = self.pipeline.transformer.dtype
+        context = torch.enable_grad() if requires_grad else torch.no_grad()
+        with context:
+            focal_features = self.focal_processor(focal_stack_signed, focal_plane_distances.float())
+            focal_features = {
+                key: value.to(device=device, dtype=dtype) if isinstance(value, torch.Tensor) and value is not None else value
+                for key, value in focal_features.items()
+            }
+            focal_evidence = self.focal_evidence_head(focal_stack_signed.float(), focal_plane_distances.float())
+            latent_channels = int(getattr(self.pipeline.transformer.config, "in_channels", self.pipeline.vae.config.latent_channels))
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(self.self_improvement_cfg.get("replay_noise_seed", 0)))
+            latents = torch.randn((batch_size, latent_channels, latent_h, latent_w), device=device, dtype=dtype, generator=generator)
+            self.pipeline.scheduler.set_timesteps(max(1, int(self.self_improvement_cfg.get("adapt_inference_steps", 1))), device=device)
+            timestep = self.pipeline.scheduler.timesteps[0]
+            model_input = self.pipeline.scheduler.scale_model_input(latents, timestep) if hasattr(self.pipeline.scheduler, "scale_model_input") else latents
+            batch_prompt_embeds, batch_pooled_prompt_embeds = self._repeat_prompt_embeddings(prompt_embeds, pooled_prompt_embeds, batch_size=batch_size)
+            diffusion_pred = self.pipeline.transformer(
+                hidden_states=model_input,
+                timestep=timestep.expand(batch_size) if timestep.dim() == 0 else timestep,
+                encoder_hidden_states=batch_prompt_embeds,
+                pooled_projections=batch_pooled_prompt_embeds,
+                focal_features=focal_features,
+                return_dict=False,
+            )[0]
+            decoder_outputs = self.task_output_decoder(diffusion_pred.to(dtype=next(self.task_output_decoder.parameters()).dtype))
+            generated_depth_canonical = F.interpolate(decoder_outputs["generated_depth_canonical"].float(), size=(height, width), mode="bilinear", align_corners=False)
+            generative_uncertainty = F.interpolate(decoder_outputs["uncertainty"].float(), size=(height, width), mode="bilinear", align_corners=False)
+            focal_depth_canonical = F.interpolate(focal_evidence["focal_depth_canonical"].float(), size=(height, width), mode="bilinear", align_corners=False)
+            focal_entropy = F.interpolate(focal_evidence["focal_entropy"].float(), size=(height, width), mode="bilinear", align_corners=False)
+            focal_posterior = F.interpolate(focal_evidence["focal_posterior"].float(), size=(height, width), mode="bilinear", align_corners=False)
+            focal_posterior = focal_posterior / focal_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            support_inputs, _ = build_physical_evidence_features(
+                focal_posterior=focal_posterior,
+                focal_entropy=focal_entropy,
+                focal_depth_canonical=focal_depth_canonical,
+                generated_depth_canonical=generated_depth_canonical,
+                generative_uncertainty=generative_uncertainty,
+            )
+            support_outputs = self.physical_evidence_support_head(support_inputs)
+            focal_gate = support_outputs["focal_evidence_weight"]
+            generative_gate = support_outputs["generative_prior_weight"]
+            abstention = support_outputs["abstention_weight"]
+            gate_sum = (focal_gate + generative_gate).clamp(min=1e-6)
+            focal_gate_norm = focal_gate / gate_sum
+            generative_gate_norm = generative_gate / gate_sum
+            final_depth_canonical = focal_gate_norm * focal_depth_canonical + generative_gate_norm * generated_depth_canonical
+            uncertainty_final = torch.maximum(support_outputs["uncertainty_final"], abstention).clamp(0.0, 1.0)
+            rgb_latents = decoder_outputs["all_in_focus_latents"]
+            rgb_recon = self.pipeline.vae.decode(rgb_latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[0].float().clamp(-1, 1)
+            rgb_recon_unit, _ = _split_unit_and_signed_ranges(rgb_recon)
+            trace = self.pipeline.physical_verifier(
+                focal_stack=focal_stack_unit,
+                focal_plane_distances=focal_plane_distances.float(),
+                depth_canonical=final_depth_canonical,
+                all_in_focus=rgb_recon_unit,
+                generated_depth_canonical=generated_depth_canonical,
+            )
+        return {
+            "trace": trace,
+            "uncertainty_final": uncertainty_final,
+            "focal_depth_canonical": focal_depth_canonical,
+            "generated_depth_canonical": generated_depth_canonical,
+            "final_depth_canonical": final_depth_canonical,
+            "focal_gate": focal_gate_norm,
+            "generative_gate": generative_gate_norm,
+            "abstention": abstention,
+            "physical_evidence_support": support_outputs["physical_evidence_support"],
+            "focal_plane_distances": focal_plane_distances,
+        }
+
     def _mine_self_improvement_manifest(
         self,
         *,
@@ -822,51 +945,21 @@ class FocalStackGenerationTrainer:
             for batch_index, batch in enumerate(self.self_improvement_dataloader):
                 if batch_index >= max_batches:
                     break
-                focal_stack = batch["focal_stack"].to(device)
-                focal_plane_distances = batch["focal_plane_distances"].to(device)
-                focal_stack_unit = focal_stack.float().clamp(0.0, 1.0)
-                focal_stack_signed = focal_stack_unit * 2.0 - 1.0 if focal_stack_unit.min() >= 0 else focal_stack.float()
-                focal_evidence = self.focal_evidence_head(focal_stack_signed.float(), focal_plane_distances.float())
-                focal_depth_canonical = focal_evidence["focal_depth_canonical"].float()
-                focal_posterior = focal_evidence["focal_posterior"].float()
-                focal_entropy = focal_evidence["focal_entropy"].float()
-                if focal_stack_unit.shape[-2:] != focal_depth_canonical.shape[-2:]:
-                    focal_stack_for_aif = F.interpolate(
-                        focal_stack_unit.flatten(0, 1),
-                        size=focal_depth_canonical.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    ).reshape(focal_stack_unit.shape[0], focal_stack_unit.shape[1], focal_stack_unit.shape[2], *focal_depth_canonical.shape[-2:])
-                else:
-                    focal_stack_for_aif = focal_stack_unit
-                posterior_for_aif = focal_posterior
-                if posterior_for_aif.shape[-2:] != focal_stack_for_aif.shape[-2:]:
-                    posterior_for_aif = F.interpolate(posterior_for_aif, size=focal_stack_for_aif.shape[-2:], mode="bilinear", align_corners=False)
-                    posterior_for_aif = posterior_for_aif / posterior_for_aif.sum(dim=1, keepdim=True).clamp(min=1e-6)
-                aif_proxy = (posterior_for_aif[:, :, None] * focal_stack_for_aif).sum(dim=1).clamp(0.0, 1.0)
-                support_inputs, _ = build_physical_evidence_features(
-                    focal_posterior=focal_posterior,
-                    focal_entropy=focal_entropy,
-                    focal_depth_canonical=focal_depth_canonical,
-                    generated_depth_canonical=focal_depth_canonical,
-                    generative_uncertainty=focal_entropy,
-                )
-                support_outputs = self.physical_evidence_support_head(support_inputs)
-                trace = self.pipeline.physical_verifier(
-                    focal_stack=focal_stack_unit,
-                    focal_plane_distances=focal_plane_distances.float(),
-                    depth_canonical=focal_depth_canonical,
-                    all_in_focus=aif_proxy,
-                    generated_depth_canonical=focal_depth_canonical,
-                )
+                outputs = self._forward_adaptation_generation(batch, requires_grad=False)
                 mined = self.trace_mining_buffer.mine(
-                    trace=trace,
-                    uncertainty=support_outputs["uncertainty_final"].float(),
+                    trace=outputs["trace"],
+                    uncertainty=outputs["uncertainty_final"],
                     sample_ids=batch.get("sample_path"),
                     batch_index=batch_index,
-                    focal_plane_coordinates=focal_plane_distances.float().detach().cpu(),
+                    focal_plane_coordinates=outputs["focal_plane_distances"].float().detach().cpu(),
                     conflict_threshold=conflict_threshold,
                     confidence_threshold=confidence_threshold,
+                    generated_depth=outputs["generated_depth_canonical"],
+                    focal_depth=outputs["focal_depth_canonical"],
+                    final_depth=outputs["final_depth_canonical"],
+                    focal_gate=outputs["focal_gate"],
+                    generative_gate=outputs["generative_gate"],
+                    abstention=outputs["abstention"],
                 )
                 for key in ("mined_sample_count", "accepted_conflict_count", "accepted_invalid_count", "accepted_reliable_count"):
                     stats[key] += float(mined.get(key, 0.0))
@@ -879,29 +972,20 @@ class FocalStackGenerationTrainer:
         return stats
 
     def _compute_adaptation_replay_loss(self, batch: dict[str, Any], max_items: int) -> torch.Tensor | None:
-        """Re-read a U_adapt batch and compute replay loss from current M1 outputs."""
+        """Re-read a U_adapt batch and update full M1 generation outputs from replay targets."""
         if not self.trace_mining_buffer.items:
             return None
-        device = self.accelerator.device
-        focal_stack = batch["focal_stack"].to(device)
-        focal_plane_distances = batch["focal_plane_distances"].to(device)
-        focal_stack_unit = focal_stack.float().clamp(0.0, 1.0)
-        focal_stack_signed = focal_stack_unit * 2.0 - 1.0 if focal_stack_unit.min() >= 0 else focal_stack.float()
-        focal_evidence = self.focal_evidence_head(focal_stack_signed.float(), focal_plane_distances.float())
-        focal_depth_canonical = focal_evidence["focal_depth_canonical"].float()
-        focal_posterior = focal_evidence["focal_posterior"].float()
-        focal_entropy = focal_evidence["focal_entropy"].float()
-        support_inputs, _ = build_physical_evidence_features(
-            focal_posterior=focal_posterior,
-            focal_entropy=focal_entropy,
-            focal_depth_canonical=focal_depth_canonical,
-            generated_depth_canonical=focal_depth_canonical,
-            generative_uncertainty=focal_entropy,
-        )
-        support_outputs = self.physical_evidence_support_head(support_inputs)
+        outputs = self._forward_adaptation_generation(batch, requires_grad=True)
+        trace = outputs["trace"]
         return self.trace_mining_buffer.replay_loss(
-            predicted_support=support_outputs["physical_evidence_support"].float(),
-            predicted_invalid=support_outputs["uncertainty_final"].float(),
+            predicted_support=outputs["physical_evidence_support"].float(),
+            predicted_invalid=outputs["uncertainty_final"].float(),
+            predicted_conflict=trace.conflict_score.float(),
+            predicted_final_depth=outputs["final_depth_canonical"].float(),
+            predicted_generated_depth=outputs["generated_depth_canonical"].float(),
+            predicted_focal_gate=outputs["focal_gate"].float(),
+            predicted_generative_gate=outputs["generative_gate"].float(),
+            predicted_abstention=outputs["abstention"].float(),
             sample_ids=batch.get("sample_path"),
             max_items=max_items,
         )
@@ -989,12 +1073,23 @@ class TraceMiningBuffer:
         self.patch_size = max(1, int(patch_size))
         self.round_index = int(round_index)
         self.manifest_path = Path(manifest_path) if manifest_path else None
+        self.metadata: dict[str, Any] = {}
         self.items: list[dict[str, Any]] = []
         if self.manifest_path and self.manifest_path.exists():
             self.load(self.manifest_path)
 
     def __len__(self) -> int:
         return len(self.items)
+
+    def set_metadata(self, *, parent_checkpoint_sha256: str, verifier_config_hash: str) -> None:
+        """Attach provenance required to replay a mined manifest."""
+        self.metadata.update({
+            "record_type": "metadata",
+            "round_id": self.round_id,
+            "round_index": self.round_index,
+            "parent_checkpoint_sha256": parent_checkpoint_sha256,
+            "verifier_config_hash": verifier_config_hash,
+        })
 
     @staticmethod
     def _as_bchw(value: torch.Tensor) -> torch.Tensor:
@@ -1038,6 +1133,15 @@ class TraceMiningBuffer:
         invalid: torch.Tensor,
         uncertainty: torch.Tensor,
         discrepancy: torch.Tensor,
+        stack_reprojection: torch.Tensor,
+        focus_support: torch.Tensor,
+        generation_support: torch.Tensor,
+        generated_depth: torch.Tensor | None,
+        focal_depth: torch.Tensor | None,
+        final_depth: torch.Tensor | None,
+        focal_gate: torch.Tensor | None,
+        generative_gate: torch.Tensor | None,
+        abstention: torch.Tensor | None,
         sample_id: str,
         batch_index: int,
         focal_plane_coordinates: torch.Tensor | None,
@@ -1076,10 +1180,24 @@ class TraceMiningBuffer:
             "support_target": float(support_patch.mean().item()),
             "verifier_confidence": float(confidence[..., y0:y1, x0:x1].mean().item()),
             "depth_focus_discrepancy_target": float(discrepancy[..., y0:y1, x0:x1].mean().item()),
+            "stack_reprojection_residual_target": float(stack_reprojection[..., y0:y1, x0:x1].mean().item()),
+            "focus_support_target": float(focus_support[..., y0:y1, x0:x1].mean().item()),
+            "generation_support_target": float(generation_support[..., y0:y1, x0:x1].mean().item()),
             "conflict_mean": float(conflict_patch.mean().item()),
             "invalid_mean": float(invalid_patch.mean().item()),
             "uncertainty_mean": float(uncertainty[..., y0:y1, x0:x1].mean().item()),
         }
+        optional_maps = {
+            "generated_depth_target": generated_depth,
+            "focal_depth_target": focal_depth,
+            "final_depth_target": final_depth,
+            "focal_gate_target": focal_gate,
+            "generative_gate_target": generative_gate,
+            "abstention_target": abstention,
+        }
+        for key, value in optional_maps.items():
+            if value is not None:
+                item[key] = float(value[..., y0:y1, x0:x1].mean().item())
         self._append_item(item)
         return item
 
@@ -1096,11 +1214,28 @@ class TraceMiningBuffer:
         invalid_threshold: float | None = None,
         support_threshold: float = 0.5,
         discrepancy_threshold: float | None = None,
+        generated_depth: torch.Tensor | None = None,
+        focal_depth: torch.Tensor | None = None,
+        final_depth: torch.Tensor | None = None,
+        focal_gate: torch.Tensor | None = None,
+        generative_gate: torch.Tensor | None = None,
+        abstention: torch.Tensor | None = None,
     ) -> dict[str, float]:
         conflict = self._as_bchw(getattr(trace, "conflict_score")).detach().float().clamp(0.0, 1.0)
         invalid = self._as_bchw(getattr(trace, "invalid_score")).detach().float().clamp(0.0, 1.0)
         discrepancy = self._as_bchw(getattr(trace, "depth_focus_discrepancy")).detach().float().clamp(0.0, 1.0)
+        stack_reprojection = self._as_bchw(getattr(trace, "stack_reprojection_residual", torch.zeros_like(conflict))).detach().float().clamp(0.0, 1.0)
         focus_support = self._as_bchw(getattr(trace, "focus_support")).detach().float().clamp(0.0, 1.0)
+        generation_support = self._as_bchw(getattr(trace, "generation_support", torch.ones_like(conflict))).detach().float().clamp(0.0, 1.0)
+        optional_maps = {
+            "generated_depth": generated_depth,
+            "focal_depth": focal_depth,
+            "final_depth": final_depth,
+            "focal_gate": focal_gate,
+            "generative_gate": generative_gate,
+            "abstention": abstention,
+        }
+        optional_maps = {key: (self._as_bchw(value).detach().float() if value is not None else None) for key, value in optional_maps.items()}
         uncertainty = self._as_bchw(uncertainty).detach().float().clamp(0.0, 1.0)
         if uncertainty.shape[-2:] != conflict.shape[-2:]:
             uncertainty = F.interpolate(uncertainty, size=conflict.shape[-2:], mode="bilinear", align_corners=False)
@@ -1137,6 +1272,15 @@ class TraceMiningBuffer:
                     invalid=invalid[batch_idx : batch_idx + 1],
                     uncertainty=uncertainty[batch_idx : batch_idx + 1],
                     discrepancy=discrepancy[batch_idx : batch_idx + 1],
+                    stack_reprojection=stack_reprojection[batch_idx : batch_idx + 1],
+                    focus_support=focus_support[batch_idx : batch_idx + 1],
+                    generation_support=generation_support[batch_idx : batch_idx + 1],
+                    generated_depth=optional_maps["generated_depth"][batch_idx : batch_idx + 1] if optional_maps["generated_depth"] is not None else None,
+                    focal_depth=optional_maps["focal_depth"][batch_idx : batch_idx + 1] if optional_maps["focal_depth"] is not None else None,
+                    final_depth=optional_maps["final_depth"][batch_idx : batch_idx + 1] if optional_maps["final_depth"] is not None else None,
+                    focal_gate=optional_maps["focal_gate"][batch_idx : batch_idx + 1] if optional_maps["focal_gate"] is not None else None,
+                    generative_gate=optional_maps["generative_gate"][batch_idx : batch_idx + 1] if optional_maps["generative_gate"] is not None else None,
+                    abstention=optional_maps["abstention"][batch_idx : batch_idx + 1] if optional_maps["abstention"] is not None else None,
                     sample_id=sample_id,
                     batch_index=batch_index,
                     focal_plane_coordinates=focal_coords_one,
@@ -1174,15 +1318,21 @@ class TraceMiningBuffer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as handle:
+            if self.metadata:
+                handle.write(json.dumps(self.metadata, sort_keys=True) + "\n")
             for item in self.items:
-                handle.write(json.dumps(item) + "\n")
+                handle.write(json.dumps(item, sort_keys=True) + "\n")
 
     def load(self, path: str | os.PathLike[str]) -> None:
         loaded: list[dict[str, Any]] = []
         with Path(path).open("r", encoding="utf-8") as handle:
             for line in handle:
                 if line.strip():
-                    loaded.append(json.loads(line))
+                    record = json.loads(line)
+                    if record.get("record_type") == "metadata":
+                        self.metadata = record
+                    else:
+                        loaded.append(record)
         self.items = loaded[-self.max_items :]
 
     @staticmethod
@@ -1201,26 +1351,50 @@ class TraceMiningBuffer:
         height, width = shape
         return int(height), int(width)
 
+    @staticmethod
+    def _allowed_sample_ids(sample_ids: Any) -> set[str] | None:
+        if sample_ids is None:
+            return None
+        if isinstance(sample_ids, str):
+            return {sample_ids}
+        if isinstance(sample_ids, (list, tuple)):
+            return {str(item) for item in sample_ids}
+        return None
+
+    @staticmethod
+    def _batch_index_for_item(item: dict[str, Any], sample_ids: Any, batch_size: int) -> int:
+        if isinstance(sample_ids, (list, tuple)):
+            item_ids = {str(item.get("sample_id")), str(item.get("sample_path"))}
+            for index, sample_id in enumerate(sample_ids):
+                if str(sample_id) in item_ids:
+                    return min(index, batch_size - 1)
+        return 0
+
     def replay_loss(
         self,
         *,
         predicted_support: torch.Tensor,
         predicted_invalid: torch.Tensor,
         predicted_conflict: torch.Tensor | None = None,
+        predicted_final_depth: torch.Tensor | None = None,
+        predicted_generated_depth: torch.Tensor | None = None,
+        predicted_focal_gate: torch.Tensor | None = None,
+        predicted_generative_gate: torch.Tensor | None = None,
+        predicted_abstention: torch.Tensor | None = None,
         sample_ids: Any = None,
         max_items: int = 4,
     ) -> torch.Tensor | None:
         if not self.items:
             return None
-        allowed_sample_ids: set[str] | None = None
-        if sample_ids is not None:
-            if isinstance(sample_ids, str):
-                allowed_sample_ids = {sample_ids}
-            elif isinstance(sample_ids, (list, tuple)):
-                allowed_sample_ids = {str(item) for item in sample_ids}
+        allowed_sample_ids = self._allowed_sample_ids(sample_ids)
         support_prediction = self._as_bchw(predicted_support).float().clamp(1e-6, 1.0 - 1e-6)
         invalid_prediction = self._as_bchw(predicted_invalid).float().clamp(1e-6, 1.0 - 1e-6)
         conflict_prediction = self._as_bchw(predicted_conflict).float().clamp(1e-6, 1.0 - 1e-6) if predicted_conflict is not None else None
+        final_depth_prediction = self._as_bchw(predicted_final_depth).float() if predicted_final_depth is not None else None
+        generated_depth_prediction = self._as_bchw(predicted_generated_depth).float() if predicted_generated_depth is not None else None
+        focal_gate_prediction = self._as_bchw(predicted_focal_gate).float().clamp(1e-6, 1.0 - 1e-6) if predicted_focal_gate is not None else None
+        generative_gate_prediction = self._as_bchw(predicted_generative_gate).float().clamp(1e-6, 1.0 - 1e-6) if predicted_generative_gate is not None else None
+        abstention_prediction = self._as_bchw(predicted_abstention).float().clamp(1e-6, 1.0 - 1e-6) if predicted_abstention is not None else None
         losses: list[torch.Tensor] = []
         candidate_items = self.items
         if allowed_sample_ids is not None:
@@ -1233,16 +1407,61 @@ class TraceMiningBuffer:
             py1 = max(py0 + 1, min(pred_h, math.ceil(y1 * pred_h / height)))
             px0 = max(0, min(pred_w - 1, math.floor(x0 * pred_w / width)))
             px1 = max(px0 + 1, min(pred_w, math.ceil(x1 * pred_w / width)))
-            invalid_patch = invalid_prediction[:, :, py0:py1, px0:px1]
-            support_patch = support_prediction[:, :, py0:py1, px0:px1]
-            invalid_target = torch.full_like(invalid_patch, float(item["invalid_target"]))
-            support_target = torch.full_like(support_patch, float(item["support_target"]))
+            batch_index = self._batch_index_for_item(item, sample_ids, invalid_prediction.shape[0])
+            invalid_patch = invalid_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+            support_patch = support_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+            invalid_target_value = float(item["invalid_target"])
+            support_target_value = float(item["support_target"])
+            invalid_target = torch.full_like(invalid_patch, invalid_target_value)
+            support_target = torch.full_like(support_patch, support_target_value)
             losses.append(F.binary_cross_entropy(invalid_patch, invalid_target))
             losses.append(F.binary_cross_entropy(support_patch, support_target))
             if conflict_prediction is not None:
-                conflict_patch = conflict_prediction[:, :, py0:py1, px0:px1]
+                conflict_patch = conflict_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
                 conflict_target = torch.full_like(conflict_patch, float(item["conflict_target"]))
                 losses.append(F.binary_cross_entropy(conflict_patch, conflict_target))
+
+            verdict_type = str(item.get("verdict_type", ""))
+            evidence_valid = invalid_target_value < 0.5
+            is_conflict = verdict_type in {"conflict", "focus_discrepancy"} and evidence_valid
+            is_invalid = verdict_type == "invalid" or invalid_target_value >= 0.5
+            is_reliable = verdict_type == "reliable_non_conflict" and evidence_valid
+
+            if abstention_prediction is not None:
+                abstention_patch = abstention_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                abstention_target_value = max(invalid_target_value, float(item.get("abstention_target", item.get("uncertainty_mean", invalid_target_value))))
+                losses.append(F.binary_cross_entropy(abstention_patch, torch.full_like(abstention_patch, abstention_target_value)))
+
+            if is_invalid:
+                continue
+
+            if is_conflict:
+                if final_depth_prediction is not None and "focal_depth_target" in item:
+                    final_patch = final_depth_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(F.smooth_l1_loss(final_patch, torch.full_like(final_patch, float(item["focal_depth_target"]))))
+                if generated_depth_prediction is not None and "focal_depth_target" in item:
+                    generated_patch = generated_depth_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(0.5 * F.smooth_l1_loss(generated_patch, torch.full_like(generated_patch, float(item["focal_depth_target"]))))
+                if generative_gate_prediction is not None:
+                    gate_patch = generative_gate_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(F.binary_cross_entropy(gate_patch, torch.zeros_like(gate_patch)))
+                if focal_gate_prediction is not None:
+                    gate_patch = focal_gate_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(F.binary_cross_entropy(gate_patch, torch.ones_like(gate_patch)))
+
+            if is_reliable:
+                if final_depth_prediction is not None and "final_depth_target" in item:
+                    final_patch = final_depth_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(F.smooth_l1_loss(final_patch, torch.full_like(final_patch, float(item["final_depth_target"]))))
+                if generated_depth_prediction is not None and "generated_depth_target" in item:
+                    generated_patch = generated_depth_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(F.smooth_l1_loss(generated_patch, torch.full_like(generated_patch, float(item["generated_depth_target"]))))
+                if focal_gate_prediction is not None and "focal_gate_target" in item:
+                    focal_gate_patch = focal_gate_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(F.binary_cross_entropy(focal_gate_patch, torch.full_like(focal_gate_patch, float(item["focal_gate_target"]))))
+                if generative_gate_prediction is not None and "generative_gate_target" in item:
+                    generative_gate_patch = generative_gate_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(F.binary_cross_entropy(generative_gate_patch, torch.full_like(generative_gate_patch, float(item["generative_gate_target"]))))
         if not losses:
             return None
         return torch.stack(losses).mean()

@@ -256,7 +256,7 @@ class VerificationTraceLoss(nn.Module):
         lambda_invalid: float = 1.0,
         support_weight: float = 1.0,
     ) -> None:
-        """Configure trace-supervision weights for scalar maps and verdict logits."""
+        """Configure trace-supervision weights for scalar maps and verdict scores."""
         super().__init__()
         self.lambda_trace = lambda_trace
         self.lambda_invalid = lambda_invalid

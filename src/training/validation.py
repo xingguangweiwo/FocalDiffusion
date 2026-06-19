@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
 from ..models.focal_evidence_encoder import build_physical_evidence_features
+from ..models.physics_modules import _split_unit_and_signed_ranges
 from ..utils.metrics import compute_metrics
 
 
@@ -235,9 +236,8 @@ def run_teacher_forced_validation(trainer: "FocalStackGenerationTrainer", epoch:
             focal_plane_distances = batch["focal_plane_distances"].to(device)
             rgb_gt = batch["all_in_focus"].to(device)
 
-            if focal_stack.min() >= 0 and focal_stack.max() <= 1:
-                focal_stack = (focal_stack * 2.0) - 1.0
-            rgb_target = (rgb_gt * 2.0) - 1.0
+            _, focal_stack = _split_unit_and_signed_ranges(focal_stack.float())
+            _, rgb_target = _split_unit_and_signed_ranges(rgb_gt.float())
 
             focal_features = trainer.focal_processor(focal_stack, focal_plane_distances)
             focal_features = {
@@ -317,8 +317,8 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
         'uncertainty_error_l1': 0.0,
         'generated_focal_depth_disagreement': 0.0,
         'uncertainty_mean': 0.0,
-        'heldout_physical_hallucination_rate': 0.0,
-        'heldout_VPR_at_coverage': 0.0,
+        'heldout_high_confidence_physical_violation_rate': 0.0,
+        'heldout_selective_physical_risk_at_coverage': 0.0,
     }
     metric_depth_batches = 0
     normalized_depth_batches = 0
@@ -370,6 +370,18 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
             if output.uncertainty_final is not None:
                 metrics["uncertainty_final_mean"] += output.uncertainty_final.mean().item()
             trace = getattr(output, "physical_verification_trace", None)
+            evaluation_verifier = getattr(trainer, "evaluation_verifier", None)
+            if evaluation_verifier is not None and output.final_depth_canonical is not None:
+                focal_stack_unit, _ = _split_unit_and_signed_ranges(batch["focal_stack"].to(final_depth_canonical.device).float())
+                all_in_focus = output.all_in_focus_image
+                if isinstance(all_in_focus, torch.Tensor):
+                    trace = evaluation_verifier(
+                        focal_stack=focal_stack_unit,
+                        focal_plane_distances=batch["focal_plane_distances"].to(final_depth_canonical.device).float(),
+                        depth_canonical=output.final_depth_canonical.unsqueeze(1) if output.final_depth_canonical.dim() == 3 else output.final_depth_canonical,
+                        all_in_focus=all_in_focus.to(final_depth_canonical.device).float(),
+                        generated_depth_canonical=output.generated_depth_canonical.unsqueeze(1) if output.generated_depth_canonical.dim() == 3 else output.generated_depth_canonical,
+                    )
             if trace is not None:
                 invalid = trace.invalid_score.detach().float().clamp(0.0, 1.0)
                 conflict = trace.conflict_score.detach().float().clamp(0.0, 1.0)
@@ -389,16 +401,16 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
                 physically_valid = invalid < invalid_threshold
                 phr_den = (high_confidence & physically_valid).float().sum()
                 phr_num = (high_confidence & physically_valid & (conflict >= conflict_threshold)).float().sum()
-                metrics["heldout_physical_hallucination_rate"] += float("nan") if phr_den.item() == 0 else (phr_num / phr_den).item()
-                sample_vprs = []
+                metrics["heldout_high_confidence_physical_violation_rate"] += float("nan") if phr_den.item() == 0 else (phr_num / phr_den).item()
+                sample_risks = []
+                physical_risk = torch.maximum(conflict, invalid).clamp(0.0, 1.0)
                 for sample_idx in range(confidence.shape[0]):
                     flat_confidence = confidence[sample_idx].flatten()
-                    flat_conflict = conflict[sample_idx].flatten()
-                    flat_invalid = invalid[sample_idx].flatten()
+                    flat_risk = physical_risk[sample_idx].flatten()
                     coverage_count = max(1, min(flat_confidence.numel(), int(math.ceil(flat_confidence.numel() * coverage))))
                     top_indices = torch.topk(flat_confidence, k=coverage_count).indices
-                    sample_vprs.append(((flat_conflict[top_indices] < conflict_threshold) & (flat_invalid[top_indices] < invalid_threshold)).float().mean())
-                metrics["heldout_VPR_at_coverage"] += torch.stack(sample_vprs).mean().item()
+                    sample_risks.append(flat_risk[top_indices].mean())
+                metrics["heldout_selective_physical_risk_at_coverage"] += torch.stack(sample_risks).mean().item()
 
             depth_gt, depth_range, mask = _prepare_depth_target(batch, final_depth_canonical.device)
             if depth_gt is not None and depth_range is not None:
@@ -470,5 +482,23 @@ def run_validation(trainer: "FocalStackGenerationTrainer", epoch: int) -> Dict[s
     val_metrics["loss"] = val_metrics.get("generative_l1", 0.0)
     val_metrics["abs_rel"] = val_metrics.get("generative_abs_rel", 0.0)
     val_metrics["rmse"] = val_metrics.get("generative_rmse", 0.0)
+
+    self_improvement_cfg = trainer.config.get("training", {}).get("self_improvement", {}) or {}
+    if bool(self_improvement_cfg.get("enabled", False)):
+        baseline = trainer.config.get("validation", {}).get("m0_baseline_metrics", {}) or {}
+        val_metrics["m1_unlabeled_adaptation_hcpvr"] = val_metrics.get("heldout_high_confidence_physical_violation_rate", float("nan"))
+        val_metrics["m1_unlabeled_adaptation_physical_aurc"] = val_metrics.get("heldout_selective_physical_risk_at_coverage", float("nan"))
+        val_metrics["m1_unlabeled_adaptation_depth_l1"] = val_metrics.get("generative_l1", float("nan"))
+        val_metrics["m1_source_domain_retention_l1"] = val_metrics.get("teacher_forced_l1", float("nan"))
+        val_metrics["m1_independent_verifier_hcpvr"] = val_metrics.get("heldout_high_confidence_physical_violation_rate", float("nan"))
+        val_metrics["delta_hcpvr"] = val_metrics["m1_unlabeled_adaptation_hcpvr"] - float(baseline.get("m0_zero_shot_hcpvr", val_metrics["m1_unlabeled_adaptation_hcpvr"]))
+        val_metrics["delta_physical_aurc"] = val_metrics["m1_unlabeled_adaptation_physical_aurc"] - float(baseline.get("m0_zero_shot_physical_aurc", val_metrics["m1_unlabeled_adaptation_physical_aurc"]))
+        val_metrics["delta_abs_rel"] = val_metrics.get("generative_abs_rel", float("nan")) - float(baseline.get("m0_zero_shot_abs_rel", val_metrics.get("generative_abs_rel", 0.0)))
+        val_metrics["delta_psnr"] = val_metrics.get("aif_psnr", float("nan")) - float(baseline.get("m0_zero_shot_psnr", val_metrics.get("aif_psnr", 0.0)))
+    else:
+        val_metrics["m0_zero_shot_hcpvr"] = val_metrics.get("heldout_high_confidence_physical_violation_rate", float("nan"))
+        val_metrics["m0_zero_shot_physical_aurc"] = val_metrics.get("heldout_selective_physical_risk_at_coverage", float("nan"))
+        val_metrics["m0_zero_shot_abs_rel"] = val_metrics.get("generative_abs_rel", float("nan"))
+        val_metrics["m0_zero_shot_psnr"] = val_metrics.get("aif_psnr", float("nan"))
 
     return val_metrics

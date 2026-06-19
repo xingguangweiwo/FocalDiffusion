@@ -8,18 +8,38 @@ data:
     - name: hypersim
       data_root: /data/hypersim
       filelist: data/filelists/hypersim_train.txt
+      focal_coordinate_type: normalized_rank
+      focal_coordinate_unit: none
+      depth_coordinate_type: canonical
+      camera_calibration: false
+      evaluation_mode: canonical
   self_improvement_sources:
     - name: hypersim_adapt_unlabeled
       data_root: /data/hypersim
       filelist: data/filelists/hypersim_adapt_unlabeled.txt
+      focal_coordinate_type: normalized_rank
+      focal_coordinate_unit: none
+      depth_coordinate_type: canonical
+      camera_calibration: false
+      evaluation_mode: canonical
   val_sources:
     - name: hypersim
       data_root: /data/hypersim
       filelist: data/filelists/hypersim_val.txt
+      focal_coordinate_type: normalized_rank
+      focal_coordinate_unit: none
+      depth_coordinate_type: canonical
+      camera_calibration: false
+      evaluation_mode: canonical
   test_sources:
     - name: hypersim
       data_root: /data/hypersim
       filelist: data/filelists/hypersim_test.txt
+      focal_coordinate_type: normalized_rank
+      focal_coordinate_unit: none
+      depth_coordinate_type: canonical
+      camera_calibration: false
+      evaluation_mode: canonical
   focal_stack_size: 9
   focal_range: [0.2, 40.0]
 
