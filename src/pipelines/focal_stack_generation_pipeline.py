@@ -528,7 +528,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         return_dict: bool = True,
         focal_distance_mode: str = "normalized",
         num_refinement_steps: int = 0,
-        return_refinement_history: bool = False,
+        trace_refinement_epsilon: float = 1e-4,
         **kwargs: Any,
     ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, Union[torch.Tensor, Image.Image]]]:
         """Generate canonical depth and all-in-focus outputs from a focal stack.

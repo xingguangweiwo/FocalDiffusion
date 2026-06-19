@@ -12,10 +12,6 @@ from tqdm import tqdm
 import yaml
 import torch.nn.functional as F
 
-from src.pipelines import load_pipeline
-from src.data import create_dataloader
-from src.utils.metrics import compute_metrics
-
 
 def _as_bchw(value: torch.Tensor | None) -> torch.Tensor | None:
     """Convert optional tensor maps to BCHW format for metric computation."""
@@ -82,6 +78,7 @@ def compute_trace_metrics(
     conflict_threshold = violation_threshold if conflict_threshold is None else conflict_threshold
     trace = getattr(output, "physical_verification_trace", None)
     if trace is None:
+        nan = float("nan")
         return {
             "physical_hallucination_rate": float("nan"),
             "invalid_overconfidence_rate": float("nan"),
@@ -95,7 +92,6 @@ def compute_trace_metrics(
             "diagnostics": {},
         }
 
-    focus_support = trace.focus_support.detach().float().clamp(0.0, 1.0)
     conflict = trace.conflict_score.detach().float().clamp(0.0, 1.0)
     invalid = trace.invalid_score.detach().float().clamp(0.0, 1.0)
     uncertainty = _as_bchw(getattr(output, "uncertainty_final", None))
@@ -103,13 +99,10 @@ def compute_trace_metrics(
         uncertainty = _as_bchw(getattr(output, "uncertainty", None))
     if uncertainty is None:
         uncertainty = torch.zeros_like(conflict)
-    elif uncertainty.shape[-2:] != conflict.shape[-2:]:
-        uncertainty = F.interpolate(
-            uncertainty.float(),
-            size=conflict.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
+    else:
+        uncertainty = uncertainty.detach().float().clamp(0.0, 1.0)
+        if uncertainty.shape[-2:] != conflict.shape[-2:]:
+            uncertainty = F.interpolate(uncertainty, size=conflict.shape[-2:], mode="bilinear", align_corners=False)
 
     uncertainty = uncertainty.float().clamp(0.0, 1.0)
     confidence = (1.0 - uncertainty).clamp(0.0, 1.0)
@@ -227,6 +220,10 @@ def _serialize_refinement_history(history: list[dict]) -> list[dict]:
 
 
 def evaluate(args):
+    from src.pipelines import load_pipeline
+    from src.data import create_dataloader
+    from src.utils.metrics import compute_metrics
+
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 

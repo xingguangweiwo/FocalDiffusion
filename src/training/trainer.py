@@ -310,6 +310,8 @@ class FocalStackGenerationTrainer:
         self.focal_evidence_head = self.pipeline.focal_evidence_head
         self.task_output_decoder = self.pipeline.task_output_decoder
         self.physical_evidence_support_head = self.pipeline.physical_evidence_support_head
+        self.pipeline.physical_verifier.requires_grad_(False)
+        self.pipeline.physical_verifier.eval()
 
         # Configure trainable parameters
         self._configure_trainable_params()
@@ -466,10 +468,11 @@ class FocalStackGenerationTrainer:
         self.save_checkpoint(epoch, self.global_step, is_final=True)
         logger.info("Training completed!")
 
-    def train_epoch(self, epoch: int, global_step: int) -> float:
+    def train_epoch(self, epoch: int, global_step: int | None = None) -> float:
         from ..training.losses import FocalStackGenerationLoss
 
         self.pipeline.train()
+        self.pipeline.physical_verifier.eval()
         epoch_loss = 0.0
         effective_steps = 0
         supervision_mode = self.config['training'].get('supervision_mode', 'supervised')
@@ -495,9 +498,10 @@ class FocalStackGenerationTrainer:
             focus_target_temperature=self.config['losses'].get('focus_target_temperature', 0.07),
             focal_target_type=self.config["losses"].get("focal_target_type", "normalized"),
             coc_posterior_temperature=self.config["losses"].get("coc_posterior_temperature", 1.0),
-            lambda_trace=self.config['losses'].get('lambda_trace', 0.02),
-            lambda_violation=self.config['losses'].get('lambda_violation', 0.02),
-            lambda_invalid=self.config['losses'].get('lambda_invalid', 0.02),
+            lambda_trace=self.config["losses"].get("lambda_trace", 0.05),
+            lambda_violation=self.config["losses"].get("lambda_violation", 0.05),
+            lambda_invalid=self.config["losses"].get("lambda_invalid", 0.05),
+            lambda_preference=self.config["losses"].get("lambda_preference", 0.05),
             supervision_mode=supervision_mode,
         )
         loss_fn = loss_fn.to(self.accelerator.device)
@@ -522,6 +526,9 @@ class FocalStackGenerationTrainer:
             desc=f"Epoch {epoch}",
             disable=not self.accelerator.is_local_main_process,
         )
+
+        if global_step is not None:
+            self.global_step = global_step
 
         for step, batch in enumerate(progress_bar):
             with self.accelerator.accumulate(self.pipeline):
@@ -651,6 +658,14 @@ class FocalStackGenerationTrainer:
                         return_dict=False
                     )[0]
                     rgb_recon = rgb_recon.clamp(-1, 1)
+                    with torch.no_grad():
+                        physical_verification_trace = self.pipeline.physical_verifier(
+                            focal_stack.detach().float(),
+                            focal_plane_distances.detach().float(),
+                            final_depth_canonical.detach().float(),
+                            rgb_recon.detach().float(),
+                            generated_depth_canonical.detach().float(),
+                        )
 
                     # Cast tensors for stable loss computation
                     diffusion_pred = diffusion_pred.float()

@@ -119,9 +119,10 @@ losses:
   focus_target_temperature: 0.07
   focal_target_type: normalized
   coc_posterior_temperature: 1.0
-  lambda_trace: 0.02
-  lambda_violation: 0.02
-  lambda_invalid: 0.02
+  lambda_trace: 0.05
+  lambda_violation: 0.05
+  lambda_invalid: 0.05
+  lambda_preference: 0.05
 
 validation:
   num_inference_steps: 30
