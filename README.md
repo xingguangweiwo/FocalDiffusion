@@ -1,24 +1,24 @@
-# Focal Stack Understanding as Image Generation
+# FocalTrace: Self-Refining Focal-Stack Understanding via Physical Verification Traces
 
-A task-conditioned diffusion framework for focal-stack understanding, including all-in-focus reconstruction, depth generation, uncertainty estimation, focal evidence estimation, and refocused focal-plane generation.
+FocalTrace is a task-conditioned diffusion framework for focal-stack understanding with Physical Verification Traces. It supports all-in-focus reconstruction, canonical depth generation, uncertainty estimation, focal evidence estimation, physical trace verification, and inference-time trace-guided self-refinement.
 
-FocalStackGeneration formulates focal-stack understanding as task-conditioned image generation. It uses focal stacks as physical evidence, estimates a per-pixel focal-plane posterior, generates canonical depth and uncertainty outputs, and estimates focal evidence weighting for physically grounded outputs while preserving the Stable Diffusion 3.5 backbone.
+The system uses focal stacks as physical evidence, estimates a per-pixel focal-plane posterior, generates canonical depth and uncertainty outputs, and computes a Physical Verification Trace that summarizes focus support, defocus/refocus consistency, conflict, invalidity, and physical support signals while preserving the Stable Diffusion 3.5 backbone.
 
 ## Highlights
 
 * Task-conditioned focal-stack image generation for all-in-focus reconstruction, depth, uncertainty, focal evidence, and refocus outputs.
-* Focal evidence posterior over focal planes.
-* All-in-focus reconstruction and depth generation from focal-stack conditioning.
-* Uncertainty-related outputs from focal entropy, generated-depth disagreement, and abstention weighting.
-* Refocused focal-plane generation support for held-out focal-plane evaluation.
+* Physical Verification Trace outputs for focus confidence/index/coordinate, depth-focus discrepancy, defocus/refocus residuals, support, conflict, invalidity, and verdict logits.
+* Inference-time self-refinement driven by physical verification traces.
+* Evaluation metrics for physical hallucination, valid physical reconstruction at coverage, and conflict/invalid trace scores.
+* Experimental training-time trace mining/replay hooks for an initial M0→M1 self-improvement workflow; this is not yet a complete automated M0→M1→M2 closed loop.
 
 ## Important Notes
 
 * A trained checkpoint is required for meaningful inference.
 * “Zero-shot” means evaluation on unseen datasets or scenes without test-time fine-tuning.
 * Depth is normalized by default.
-* Metric depth requires calibrated focal-plane distances and camera parameters.
-* If focal-plane distances are omitted, depth should be interpreted as relative or normalized depth.
+* `focal_plane_distances` are currently required by the pipeline and evaluation/inference scripts.
+* Metric depth is interpretable only when focal-plane distances are calibrated metric distances and camera parameters are valid; otherwise outputs should be treated as relative/canonical depth.
 
 ## Installation
 
@@ -62,9 +62,32 @@ python -m script.inference \
   --guidance-scale 1.0
 ```
 
-Use `--focal-distance-mode metric` only when `--focal-plane-distances` are calibrated metric distances. The default mode is `normalized`, which still uses focal-plane values for canonical model conditioning but does not expose `depth_focus_metric`.
+`--focal-plane-distances` is required. Use `--focal-distance-mode metric` only when those distances are calibrated metric distances. The default mode is `normalized`, which still uses focal-plane values for canonical model conditioning but does not expose `depth_focus_metric`. Without calibrated focal distances and camera parameters, output depth should be interpreted as relative/canonical rather than metric depth.
 
-If `--focal-plane-distances` is omitted, index-spaced focal positions are used. In that case, keep `--focal-distance-mode normalized`, and output depth should not be interpreted as metric depth.
+
+## Evaluation
+
+Use `script.evaluate` as the official evaluation entry point for FocalTrace/FocalStackGeneration checkpoints:
+
+```bash
+python -m script.evaluate \
+  --config configs/base.yaml \
+  --checkpoint outputs/experiments/base/checkpoints/best.pt \
+  --dataset hypersim \
+  --data_root /path/to/hypersim \
+  --output_dir outputs/evaluation \
+  --num_inference_steps 30 \
+  --num_refinement_steps 0
+```
+
+The evaluator writes `metrics.json`, `trace_metrics.json`, and a `visualizations/` directory. When refinement is enabled with `--num_refinement_steps > 0`, it also requests refinement history from the pipeline and writes `refinement_curve.json`. Use `--confidence-threshold`, `--violation-threshold`, and `--coverage` to tune the reported trace metrics.
+
+Trace metrics include:
+
+* **Physical Hallucination Rate (PHR) / false-confident violation rate**: the fraction of high-confidence predictions whose physical violation score exceeds the configured threshold.
+* **VPR@Coverage** (`VPR_at_coverage`): among the top-confidence coverage fraction, the proportion of pixels/patches whose violation is below threshold.
+* **`mean_conflict_score`**: average physical conflict score from the trace.
+* **`mean_invalid_score`**: average invalid/physically unreliable score from the trace.
 
 ## Generation Tasks
 
@@ -80,7 +103,7 @@ The legacy task alias `aif` is accepted only as a compatibility alias for `all_i
 
 ## Method
 
-FocalStackGeneration consists of three main components:
+FocalTrace consists of four main components:
 
 1. **Focal Evidence Encoder**
    Predicts a per-pixel posterior distribution over focal planes from the input focal stack.
@@ -91,10 +114,13 @@ FocalStackGeneration consists of three main components:
 3. **Physical Evidence Estimator**
    Estimates focal evidence weighting and uncertainty from compact focal evidence diagnostics, including focal entropy, posterior margin, generated-depth disagreement, and generative uncertainty.
 
+4. **Physical Verification Trace**
+   Computes fixed physical checks for focus confidence, focus peak index/coordinate, defocus/refocus residuals, support, conflict, and invalidity. This trace is implemented and can guide inference-time self-refinement. Training-time self-improvement is currently experimental via optional trace mining/replay, not a full multi-round automated loop.
+
 ## Limitations
 
-* Metric depth requires calibrated focal-plane distances and camera parameters.
-* Without valid focal-plane distances, output depth is relative or normalized.
+* Metric depth requires calibrated focal-plane distances and valid camera parameters; otherwise output depth is relative/canonical.
+* `focal_plane_distances` are required by the current pipeline.
 * Reliability claims should be supported by high-error detection, sparsification, and calibration evaluation.
 * Large diffusion backbones should be separated from focal-evidence contributions through ablation studies.
 

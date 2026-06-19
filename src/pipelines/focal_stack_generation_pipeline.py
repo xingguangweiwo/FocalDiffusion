@@ -90,6 +90,7 @@ class FocalStackGenerationOutput(BaseOutput):
     uncertainty_final: Optional[torch.Tensor] = None
     depth_focus_metric: Optional[torch.Tensor] = None
     physical_verification_trace: Optional[PhysicalVerificationTrace] = None
+    refinement_history: Optional[List[Dict[str, Any]]] = None
 
 
 class FocalInjectedSD3Transformer(nn.Module):
@@ -529,6 +530,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         return_dict: bool = True,
         focal_distance_mode: str = "normalized",
         num_refinement_steps: int = 0,
+        return_refinement_history: bool = False,
         **kwargs: Any,
     ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, Union[torch.Tensor, Image.Image]]]:
         """Generate canonical depth and all-in-focus outputs from a focal stack.
@@ -547,6 +549,8 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
                 returned as ``depth_focus_metric``.
             num_refinement_steps: Optional inference-time self-refinement steps.
                 ``0`` preserves the original single-pass behavior.
+            return_refinement_history: When ``True`` and refinement is enabled,
+                return per-step depth/uncertainty snapshots and trace summaries.
 
         Raises:
             ValueError: If ``focal_distance_mode`` is not ``"normalized"`` or
@@ -737,7 +741,8 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
             generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
         )
-        for _ in range(num_refinement_steps):
+        refinement_history: Optional[List[Dict[str, Any]]] = [] if (return_refinement_history and num_refinement_steps > 0) else None
+        for refinement_step in range(num_refinement_steps):
             final_depth_canonical, uncertainty_final = self._apply_trace_refinement(
                 final_depth_canonical=final_depth_canonical,
                 focal_depth_canonical=focal_depth_canonical,
@@ -753,6 +758,18 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
                 all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
                 generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
             )
+            if refinement_history is not None:
+                refinement_history.append(
+                    {
+                        "step": refinement_step,
+                        "final_depth_canonical": final_depth_canonical.detach().cpu(),
+                        "uncertainty_final": uncertainty_final.detach().cpu(),
+                        "mean_conflict_score": float(verification_trace.conflict_score.detach().float().mean().item()),
+                        "mean_invalid_score": float(verification_trace.invalid_score.detach().float().mean().item()),
+                        "mean_focus_support": float(verification_trace.focus_support.detach().float().mean().item()),
+                        "mean_generation_support": float(verification_trace.generation_support.detach().float().mean().item()),
+                    }
+                )
 
         if output_type == "pil":
             image = self.numpy_to_pil(recon.cpu().permute(0, 2, 3, 1).numpy())[0]
@@ -788,6 +805,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             uncertainty_final=uncertainty_final.squeeze(1),
             depth_focus_metric=depth_focus_metric,
             physical_verification_trace=verification_trace,
+            refinement_history=refinement_history,
         )
 
 
