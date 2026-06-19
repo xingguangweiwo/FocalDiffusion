@@ -2,15 +2,15 @@
 
 FocalTrace is a task-conditioned diffusion framework for focal-stack understanding with Physical Verification Traces. It supports all-in-focus reconstruction, canonical depth generation, uncertainty estimation, focal evidence estimation, physical trace verification, and inference-time trace-guided self-refinement.
 
-The system uses focal stacks as physical evidence, estimates a per-pixel focal-plane posterior, generates canonical depth and uncertainty outputs, and computes a Physical Verification Trace that summarizes focus support, defocus/refocus consistency, conflict, invalidity, and physical support signals while preserving the Stable Diffusion 3.5 backbone.
+The system uses focal stacks as physical evidence, estimates a per-pixel focal-plane posterior, generates canonical depth and uncertainty outputs, and computes a Physical Verification Trace that summarizes focus support, defocus rendering consistency, conflict, invalidity, and physical support signals while preserving the Stable Diffusion 3.5 backbone.
 
 ## Highlights
 
-* Task-conditioned focal-stack image generation for all-in-focus reconstruction, depth, uncertainty, focal evidence, and refocus outputs.
-* Physical Verification Trace outputs for focus confidence/index/coordinate, depth-focus discrepancy, defocus/refocus residuals, support, conflict, invalidity, and verdict logits.
+* Task-conditioned focal-stack image generation for all-in-focus reconstruction, depth, uncertainty, and focal evidence outputs.
+* Physical Verification Trace outputs for focus confidence/index/coordinate, depth-focus discrepancy, defocus rendering residuals, support, conflict, invalidity, and verdict logits.
 * Inference-time self-refinement driven by physical verification traces.
 * Evaluation metrics for physical hallucination, valid physical reconstruction at coverage, and conflict/invalid trace scores.
-* Experimental training-time trace mining/replay hooks for an initial M0→M1 self-improvement workflow; this is not yet a complete automated M0→M1→M2 closed loop.
+* Minimal M0→M1 verifier-guided self-improvement workflow: M0 is trained on labeled `train_sources`, mines frozen-verifier trace targets from unlabeled `self_improvement_sources`, and M1 is initialized from `parent_checkpoint` while replaying the manifest alongside source supervision.
 
 ## Important Notes
 
@@ -84,10 +84,17 @@ The evaluator writes `metrics.json`, `trace_metrics.json`, and a `visualizations
 
 Trace metrics include:
 
-* **Physical Hallucination Rate (PHR) / false-confident violation rate**: the fraction of high-confidence predictions whose physical violation score exceeds the configured threshold.
+* **Physical Hallucination Rate** (`physical_hallucination_rate`): the fraction of high-confidence predictions whose physical violation score exceeds the configured threshold.
 * **VPR@Coverage** (`VPR_at_coverage`): among the top-confidence coverage fraction, the proportion of pixels/patches whose violation is below threshold.
 * **`mean_conflict_score`**: average physical conflict score from the trace.
 * **`mean_invalid_score`**: average invalid/physically unreliable score from the trace.
+
+
+## M0→M1 Self-Improvement
+
+The training config separates `train_sources`, `self_improvement_sources`, `val_sources`, and `test_sources`. Trace mining is only allowed on `self_improvement_sources`; the trainer rejects overlap between adaptation and test filelists. During the self-improvement round, the physical verifier is frozen and verifier targets are detached before being written to the lightweight `mining_manifest`. Replay re-reads U_adapt focal stacks, runs the current M1 heads forward, and mixes trace-guided replay loss with the original source supervised loss.
+
+Use `training.self_improvement.round_index`, `training.self_improvement.parent_checkpoint`, and `training.self_improvement.mining_manifest` to define the M0→M1 round. M0 evaluation on unseen `test_sources` is zero-shot; M1 evaluation after unlabeled target-domain replay should be reported as verifier-guided unlabeled adaptation, not zero-shot. Held-out verifier thresholds under `validation.heldout_verifier` must be selected on validation splits, not tuned on test splits.
 
 ## Generation Tasks
 
@@ -97,7 +104,6 @@ Canonical task names are centralized in `src/generation_tasks.py`:
 * `depth`
 * `uncertainty`
 * `focal_evidence`
-* `refocus`
 
 The legacy task alias `aif` is accepted only as a compatibility alias for `all_in_focus`.
 
@@ -115,7 +121,7 @@ FocalTrace consists of four main components:
    Estimates focal evidence weighting and uncertainty from compact focal evidence diagnostics, including focal entropy, posterior margin, generated-depth disagreement, and generative uncertainty.
 
 4. **Physical Verification Trace**
-   Computes fixed physical checks for focus confidence, focus peak index/coordinate, defocus/refocus residuals, support, conflict, and invalidity. This trace is implemented and can guide inference-time self-refinement. Training-time self-improvement is currently experimental via optional trace mining/replay, not a full multi-round automated loop.
+   Computes fixed physical checks for focus confidence, focus peak index/coordinate, defocus rendering and stack reprojection residuals, support, conflict, and invalidity. This trace is implemented and can guide inference-time self-refinement. Training-time self-improvement is currently experimental via optional trace mining/replay, not a full multi-round automated loop.
 
 ## Limitations
 

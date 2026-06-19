@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 from PIL import Image
 
@@ -93,7 +95,15 @@ def test_load_config_base_smoke():
     assert config["losses"]["lambda_invalid"] == 0.02
     assert config["training"]["self_improvement"]["enabled"] is False
     assert config["training"]["self_improvement"]["round_id"] == "M0"
-    assert config["training"]["self_improvement"]["mine_every_n_steps"] == 100
+    assert config["training"]["self_improvement"]["round_index"] == 0
+    assert config["data"]["self_improvement_sources"]
+    train_filelists = {source["filelist"] for source in config["data"]["train_sources"]}
+    adapt_filelists = {source["filelist"] for source in config["data"]["self_improvement_sources"]}
+    test_filelists = {source["filelist"] for source in config["data"]["test_sources"]}
+    assert adapt_filelists.isdisjoint(test_filelists)
+    assert train_filelists.isdisjoint(test_filelists)
+    assert config["training"]["self_improvement"]["mining_manifest"]
+    assert "mine_every_n_steps" not in config["training"]["self_improvement"]
 
 
 def test_dataset_strict_data_raises_on_missing_files(tmp_path):
@@ -461,8 +471,8 @@ def test_defocus_consistency_range_invariant_residuals():
         atol=1e-6,
     )
     assert torch.allclose(
-        unit_outputs["refocus_residual"],
-        signed_outputs["refocus_residual"],
+        unit_outputs["stack_reprojection_residual"],
+        signed_outputs["stack_reprojection_residual"],
         atol=1e-6,
     )
     assert unit_outputs.keys() == signed_outputs.keys()
@@ -520,12 +530,104 @@ def test_trace_mining_buffer_mines_and_replays_small_patches():
         confidence_threshold=0.5,
     )
 
-    assert stats["mined_trace_items"] == 3
-    assert stats["buffer_size"] == 3
-    assert len(buffer) == 3
-    assert {item["verdict_type"] for item in buffer.items} == {"conflict", "invalid", "focus_discrepancy"}
-    assert all(item["target_patch"].numel() <= 1 for item in buffer.items)
+    assert stats["mined_trace_items"] == 4
+    assert stats["buffer_size"] == 4
+    assert len(buffer) == 4
+    assert {item["verdict_type"] for item in buffer.items} == {"conflict", "invalid", "focus_discrepancy", "reliable_non_conflict"}
+    assert all("target_patch" not in item for item in buffer.items)
+    assert all("sample_path" in item and "crop" in item for item in buffer.items)
+    assert all("conflict_target" in item and "invalid_target" in item and "support_target" in item for item in buffer.items)
 
-    replay_loss = buffer.replay_loss(torch.full((1, 1, 2, 2), 0.1))
+    replay_loss = buffer.replay_loss(
+        predicted_support=torch.full((1, 1, 2, 2), 0.1),
+        predicted_invalid=torch.full((1, 1, 2, 2), 0.1),
+        sample_ids=["sample_a"],
+    )
     assert replay_loss is not None
     assert replay_loss > 0
+
+
+def test_trace_replay_updates_model_but_not_frozen_verifier_and_checkpoint_hash_changes(tmp_path):
+    from src.training.trainer import TraceMiningBuffer, checkpoint_sha256
+
+    model = torch.nn.Conv2d(3, 2, kernel_size=1)
+    verifier = torch.nn.Conv2d(3, 1, kernel_size=1)
+    for parameter in verifier.parameters():
+        parameter.requires_grad_(False)
+    verifier_before = {name: value.detach().clone() for name, value in verifier.state_dict().items()}
+
+    m0_path = tmp_path / "m0.pt"
+    torch.save({"model": model.state_dict()}, m0_path)
+    m0_hash = checkpoint_sha256(m0_path)
+
+    buffer = TraceMiningBuffer(max_items=2, round_id="M1", round_index=1, patch_size=2)
+    buffer.items.append({
+        "round_id": "M1",
+        "round_index": 1,
+        "sample_id": "adapt_a",
+        "sample_path": "adapt_a",
+        "verdict_type": "invalid",
+        "crop": {"y0": 0, "y1": 2, "x0": 0, "x1": 2},
+        "source_shape": {"height": 2, "width": 2},
+        "focal_plane_coordinates": [0.0, 1.0],
+        "conflict_target": 0.0,
+        "invalid_target": 1.0,
+        "support_target": 0.0,
+        "verifier_confidence": 0.95,
+    })
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    x = torch.ones(1, 3, 2, 2)
+    before = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    logits = model(x)
+    predictions = torch.sigmoid(logits)
+    replay_loss = buffer.replay_loss(
+        predicted_support=predictions[:, :1],
+        predicted_invalid=predictions[:, 1:],
+        sample_ids=["adapt_a"],
+    )
+    assert replay_loss is not None
+    replay_loss.backward()
+    assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in model.parameters())
+    optimizer.step()
+    assert any(not torch.equal(before[name], value) for name, value in model.state_dict().items())
+    assert all(torch.equal(verifier_before[name], value) for name, value in verifier.state_dict().items())
+
+    m1_path = tmp_path / "m1.pt"
+    torch.save({"model": model.state_dict()}, m1_path)
+    assert checkpoint_sha256(m1_path) != m0_hash
+
+
+def test_no_refocus_symbols_in_public_source():
+    forbidden = ("refocus", "refocused", "refocus_residual")
+    roots = [Path("src"), Path("script"), Path("configs"), Path("README.md")]
+    offenders = []
+    for root in roots:
+        paths = [root] if root.is_file() else [path for path in root.rglob("*") if path.is_file()]
+        for path in paths:
+            if path.suffix in {".py", ".yaml", ".md"}:
+                text = path.read_text(encoding="utf-8")
+                for symbol in forbidden:
+                    if symbol in text:
+                        offenders.append(f"{path}:{symbol}")
+    assert offenders == []
+
+
+def test_tiny_one_batch_overfit_cpu():
+    model = torch.nn.Conv2d(1, 1, kernel_size=1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    x = torch.ones(1, 1, 2, 2)
+    y = torch.ones(1, 1, 2, 2)
+    first_loss = None
+    last_loss = None
+    for _ in range(8):
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(model(x), y)
+        if first_loss is None:
+            first_loss = loss.item()
+        loss.backward()
+        optimizer.step()
+        last_loss = loss.item()
+    assert last_loss is not None and first_loss is not None
+    final_loss = torch.nn.functional.mse_loss(model(x), y).item()
+    assert final_loss < first_loss

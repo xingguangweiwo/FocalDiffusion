@@ -5,7 +5,6 @@ GENERATION_TASKS = {
     "depth": 1,
     "uncertainty": 2,
     "focal_evidence": 3,
-    "refocus": 4,
 }
 
 

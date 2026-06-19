@@ -8,6 +8,10 @@ data:
     - name: hypersim
       data_root: /data/hypersim
       filelist: data/filelists/hypersim_train.txt
+  self_improvement_sources:
+    - name: hypersim_adapt_unlabeled
+      data_root: /data/hypersim
+      filelist: data/filelists/hypersim_adapt_unlabeled.txt
   val_sources:
     - name: hypersim
       data_root: /data/hypersim

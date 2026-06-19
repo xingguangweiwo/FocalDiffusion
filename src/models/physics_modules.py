@@ -107,7 +107,7 @@ class DefocusConsistencyVerifier(nn.Module):
         return torch.stack(blurred, dim=1).mean(dim=1)
 
     def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Return residual maps from defocus and refocus consistency checks."""
+        """Return residual maps from defocus rendering consistency checks."""
         FocusMeasureBank._validate_stack(focal_stack)
         batch, planes, _, height, width = focal_stack.shape
         if depth_canonical.dim() == 3:
@@ -125,9 +125,8 @@ class DefocusConsistencyVerifier(nn.Module):
         blurred = self._multi_blur(aif)[:, None]
         rendered = (1.0 - blur_amount) * aif[:, None] + blur_amount * blurred
         defocus_residual = (rendered - focal_stack_unit).abs().mean(dim=2).mean(dim=1, keepdim=True).clamp(0.0, 1.0)
-        refocused = focal_stack_unit.mean(dim=1)
-        refocus_residual = (refocused - aif).abs().mean(dim=1, keepdim=True).clamp(0.0, 1.0)
-        return {"defocus_residual": defocus_residual, "refocus_residual": refocus_residual, "rendered_stack": rendered}
+        stack_reprojection_residual = defocus_residual
+        return {"defocus_residual": defocus_residual, "stack_reprojection_residual": stack_reprojection_residual, "rendered_stack": rendered}
 
 
 class FocalPhysicalVerifier(nn.Module):
@@ -158,9 +157,9 @@ class FocalPhysicalVerifier(nn.Module):
         generation_discrepancy = (prior - focus_depth).abs().clamp(0.0, 1.0)
         focus_support = (focus["focus_peak_confidence"] * focus["focus_margin"] * (1.0 - focus["focus_entropy"]) * focus["operator_agreement"] * focus["texture_confidence"]).clamp(0.0, 1.0)
         physical_penalty = torch.maximum(discrepancy, residuals["defocus_residual"])
-        generation_support = ((1.0 - generation_discrepancy) * (1.0 - residuals["refocus_residual"])).clamp(0.0, 1.0)
+        generation_support = ((1.0 - generation_discrepancy) * (1.0 - residuals["stack_reprojection_residual"])).clamp(0.0, 1.0)
         conflict_score = torch.maximum(discrepancy, generation_discrepancy).clamp(0.0, 1.0)
-        invalid_score = torch.maximum(focus["focus_entropy"], torch.maximum(residuals["defocus_residual"], residuals["refocus_residual"])).clamp(0.0, 1.0)
+        invalid_score = torch.maximum(focus["focus_entropy"], residuals["stack_reprojection_residual"]).clamp(0.0, 1.0)
         support_logit = focus_support + generation_support - physical_penalty
         verdict_logits = torch.cat([support_logit, conflict_score, invalid_score], dim=1)
         return PhysicalVerificationTrace(
@@ -173,7 +172,7 @@ class FocalPhysicalVerifier(nn.Module):
             texture_confidence=focus["texture_confidence"],
             depth_focus_discrepancy=discrepancy,
             defocus_residual=residuals["defocus_residual"],
-            refocus_residual=residuals["refocus_residual"],
+            stack_reprojection_residual=residuals["stack_reprojection_residual"],
             focus_support=focus_support,
             generation_support=generation_support,
             conflict_score=conflict_score,

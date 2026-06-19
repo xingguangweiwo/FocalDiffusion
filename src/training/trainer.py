@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 from datetime import datetime
 import json
+import hashlib
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +23,7 @@ from huggingface_hub.errors import GatedRepoError
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
 from ..models.focal_evidence_encoder import build_physical_evidence_features
@@ -38,16 +39,20 @@ class FocalStackGenerationTrainer:
         self.config = config
         self.setup_logging()
         self.setup_accelerator()
+        self.self_improvement_cfg = self.config.get('training', {}).get('self_improvement', {}) or {}
         self.setup_model()
         self.setup_data()
         self.setup_optimization()
         self.setup_tracking()
 
-        self.self_improvement_cfg = self.config.get('training', {}).get('self_improvement', {}) or {}
         self.trace_mining_buffer = TraceMiningBuffer(
             max_items=int(self.self_improvement_cfg.get('max_buffer_items', 128)),
             round_id=str(self.self_improvement_cfg.get('round_id', 'M0')),
+            round_index=int(self.self_improvement_cfg.get('round_index', 0)),
+            manifest_path=self.self_improvement_cfg.get('mining_manifest'),
         )
+        if bool(self.self_improvement_cfg.get('enabled', False)):
+            self._freeze_physical_verifier()
 
         self.current_epoch = 0
         self.global_step = 0
@@ -111,6 +116,7 @@ class FocalStackGenerationTrainer:
 
         dataset_type = dataset_cfg.get('dataset_type')
         train_sources = dataset_cfg.get('train_sources')
+        self_improvement_sources = dataset_cfg.get('self_improvement_sources')
         val_sources = dataset_cfg.get('val_sources')
         train_filelist = dataset_cfg.get('train_filelist')
         val_filelist = dataset_cfg.get('val_filelist')
@@ -147,8 +153,52 @@ class FocalStackGenerationTrainer:
             sources=val_sources,
             **val_dataset_kwargs,
         )
+        self.self_improvement_dataloader = None
+        if self_improvement_sources:
+            self._ensure_self_improvement_is_not_test(dataset_cfg)
+            self.self_improvement_dataloader = create_dataloader(
+                dataset_type=dataset_type,
+                filelist_path=None,
+                data_root=dataset_cfg.get('data_root', "./data"),
+                batch_size=int(self.self_improvement_cfg.get('replay_batch_size', self.config['training']['batch_size'])),
+                num_workers=dataset_cfg['num_workers'],
+                image_size=tuple(dataset_cfg['image_size']),
+                focal_stack_size=dataset_cfg['focal_stack_size'],
+                focal_range=tuple(dataset_cfg['focal_range']),
+                resize_mode=dataset_cfg.get('resize_mode', 'letterbox'),
+                augmentation=False,
+                shuffle=True,
+                max_samples=dataset_cfg.get('max_self_improvement_samples'),
+                sources=self_improvement_sources,
+                **base_dataset_kwargs,
+            )
         logger.info(f"Train samples: {len(self.train_dataloader.dataset)}")
         logger.info(f"Val samples: {len(self.val_dataloader.dataset)}")
+        if self.self_improvement_dataloader is not None:
+            logger.info("Self-improvement adaptation samples: %s", len(self.self_improvement_dataloader.dataset))
+
+    @staticmethod
+    def _source_filelists(sources: Iterable[dict[str, Any]] | None) -> set[str]:
+        return {str(source.get("filelist")) for source in (sources or []) if source.get("filelist")}
+
+    def _ensure_self_improvement_is_not_test(self, dataset_cfg: dict[str, Any]) -> None:
+        adapt_filelists = self._source_filelists(dataset_cfg.get("self_improvement_sources"))
+        test_filelists = self._source_filelists(dataset_cfg.get("test_sources"))
+        overlap = adapt_filelists & test_filelists
+        if overlap:
+            raise ValueError(
+                "data.self_improvement_sources must not overlap data.test_sources; "
+                f"overlapping filelists: {sorted(overlap)}"
+            )
+
+    def _freeze_physical_verifier(self) -> None:
+        """Freeze the non-learned verifier during verifier-guided adaptation."""
+        verifier = getattr(self.pipeline, "physical_verifier", None)
+        if verifier is None:
+            return
+        verifier.eval()
+        for parameter in verifier.parameters():
+            parameter.requires_grad_(False)
 
     def setup_model(self):
         """Initialize model components"""
@@ -401,7 +451,7 @@ class FocalStackGenerationTrainer:
         best_val_loss = float('inf')
         for epoch in range(self.config['training']['num_epochs']):
             self.current_epoch = epoch
-            train_loss = self.train_epoch(epoch)
+            train_loss = self.train_epoch(epoch, self.global_step)
             if epoch % self.config['training']['val_every_n_epochs'] == 0:
                 val_metrics = self.validate(epoch)
                 if self.accelerator.is_main_process:
@@ -456,12 +506,21 @@ class FocalStackGenerationTrainer:
         )
         loss_fn = loss_fn.to(self.accelerator.device)
         self_improvement_enabled = bool(self.self_improvement_cfg.get('enabled', False))
-        mine_every_n_steps = max(1, int(self.self_improvement_cfg.get('mine_every_n_steps', 100)))
         mining_conflict_threshold = float(self.self_improvement_cfg.get('conflict_threshold', 0.5))
         mining_confidence_threshold = float(self.self_improvement_cfg.get('confidence_threshold', 0.8))
         trace_replay_weight = float(self.config['losses'].get('lambda_violation', 0.02))
+        if self_improvement_enabled and len(self.trace_mining_buffer) == 0:
+            self._mine_self_improvement_manifest(
+                max_batches=int(self.self_improvement_cfg.get("max_mining_batches", 8)),
+                conflict_threshold=mining_conflict_threshold,
+                confidence_threshold=mining_confidence_threshold,
+            )
 
         prompt_embeds, pooled_prompt_embeds = self._get_empty_prompt_embeddings()
+        replay_iterator = iter(self.self_improvement_dataloader) if (self_improvement_enabled and self.self_improvement_dataloader is not None) else None
+        replay_batch_count = 0
+        replay_loss_running = 0.0
+        source_loss_running = 0.0
         progress_bar = tqdm(
             self.train_dataloader,
             desc=f"Epoch {epoch}",
@@ -652,41 +711,56 @@ class FocalStackGenerationTrainer:
                     )
                     mined_trace_stats = {
                         "mined_trace_items": 0,
+                        "mined_sample_count": 0,
+                        "accepted_conflict_count": 0,
+                        "accepted_invalid_count": 0,
+                        "accepted_reliable_count": 0,
                         "buffer_size": len(self.trace_mining_buffer),
                         "mined_conflict_mean": 0.0,
                         "mined_invalid_mean": 0.0,
                     }
                     if self_improvement_enabled:
-                        replay_loss = self.trace_mining_buffer.replay_loss(uncertainty_final.float())
+                        replay_loss = None
+                        if replay_iterator is not None:
+                            try:
+                                replay_batch = next(replay_iterator)
+                            except StopIteration:
+                                replay_iterator = iter(self.self_improvement_dataloader)
+                                replay_batch = next(replay_iterator)
+                            replay_loss = self._compute_adaptation_replay_loss(
+                                replay_batch,
+                                max_items=int(self.self_improvement_cfg.get("max_replay_items_per_batch", 4)),
+                            )
                         if replay_loss is not None:
                             replay_loss = trace_replay_weight * replay_loss
                             loss_dict["loss_violation"] = loss_dict["loss_violation"] + replay_loss
                             loss_dict["loss_trace_replay"] = replay_loss
                             loss_dict["total"] = loss_dict["total"] + replay_loss
-                        if (global_step + step) % mine_every_n_steps == 0:
-                            mined_trace_stats = self.trace_mining_buffer.mine(
-                                trace=physical_verification_trace,
-                                uncertainty=uncertainty_final.float(),
-                                sample_ids=batch.get("sample_path"),
-                                batch_index=global_step + step,
-                                conflict_threshold=mining_conflict_threshold,
-                                confidence_threshold=mining_confidence_threshold,
-                            )
+                            replay_batch_count += 1
+                            replay_loss_running += float(replay_loss.detach().item())
                     loss = loss_dict['total']
+                source_loss_running += float((loss_dict['total'] - loss_dict.get('loss_trace_replay', torch.zeros_like(loss_dict['total']))).detach().item())
 
                 self.accelerator.backward(loss)
-                if self.config['training'].get('max_grad_norm'):
-                    clip_params = list(self._iter_pipeline_parameters(only_trainable=True))
-                    if clip_params:
-                        self.accelerator.clip_grad_norm_(clip_params, self.config['training']['max_grad_norm'])
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                self.optimizer.zero_grad()
-                if self.ema is not None:
-                    self.ema.step(self._ema_parameters())
+                gradient_norm = 0.0
                 if self.accelerator.sync_gradients:
+                    if self.config['training'].get('max_grad_norm'):
+                        clip_params = list(self._iter_pipeline_parameters(only_trainable=True))
+                        if clip_params:
+                            clipped_norm = self.accelerator.clip_grad_norm_(clip_params, self.config['training']['max_grad_norm'])
+                            gradient_norm = float(clipped_norm.detach().item() if isinstance(clipped_norm, torch.Tensor) else clipped_norm)
+                    else:
+                        grad_sq = 0.0
+                        for param in self._iter_pipeline_parameters(only_trainable=True):
+                            if param.grad is not None:
+                                grad_sq += float(param.grad.detach().float().norm(2).item() ** 2)
+                        gradient_norm = math.sqrt(grad_sq)
+                    self.optimizer.step()
+                    self.lr_scheduler.step()
+                    self.optimizer.zero_grad()
+                    if self.ema is not None:
+                        self.ema.step(self._ema_parameters())
                     self.global_step += 1
-
                 effective_steps += 1
                 epoch_loss += loss.item()
                 if step % self.config['logging']['log_every_n_steps'] == 0:
@@ -703,11 +777,134 @@ class FocalStackGenerationTrainer:
                             'train_abstention_weight_mean': abstention_weight.mean().item(),
                             'train_physical_evidence_support_mean': support_outputs['physical_evidence_support'].mean().item(),
                             'train_generated_focal_depth_disagreement': support_maps['depth_disagreement'].mean().item(),
+                            **{f'train_{k}': v for k, v in mined_trace_stats.items()},
+                            'train_replay_batch_count': replay_batch_count,
+                            'train_replay_loss': replay_loss_running / max(replay_batch_count, 1),
+                            'train_source_loss': source_loss_running / max(effective_steps + 1, 1),
+                            'train_gradient_norm': gradient_norm,
                         }, step=self.global_step)
 
         if effective_steps == 0:
             return 0.0
         return epoch_loss / effective_steps
+
+    def _mine_self_improvement_manifest(
+        self,
+        *,
+        max_batches: int,
+        conflict_threshold: float,
+        confidence_threshold: float,
+    ) -> dict[str, float]:
+        """Mine verifier targets from U_adapt with a frozen verifier.
+
+        This is the M0 mining pass. It reads only
+        ``data.self_improvement_sources`` and stores a lightweight manifest
+        for replay; no detached prediction tensors are saved.
+        """
+        if self.self_improvement_dataloader is None:
+            raise ValueError("self-improvement is enabled but data.self_improvement_sources is not configured")
+        self._freeze_physical_verifier()
+        stats = {
+            "mined_sample_count": 0.0,
+            "accepted_conflict_count": 0.0,
+            "accepted_invalid_count": 0.0,
+            "accepted_reliable_count": 0.0,
+            "buffer_size": float(len(self.trace_mining_buffer)),
+        }
+        device = self.accelerator.device
+        was_training = {
+            "focal_evidence_head": self.focal_evidence_head.training,
+            "physical_evidence_support_head": self.physical_evidence_support_head.training,
+        }
+        self.focal_evidence_head.eval()
+        self.physical_evidence_support_head.eval()
+        with torch.no_grad():
+            for batch_index, batch in enumerate(self.self_improvement_dataloader):
+                if batch_index >= max_batches:
+                    break
+                focal_stack = batch["focal_stack"].to(device)
+                focal_plane_distances = batch["focal_plane_distances"].to(device)
+                focal_stack_unit = focal_stack.float().clamp(0.0, 1.0)
+                focal_stack_signed = focal_stack_unit * 2.0 - 1.0 if focal_stack_unit.min() >= 0 else focal_stack.float()
+                focal_evidence = self.focal_evidence_head(focal_stack_signed.float(), focal_plane_distances.float())
+                focal_depth_canonical = focal_evidence["focal_depth_canonical"].float()
+                focal_posterior = focal_evidence["focal_posterior"].float()
+                focal_entropy = focal_evidence["focal_entropy"].float()
+                if focal_stack_unit.shape[-2:] != focal_depth_canonical.shape[-2:]:
+                    focal_stack_for_aif = F.interpolate(
+                        focal_stack_unit.flatten(0, 1),
+                        size=focal_depth_canonical.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).reshape(focal_stack_unit.shape[0], focal_stack_unit.shape[1], focal_stack_unit.shape[2], *focal_depth_canonical.shape[-2:])
+                else:
+                    focal_stack_for_aif = focal_stack_unit
+                posterior_for_aif = focal_posterior
+                if posterior_for_aif.shape[-2:] != focal_stack_for_aif.shape[-2:]:
+                    posterior_for_aif = F.interpolate(posterior_for_aif, size=focal_stack_for_aif.shape[-2:], mode="bilinear", align_corners=False)
+                    posterior_for_aif = posterior_for_aif / posterior_for_aif.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                aif_proxy = (posterior_for_aif[:, :, None] * focal_stack_for_aif).sum(dim=1).clamp(0.0, 1.0)
+                support_inputs, _ = build_physical_evidence_features(
+                    focal_posterior=focal_posterior,
+                    focal_entropy=focal_entropy,
+                    focal_depth_canonical=focal_depth_canonical,
+                    generated_depth_canonical=focal_depth_canonical,
+                    generative_uncertainty=focal_entropy,
+                )
+                support_outputs = self.physical_evidence_support_head(support_inputs)
+                trace = self.pipeline.physical_verifier(
+                    focal_stack=focal_stack_unit,
+                    focal_plane_distances=focal_plane_distances.float(),
+                    depth_canonical=focal_depth_canonical,
+                    all_in_focus=aif_proxy,
+                    generated_depth_canonical=focal_depth_canonical,
+                )
+                mined = self.trace_mining_buffer.mine(
+                    trace=trace,
+                    uncertainty=support_outputs["uncertainty_final"].float(),
+                    sample_ids=batch.get("sample_path"),
+                    batch_index=batch_index,
+                    focal_plane_coordinates=focal_plane_distances.float().detach().cpu(),
+                    conflict_threshold=conflict_threshold,
+                    confidence_threshold=confidence_threshold,
+                )
+                for key in ("mined_sample_count", "accepted_conflict_count", "accepted_invalid_count", "accepted_reliable_count"):
+                    stats[key] += float(mined.get(key, 0.0))
+                stats["buffer_size"] = float(len(self.trace_mining_buffer))
+        if was_training["focal_evidence_head"]:
+            self.focal_evidence_head.train()
+        if was_training["physical_evidence_support_head"]:
+            self.physical_evidence_support_head.train()
+        logger.info("Mined self-improvement manifest: %s", stats)
+        return stats
+
+    def _compute_adaptation_replay_loss(self, batch: dict[str, Any], max_items: int) -> torch.Tensor | None:
+        """Re-read a U_adapt batch and compute replay loss from current M1 outputs."""
+        if not self.trace_mining_buffer.items:
+            return None
+        device = self.accelerator.device
+        focal_stack = batch["focal_stack"].to(device)
+        focal_plane_distances = batch["focal_plane_distances"].to(device)
+        focal_stack_unit = focal_stack.float().clamp(0.0, 1.0)
+        focal_stack_signed = focal_stack_unit * 2.0 - 1.0 if focal_stack_unit.min() >= 0 else focal_stack.float()
+        focal_evidence = self.focal_evidence_head(focal_stack_signed.float(), focal_plane_distances.float())
+        focal_depth_canonical = focal_evidence["focal_depth_canonical"].float()
+        focal_posterior = focal_evidence["focal_posterior"].float()
+        focal_entropy = focal_evidence["focal_entropy"].float()
+        support_inputs, _ = build_physical_evidence_features(
+            focal_posterior=focal_posterior,
+            focal_entropy=focal_entropy,
+            focal_depth_canonical=focal_depth_canonical,
+            generated_depth_canonical=focal_depth_canonical,
+            generative_uncertainty=focal_entropy,
+        )
+        support_outputs = self.physical_evidence_support_head(support_inputs)
+        return self.trace_mining_buffer.replay_loss(
+            predicted_support=support_outputs["physical_evidence_support"].float(),
+            predicted_invalid=support_outputs["uncertainty_final"].float(),
+            sample_ids=batch.get("sample_path"),
+            max_items=max_items,
+        )
 
     def _get_empty_prompt_embeddings(self) -> Tuple[torch.Tensor, torch.Tensor]:
         cache = self._empty_prompt_cache
@@ -771,13 +968,30 @@ class FocalStackGenerationTrainer:
 
 
 class TraceMiningBuffer:
-    """Lightweight replay buffer for mined physical-verification trace patches."""
+    """Lightweight manifest of mined physical-verification trace patches.
 
-    def __init__(self, max_items: int = 128, round_id: str = "M0", patch_size: int = 16) -> None:
+    The manifest stores source identity, crop geometry, focal-plane coordinates
+    and scalar supervision targets. It intentionally does not store detached
+    model predictions; replay must re-read the source focal stack and run the
+    current model forward so gradients update M1 parameters.
+    """
+
+    def __init__(
+        self,
+        max_items: int = 128,
+        round_id: str = "M0",
+        patch_size: int = 16,
+        round_index: int = 0,
+        manifest_path: str | os.PathLike[str] | None = None,
+    ) -> None:
         self.max_items = max(1, int(max_items))
         self.round_id = round_id
         self.patch_size = max(1, int(patch_size))
+        self.round_index = int(round_index)
+        self.manifest_path = Path(manifest_path) if manifest_path else None
         self.items: list[dict[str, Any]] = []
+        if self.manifest_path and self.manifest_path.exists():
+            self.load(self.manifest_path)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -826,6 +1040,7 @@ class TraceMiningBuffer:
         discrepancy: torch.Tensor,
         sample_id: str,
         batch_index: int,
+        focal_plane_coordinates: torch.Tensor | None,
         conflict_threshold: float,
         confidence_threshold: float,
     ) -> dict[str, Any] | None:
@@ -838,18 +1053,32 @@ class TraceMiningBuffer:
         y = flat_index // width
         x = flat_index % width
         y0, y1, x0, x1 = self._crop_bounds(y, x, height, width)
-        target_patch = torch.maximum(torch.maximum(conflict[..., y0:y1, x0:x1], invalid[..., y0:y1, x0:x1]), discrepancy[..., y0:y1, x0:x1])
+        conflict_patch = conflict[..., y0:y1, x0:x1]
+        invalid_patch = invalid[..., y0:y1, x0:x1]
+        support_patch = (1.0 - torch.maximum(conflict_patch, invalid_patch)).clamp(0.0, 1.0)
+        if verdict_type in {"conflict", "focus_discrepancy"}:
+            support_patch = support_patch * (1.0 - discrepancy[..., y0:y1, x0:x1]).clamp(0.0, 1.0)
+        focal_plane_coordinates_list = None
+        if focal_plane_coordinates is not None:
+            focal_plane_coordinates_list = [float(value) for value in focal_plane_coordinates.detach().cpu().flatten().tolist()]
         item = {
             "round_id": self.round_id,
+            "round_index": self.round_index,
             "sample_id": sample_id,
+            "sample_path": sample_id,
             "batch_index": int(batch_index),
             "verdict_type": verdict_type,
-            "crop": (int(y0), int(y1), int(x0), int(x1)),
-            "source_shape": (int(height), int(width)),
-            "conflict_mean": float(conflict[..., y0:y1, x0:x1].mean().item()),
-            "invalid_mean": float(invalid[..., y0:y1, x0:x1].mean().item()),
+            "crop": {"y0": int(y0), "y1": int(y1), "x0": int(x0), "x1": int(x1)},
+            "source_shape": {"height": int(height), "width": int(width)},
+            "focal_plane_coordinates": focal_plane_coordinates_list,
+            "conflict_target": float(conflict_patch.mean().item()),
+            "invalid_target": float(invalid_patch.mean().item()),
+            "support_target": float(support_patch.mean().item()),
+            "verifier_confidence": float(confidence[..., y0:y1, x0:x1].mean().item()),
+            "depth_focus_discrepancy_target": float(discrepancy[..., y0:y1, x0:x1].mean().item()),
+            "conflict_mean": float(conflict_patch.mean().item()),
+            "invalid_mean": float(invalid_patch.mean().item()),
             "uncertainty_mean": float(uncertainty[..., y0:y1, x0:x1].mean().item()),
-            "target_patch": target_patch.detach().cpu().to(dtype=torch.float16),
         }
         self._append_item(item)
         return item
@@ -861,8 +1090,12 @@ class TraceMiningBuffer:
         uncertainty: torch.Tensor,
         sample_ids: Any,
         batch_index: int,
+        focal_plane_coordinates: torch.Tensor | None = None,
         conflict_threshold: float,
         confidence_threshold: float,
+        invalid_threshold: float | None = None,
+        support_threshold: float = 0.5,
+        discrepancy_threshold: float | None = None,
     ) -> dict[str, float]:
         conflict = self._as_bchw(getattr(trace, "conflict_score")).detach().float().clamp(0.0, 1.0)
         invalid = self._as_bchw(getattr(trace, "invalid_score")).detach().float().clamp(0.0, 1.0)
@@ -872,6 +1105,8 @@ class TraceMiningBuffer:
         if uncertainty.shape[-2:] != conflict.shape[-2:]:
             uncertainty = F.interpolate(uncertainty, size=conflict.shape[-2:], mode="bilinear", align_corners=False)
         confidence = (1.0 - uncertainty).clamp(0.0, 1.0)
+        invalid_threshold = conflict_threshold if invalid_threshold is None else invalid_threshold
+        discrepancy_threshold = conflict_threshold if discrepancy_threshold is None else discrepancy_threshold
 
         mined: list[dict[str, Any]] = []
         batch = conflict.shape[0]
@@ -879,10 +1114,21 @@ class TraceMiningBuffer:
             sample_id = self._sample_id(sample_ids, batch_idx, batch_index)
             maps = {
                 "conflict": conflict[batch_idx : batch_idx + 1],
-                "invalid": invalid[batch_idx : batch_idx + 1],
+                "invalid": invalid[batch_idx : batch_idx + 1] * confidence[batch_idx : batch_idx + 1],
                 "focus_discrepancy": discrepancy[batch_idx : batch_idx + 1] * focus_support[batch_idx : batch_idx + 1],
+                "reliable_non_conflict": (focus_support[batch_idx : batch_idx + 1] * (1.0 - conflict[batch_idx : batch_idx + 1]) * (1.0 - invalid[batch_idx : batch_idx + 1])),
             }
             for verdict_type, score_map in maps.items():
+                threshold = conflict_threshold
+                if verdict_type == "invalid":
+                    threshold = invalid_threshold
+                elif verdict_type == "focus_discrepancy":
+                    threshold = discrepancy_threshold
+                elif verdict_type == "reliable_non_conflict":
+                    threshold = support_threshold
+                focal_coords_one = None
+                if focal_plane_coordinates is not None:
+                    focal_coords_one = focal_plane_coordinates[batch_idx] if focal_plane_coordinates.dim() > 1 else focal_plane_coordinates
                 item = self._mine_one(
                     verdict_type=verdict_type,
                     score_map=score_map,
@@ -893,7 +1139,8 @@ class TraceMiningBuffer:
                     discrepancy=discrepancy[batch_idx : batch_idx + 1],
                     sample_id=sample_id,
                     batch_index=batch_index,
-                    conflict_threshold=conflict_threshold,
+                    focal_plane_coordinates=focal_coords_one,
+                    conflict_threshold=threshold,
                     confidence_threshold=confidence_threshold,
                 )
                 if item is not None:
@@ -902,35 +1149,109 @@ class TraceMiningBuffer:
         if not mined:
             return {
                 "mined_trace_items": 0,
+                "mined_sample_count": 0,
+                "accepted_conflict_count": 0,
+                "accepted_invalid_count": 0,
+                "accepted_reliable_count": 0,
                 "buffer_size": len(self),
                 "mined_conflict_mean": 0.0,
                 "mined_invalid_mean": 0.0,
             }
+        if self.manifest_path:
+            self.save(self.manifest_path)
         return {
             "mined_trace_items": float(len(mined)),
+            "mined_sample_count": float(len(mined)),
+            "accepted_conflict_count": float(sum(1 for item in mined if item["verdict_type"] == "conflict")),
+            "accepted_invalid_count": float(sum(1 for item in mined if item["verdict_type"] == "invalid")),
+            "accepted_reliable_count": float(sum(1 for item in mined if item["verdict_type"] == "reliable_non_conflict")),
             "buffer_size": float(len(self)),
             "mined_conflict_mean": sum(item["conflict_mean"] for item in mined) / len(mined),
             "mined_invalid_mean": sum(item["invalid_mean"] for item in mined) / len(mined),
         }
 
-    def replay_loss(self, predicted_invalid: torch.Tensor, max_items: int = 4) -> torch.Tensor | None:
+    def save(self, path: str | os.PathLike[str]) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for item in self.items:
+                handle.write(json.dumps(item) + "\n")
+
+    def load(self, path: str | os.PathLike[str]) -> None:
+        loaded: list[dict[str, Any]] = []
+        with Path(path).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    loaded.append(json.loads(line))
+        self.items = loaded[-self.max_items :]
+
+    @staticmethod
+    def _crop_from_item(item: dict[str, Any]) -> tuple[int, int, int, int]:
+        crop = item["crop"]
+        if isinstance(crop, dict):
+            return int(crop["y0"]), int(crop["y1"]), int(crop["x0"]), int(crop["x1"])
+        y0, y1, x0, x1 = crop
+        return int(y0), int(y1), int(x0), int(x1)
+
+    @staticmethod
+    def _shape_from_item(item: dict[str, Any]) -> tuple[int, int]:
+        shape = item["source_shape"]
+        if isinstance(shape, dict):
+            return int(shape["height"]), int(shape["width"])
+        height, width = shape
+        return int(height), int(width)
+
+    def replay_loss(
+        self,
+        *,
+        predicted_support: torch.Tensor,
+        predicted_invalid: torch.Tensor,
+        predicted_conflict: torch.Tensor | None = None,
+        sample_ids: Any = None,
+        max_items: int = 4,
+    ) -> torch.Tensor | None:
         if not self.items:
             return None
-        prediction = self._as_bchw(predicted_invalid).float().clamp(1e-6, 1.0 - 1e-6)
+        allowed_sample_ids: set[str] | None = None
+        if sample_ids is not None:
+            if isinstance(sample_ids, str):
+                allowed_sample_ids = {sample_ids}
+            elif isinstance(sample_ids, (list, tuple)):
+                allowed_sample_ids = {str(item) for item in sample_ids}
+        support_prediction = self._as_bchw(predicted_support).float().clamp(1e-6, 1.0 - 1e-6)
+        invalid_prediction = self._as_bchw(predicted_invalid).float().clamp(1e-6, 1.0 - 1e-6)
+        conflict_prediction = self._as_bchw(predicted_conflict).float().clamp(1e-6, 1.0 - 1e-6) if predicted_conflict is not None else None
         losses: list[torch.Tensor] = []
-        for item in self.items[-max_items:]:
-            height, width = item["source_shape"]
-            y0, y1, x0, x1 = item["crop"]
-            pred_h, pred_w = prediction.shape[-2:]
+        candidate_items = self.items
+        if allowed_sample_ids is not None:
+            candidate_items = [item for item in self.items if str(item.get("sample_id")) in allowed_sample_ids or str(item.get("sample_path")) in allowed_sample_ids]
+        for item in candidate_items[-max_items:]:
+            height, width = self._shape_from_item(item)
+            y0, y1, x0, x1 = self._crop_from_item(item)
+            pred_h, pred_w = invalid_prediction.shape[-2:]
             py0 = max(0, min(pred_h - 1, math.floor(y0 * pred_h / height)))
             py1 = max(py0 + 1, min(pred_h, math.ceil(y1 * pred_h / height)))
             px0 = max(0, min(pred_w - 1, math.floor(x0 * pred_w / width)))
             px1 = max(px0 + 1, min(pred_w, math.ceil(x1 * pred_w / width)))
-            pred_patch = prediction[:, :, py0:py1, px0:px1]
-            target_patch = item["target_patch"].to(device=prediction.device, dtype=prediction.dtype)
-            target_patch = F.interpolate(target_patch, size=pred_patch.shape[-2:], mode="bilinear", align_corners=False)
-            target_patch = target_patch.expand(pred_patch.shape[0], -1, -1, -1).clamp(0.0, 1.0)
-            losses.append(F.binary_cross_entropy(pred_patch, target_patch))
+            invalid_patch = invalid_prediction[:, :, py0:py1, px0:px1]
+            support_patch = support_prediction[:, :, py0:py1, px0:px1]
+            invalid_target = torch.full_like(invalid_patch, float(item["invalid_target"]))
+            support_target = torch.full_like(support_patch, float(item["support_target"]))
+            losses.append(F.binary_cross_entropy(invalid_patch, invalid_target))
+            losses.append(F.binary_cross_entropy(support_patch, support_target))
+            if conflict_prediction is not None:
+                conflict_patch = conflict_prediction[:, :, py0:py1, px0:px1]
+                conflict_target = torch.full_like(conflict_patch, float(item["conflict_target"]))
+                losses.append(F.binary_cross_entropy(conflict_patch, conflict_target))
         if not losses:
             return None
         return torch.stack(losses).mean()
+
+
+def checkpoint_sha256(path: str | os.PathLike[str]) -> str:
+    """Return a SHA256 digest for checkpoint identity comparisons."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

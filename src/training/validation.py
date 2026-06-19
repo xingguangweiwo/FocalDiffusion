@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, Tuple
 
+import math
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -316,6 +317,8 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
         'uncertainty_error_l1': 0.0,
         'generated_focal_depth_disagreement': 0.0,
         'uncertainty_mean': 0.0,
+        'heldout_physical_hallucination_rate': 0.0,
+        'heldout_VPR_at_coverage': 0.0,
     }
     metric_depth_batches = 0
     normalized_depth_batches = 0
@@ -366,6 +369,36 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
                 metrics["posterior_margin_mean"] += output.posterior_margin.mean().item()
             if output.uncertainty_final is not None:
                 metrics["uncertainty_final_mean"] += output.uncertainty_final.mean().item()
+            trace = getattr(output, "physical_verification_trace", None)
+            if trace is not None:
+                invalid = trace.invalid_score.detach().float().clamp(0.0, 1.0)
+                conflict = trace.conflict_score.detach().float().clamp(0.0, 1.0)
+                if uncertainty is None:
+                    uncertainty_for_trace = torch.zeros_like(conflict)
+                else:
+                    uncertainty_for_trace = uncertainty.unsqueeze(1) if uncertainty.dim() == 3 else uncertainty
+                    if uncertainty_for_trace.shape[-2:] != conflict.shape[-2:]:
+                        uncertainty_for_trace = F.interpolate(uncertainty_for_trace.float(), size=conflict.shape[-2:], mode="bilinear", align_corners=False)
+                heldout_cfg = trainer.config.get("validation", {}).get("heldout_verifier", {})
+                confidence_threshold = float(heldout_cfg.get("confidence_threshold", 0.8))
+                invalid_threshold = float(heldout_cfg.get("invalid_threshold", 0.5))
+                conflict_threshold = float(heldout_cfg.get("conflict_threshold", 0.5))
+                coverage = float(heldout_cfg.get("coverage", 0.2))
+                confidence = (1.0 - uncertainty_for_trace.float().clamp(0.0, 1.0)).clamp(0.0, 1.0)
+                high_confidence = confidence >= confidence_threshold
+                physically_valid = invalid < invalid_threshold
+                phr_den = (high_confidence & physically_valid).float().sum()
+                phr_num = (high_confidence & physically_valid & (conflict >= conflict_threshold)).float().sum()
+                metrics["heldout_physical_hallucination_rate"] += float("nan") if phr_den.item() == 0 else (phr_num / phr_den).item()
+                sample_vprs = []
+                for sample_idx in range(confidence.shape[0]):
+                    flat_confidence = confidence[sample_idx].flatten()
+                    flat_conflict = conflict[sample_idx].flatten()
+                    flat_invalid = invalid[sample_idx].flatten()
+                    coverage_count = max(1, min(flat_confidence.numel(), int(math.ceil(flat_confidence.numel() * coverage))))
+                    top_indices = torch.topk(flat_confidence, k=coverage_count).indices
+                    sample_vprs.append(((flat_conflict[top_indices] < conflict_threshold) & (flat_invalid[top_indices] < invalid_threshold)).float().mean())
+                metrics["heldout_VPR_at_coverage"] += torch.stack(sample_vprs).mean().item()
 
             depth_gt, depth_range, mask = _prepare_depth_target(batch, final_depth_canonical.device)
             if depth_gt is not None and depth_range is not None:

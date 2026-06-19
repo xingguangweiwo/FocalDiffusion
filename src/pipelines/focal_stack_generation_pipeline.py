@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import logging
+import warnings
 import math
 import torch
 import torch.nn as nn
@@ -90,10 +91,11 @@ class FocalStackGenerationOutput(BaseOutput):
     uncertainty_final: Optional[torch.Tensor] = None
     depth_focus_metric: Optional[torch.Tensor] = None
     physical_verification_trace: Optional[PhysicalVerificationTrace] = None
+    refinement_history: Optional[List[Dict[str, Any]]] = None
     accepted_refinement_steps: int = 0
     rejected_refinement_steps: int = 0
-    physical_risk_before: Optional[torch.Tensor] = None
-    physical_risk_after: Optional[torch.Tensor] = None
+    physical_risk_before: Optional[float] = None
+    physical_risk_after: Optional[float] = None
 
 
 class FocalInjectedSD3Transformer(nn.Module):
@@ -219,15 +221,6 @@ class FocalInjectedSD3Transformer(nn.Module):
 
         return (result,)
 
-    def _get_condition_adapter(self, channels: int) -> nn.Conv2d:
-        if channels != self.condition_channels:
-            raise ValueError(
-                "Focal condition channel mismatch: "
-                f"expected {self.condition_channels}, got {channels}. "
-                "Condition adapters are fixed at initialization; rebuild the pipeline with a matching focal_processor."
-            )
-        return self.condition_adapter
-
     @staticmethod
     def _match_condition_batch(condition: torch.Tensor, target_batch: int) -> torch.Tensor:
         if condition.shape[0] == target_batch:
@@ -255,8 +248,12 @@ class FocalInjectedSD3Transformer(nn.Module):
         if fused.shape[-2:] != spatial_size:
             fused = F.interpolate(fused, size=spatial_size, mode="bilinear", align_corners=False)
 
-        adapter = self._get_condition_adapter(fused.shape[1]).to(device=fused.device, dtype=fused.dtype)
-        conditioned = adapter(fused)
+        if fused.shape[1] != self.condition_channels:
+            raise ValueError(
+                "fused focal feature channels must match the initialized condition adapter; "
+                f"expected {self.condition_channels}, got {fused.shape[1]}"
+            )
+        conditioned = self.condition_adapter.to(device=fused.device, dtype=fused.dtype)(fused)
 
         spatial_maps = focal_features.get("temporal_attention_maps")
         if spatial_maps is not None:
@@ -737,22 +734,21 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
 
 
         verifier_device, verifier_dtype = _module_device_dtype(self.physical_verifier, torch.device(device), dtype)
-
-        def run_verifier(depth: torch.Tensor) -> PhysicalVerificationTrace:
-            return self.physical_verifier(
-                focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
-                focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
-                depth_canonical=depth.to(device=verifier_device, dtype=verifier_dtype),
-                all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
-                generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
-            )
-
-        verification_trace = run_verifier(final_depth_canonical)
-        initial_physical_risk = self._physical_risk(verification_trace).detach()
-        current_physical_risk = initial_physical_risk
+        verification_trace = self.physical_verifier(
+            focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
+            focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
+            depth_canonical=final_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+            all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
+            generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+        )
+        refinement_history: Optional[List[Dict[str, Any]]] = [] if (return_refinement_history and num_refinement_steps > 0) else None
         accepted_refinement_steps = 0
         rejected_refinement_steps = 0
-        for _ in range(num_refinement_steps):
+        refinement_epsilon = 1e-4
+        initial_physical_risk = self._physical_risk(verification_trace)
+        physical_risk_before = initial_physical_risk
+        physical_risk_after = initial_physical_risk
+        for refinement_step in range(num_refinement_steps):
             candidate_depth, candidate_uncertainty = self._apply_trace_refinement(
                 final_depth_canonical=final_depth_canonical,
                 focal_depth_canonical=focal_depth_canonical,
@@ -760,17 +756,44 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
                 uncertainty_final=uncertainty_final,
                 trace=verification_trace,
             )
-            candidate_trace = run_verifier(candidate_depth)
-            candidate_physical_risk = self._physical_risk(candidate_trace).detach()
-            if self._should_accept_refinement(current_physical_risk, candidate_physical_risk, trace_refinement_epsilon):
+            candidate_trace = self.physical_verifier(
+                focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
+                focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
+                depth_canonical=candidate_depth.to(device=verifier_device, dtype=verifier_dtype),
+                all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
+                generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+            )
+            accepted, current_risk, candidate_risk = self._accept_refinement_candidate(
+                verification_trace,
+                candidate_trace,
+                epsilon=refinement_epsilon,
+            )
+            if accepted:
                 final_depth_canonical = candidate_depth
                 uncertainty_final = candidate_uncertainty
                 verification_trace = candidate_trace
-                current_physical_risk = candidate_physical_risk
                 accepted_refinement_steps += 1
-                depth_map = final_depth_canonical.squeeze(1)
+                physical_risk_after = candidate_risk
             else:
                 rejected_refinement_steps += 1
+                physical_risk_after = current_risk
+            depth_map = final_depth_canonical.squeeze(1)
+            if refinement_history is not None:
+                refinement_history.append(
+                    {
+                        "step": refinement_step,
+                        "accepted": accepted,
+                        "physical_risk_before": current_risk,
+                        "physical_risk_after": physical_risk_after,
+                        "final_depth_canonical": final_depth_canonical.detach().cpu(),
+                        "uncertainty_final": uncertainty_final.detach().cpu(),
+                        "mean_conflict_score": float(verification_trace.conflict_score.detach().float().mean().item()),
+                        "mean_invalid_score": float(verification_trace.invalid_score.detach().float().mean().item()),
+                        "mean_focus_support": float(verification_trace.focus_support.detach().float().mean().item()),
+                        "mean_generation_support": float(verification_trace.generation_support.detach().float().mean().item()),
+                    }
+                )
+            if not accepted:
                 break
 
         if output_type == "pil":
@@ -807,24 +830,34 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             uncertainty_final=uncertainty_final.squeeze(1),
             depth_focus_metric=depth_focus_metric,
             physical_verification_trace=verification_trace,
+            refinement_history=refinement_history,
             accepted_refinement_steps=accepted_refinement_steps,
             rejected_refinement_steps=rejected_refinement_steps,
-            physical_risk_before=initial_physical_risk,
-            physical_risk_after=current_physical_risk,
+            physical_risk_before=physical_risk_before,
+            physical_risk_after=physical_risk_after,
         )
 
 
     @staticmethod
-    def _physical_risk(trace: PhysicalVerificationTrace) -> torch.Tensor:
+    def _physical_risk(trace: PhysicalVerificationTrace) -> float:
+        """Return a scalar physical risk without merging conflict and invalid events."""
         conflict = trace.conflict_score.detach().float().clamp(0.0, 1.0)
         invalid = trace.invalid_score.detach().float().clamp(0.0, 1.0)
-        return (0.5 * (conflict + invalid)).mean()
+        support = trace.focus_support.detach().float().clamp(0.0, 1.0)
+        return float((0.5 * conflict + 0.5 * invalid + 0.25 * (1.0 - support)).mean().item())
 
 
-    @staticmethod
-    def _should_accept_refinement(current_risk: torch.Tensor, candidate_risk: torch.Tensor, epsilon: float) -> bool:
-        return bool((candidate_risk <= current_risk - float(epsilon)).item())
-
+    @classmethod
+    def _accept_refinement_candidate(
+        cls,
+        current_trace: PhysicalVerificationTrace,
+        candidate_trace: PhysicalVerificationTrace,
+        epsilon: float = 1e-4,
+    ) -> tuple[bool, float, float]:
+        """Accept a candidate only when physical risk decreases by ``epsilon``."""
+        current_risk = cls._physical_risk(current_trace)
+        candidate_risk = cls._physical_risk(candidate_trace)
+        return candidate_risk <= current_risk - epsilon, current_risk, candidate_risk
 
     @staticmethod
     def _apply_trace_refinement(
@@ -928,5 +961,25 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
 
 
 # Backward-compatible aliases for external scripts using pre-rename APIs.
-FocalDiffusionOutput = FocalStackGenerationOutput
-FocalDiffusionPipeline = FocalStackGenerationPipeline
+@dataclass
+class FocalDiffusionOutput(FocalStackGenerationOutput):
+    """Deprecated compatibility alias for :class:`FocalStackGenerationOutput`."""
+
+    def __post_init__(self) -> None:
+        warnings.warn(
+            "FocalDiffusionOutput is deprecated; use FocalStackGenerationOutput instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+
+class FocalDiffusionPipeline(FocalStackGenerationPipeline):
+    """Deprecated compatibility alias for :class:`FocalStackGenerationPipeline`."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        warnings.warn(
+            "FocalDiffusionPipeline is deprecated; use FocalStackGenerationPipeline instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)

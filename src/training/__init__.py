@@ -3,7 +3,6 @@
 from .trainer import FocalStackGenerationTrainer
 from .losses import (
     FocalStackGenerationLoss,
-    PhysicalPreferenceLoss,
     SelectiveViolationLoss,
     VerificationTraceLoss,
 )
@@ -14,7 +13,6 @@ __all__ = [
     "FocalStackGenerationLoss",
     "VerificationTraceLoss",
     "SelectiveViolationLoss",
-    "PhysicalPreferenceLoss",
     "get_optimizer",
     "get_scheduler",
 ]

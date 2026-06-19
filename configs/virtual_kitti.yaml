@@ -8,6 +8,10 @@ data:
     - name: virtual_kitti
       data_root: /data/virtual_kitti/vkitti_2.0.3_rgb
       filelist: data/filelists/vkitti_train.txt
+  self_improvement_sources:
+    - name: virtual_kitti_adapt_unlabeled
+      data_root: /data/virtual_kitti/vkitti_2.0.3_rgb
+      filelist: data/filelists/vkitti_adapt_unlabeled.txt
   val_sources:
     - name: virtual_kitti
       data_root: /data/virtual_kitti/vkitti_2.0.3_rgb

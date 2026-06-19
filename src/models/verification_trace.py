@@ -26,7 +26,7 @@ class PhysicalVerificationTrace:
     texture_confidence: torch.Tensor
     depth_focus_discrepancy: torch.Tensor
     defocus_residual: torch.Tensor
-    refocus_residual: torch.Tensor
+    stack_reprojection_residual: torch.Tensor
     focus_support: torch.Tensor
     generation_support: torch.Tensor
     conflict_score: torch.Tensor
