@@ -1,4 +1,5 @@
 import pytest
+import math
 import torch
 
 from src.models import FocalStackProcessor
@@ -294,7 +295,7 @@ def test_focal_physical_verifier_trace_shapes_for_batch_first_stack():
         "texture_confidence",
         "depth_focus_discrepancy",
         "defocus_residual",
-        "refocus_residual",
+        "stack_reprojection_residual",
         "focus_support",
         "generation_support",
         "conflict_score",
@@ -307,6 +308,9 @@ def test_focal_physical_verifier_trace_shapes_for_batch_first_stack():
     with pytest.warns(DeprecationWarning, match="focus_peak is deprecated"):
         assert torch.equal(trace.focus_peak, trace.focus_peak_confidence)
     assert trace.verdict_logits.shape == (B, 3, H, W)
+    for value in trace.__dict__.values():
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            assert torch.isfinite(value).all()
 
 
 def test_trace_refinement_preserves_output_fields():
@@ -337,6 +341,33 @@ def test_trace_refinement_preserves_output_fields():
     assert out.physical_verification_trace is trace
 
 
+def test_trace_refinement_accepts_only_improved_physical_risk():
+    from dataclasses import replace
+
+    from src.models.physics_modules import FocalPhysicalVerifier
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationPipeline
+
+    B, K, C, H, W = 1, 3, 3, 8, 8
+    trace = FocalPhysicalVerifier()(torch.rand(B, K, C, H, W), torch.linspace(0, 1, K), torch.rand(B, 1, H, W), torch.rand(B, C, H, W))
+    improved = replace(
+        trace,
+        conflict_score=(trace.conflict_score * 0.1).clamp(0.0, 1.0),
+        invalid_score=(trace.invalid_score * 0.1).clamp(0.0, 1.0),
+    )
+    worse = replace(
+        trace,
+        conflict_score=torch.ones_like(trace.conflict_score),
+        invalid_score=torch.ones_like(trace.invalid_score),
+    )
+
+    accepted, before, after = FocalStackGenerationPipeline._accept_refinement_candidate(trace, improved, epsilon=1e-6)
+    assert accepted
+    assert after < before
+    rejected, before_reject, after_reject = FocalStackGenerationPipeline._accept_refinement_candidate(trace, worse, epsilon=1e-6)
+    assert not rejected
+    assert after_reject > before_reject
+
+
 def test_evaluate_trace_metrics_computes_phr_vpr_at_coverage():
     from types import SimpleNamespace
 
@@ -361,13 +392,61 @@ def test_evaluate_trace_metrics_computes_phr_vpr_at_coverage():
 
     assert "FCPV" not in metrics
     assert "PVPR" not in metrics
-    assert metrics["PHR"] == metrics["false_confident_violation_rate"]
-    assert metrics["false_confident_violation_rate"] == pytest.approx(2 / 3)
+    assert "PHR" not in metrics
+    assert "false_confident_violation_rate" not in metrics
+    assert metrics["physical_hallucination_rate"] == pytest.approx(2 / 3)
     assert metrics["VPR_at_coverage"] == pytest.approx(0.5)
-    assert metrics["focus_supported_valid_mass"] == pytest.approx(0.425)
+    assert metrics["VPR_at_coverage_std"] == pytest.approx(0.0)
+    assert metrics["invalid_overconfidence_rate"] == pytest.approx(0.0)
+    assert metrics["accepted_coverage"] == pytest.approx(0.75)
+    assert metrics["coverage"] == pytest.approx(0.5)
+    assert metrics["diagnostics"]["focus_supported_valid_mass"] == pytest.approx(0.75)
     assert metrics["mean_conflict_score"] == pytest.approx(0.4)
     assert metrics["mean_invalid_score"] == pytest.approx(0.375)
-    assert "uncertainty_selective_focus_consistency" in metrics
+    assert "invalid_calibration_error" in metrics
+
+
+def test_evaluate_trace_metrics_returns_nan_for_empty_phr_denominator():
+    from types import SimpleNamespace
+
+    from script.evaluate import compute_trace_metrics
+
+    trace = SimpleNamespace(
+        focus_support=torch.ones(1, 1, 2, 2),
+        conflict_score=torch.zeros(1, 1, 2, 2),
+        invalid_score=torch.ones(1, 1, 2, 2),
+    )
+    output = SimpleNamespace(
+        uncertainty_final=torch.zeros(1, 2, 2),
+        physical_verification_trace=trace,
+    )
+
+    metrics = compute_trace_metrics(output, confidence_threshold=0.5, violation_threshold=0.5, coverage=0.5)
+
+    assert math.isnan(metrics["physical_hallucination_rate"])
+    assert metrics["invalid_overconfidence_rate"] == pytest.approx(1.0)
+    assert metrics["accepted_coverage"] == pytest.approx(0.0)
+
+
+def test_evaluate_trace_metrics_vpr_is_per_sample_mean_and_std():
+    from types import SimpleNamespace
+
+    from script.evaluate import compute_trace_metrics
+
+    trace = SimpleNamespace(
+        focus_support=torch.ones(2, 1, 1, 4),
+        conflict_score=torch.tensor([[[[0.0, 0.9, 0.0, 0.0]]], [[[0.9, 0.8, 0.0, 0.0]]]]),
+        invalid_score=torch.zeros(2, 1, 1, 4),
+    )
+    output = SimpleNamespace(
+        uncertainty_final=torch.tensor([[[0.1, 0.2, 0.9, 0.9]], [[0.1, 0.2, 0.9, 0.9]]]),
+        physical_verification_trace=trace,
+    )
+
+    metrics = compute_trace_metrics(output, confidence_threshold=0.5, violation_threshold=0.5, coverage=0.5)
+
+    assert metrics["VPR_at_coverage"] == pytest.approx(0.25)
+    assert metrics["VPR_at_coverage_std"] == pytest.approx(0.25)
 
 
 def test_serialize_refinement_history_compacts_tensors_for_json():

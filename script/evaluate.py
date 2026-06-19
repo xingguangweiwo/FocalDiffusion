@@ -28,23 +28,71 @@ def _as_bchw(value: torch.Tensor | None) -> torch.Tensor | None:
     raise ValueError(f"Expected [B,H,W] or [B,C,H,W] tensor, got {tuple(value.shape)}")
 
 
+def _safe_ratio(numerator: torch.Tensor, denominator: torch.Tensor) -> float:
+    """Return numerator/denominator or NaN when the denominator is empty."""
+    if float(denominator.item()) == 0.0:
+        return float("nan")
+    return float((numerator / denominator).item())
+
+
+def _sample_vpr_at_coverage(
+    confidence: torch.Tensor,
+    conflict: torch.Tensor,
+    invalid: torch.Tensor,
+    coverage: float,
+    conflict_threshold: float,
+    invalid_threshold: float,
+) -> tuple[float, float]:
+    """Compute per-sample VPR@coverage mean/std and accepted coverage."""
+    batch = confidence.shape[0]
+    coverage = min(max(float(coverage), 0.0), 1.0)
+    sample_rates: list[float] = []
+    accepted_coverages: list[float] = []
+    for index in range(batch):
+        flat_confidence = confidence[index].flatten()
+        flat_conflict = conflict[index].flatten()
+        flat_invalid = invalid[index].flatten()
+        if flat_confidence.numel() == 0:
+            sample_rates.append(float("nan"))
+            accepted_coverages.append(float("nan"))
+            continue
+        coverage_count = max(1, min(flat_confidence.numel(), int(math.ceil(flat_confidence.numel() * coverage))))
+        top_indices = torch.topk(flat_confidence, k=coverage_count).indices
+        pass_mask = (flat_conflict[top_indices] < conflict_threshold) & (flat_invalid[top_indices] < invalid_threshold)
+        sample_rates.append(float(pass_mask.float().mean().item()))
+        accepted_coverages.append(float(coverage_count / flat_confidence.numel()))
+    rates = torch.tensor(sample_rates, dtype=torch.float32)
+    valid_rates = rates[torch.isfinite(rates)]
+    if valid_rates.numel() == 0:
+        return float("nan"), float("nan")
+    std = float(valid_rates.std(unbiased=False).item()) if valid_rates.numel() > 1 else 0.0
+    return float(valid_rates.mean().item()), std
+
+
 def compute_trace_metrics(
     output,
     confidence_threshold: float = 0.8,
     violation_threshold: float = 0.5,
     coverage: float = 0.2,
+    invalid_threshold: float | None = None,
+    conflict_threshold: float | None = None,
 ) -> dict[str, float]:
     """Compute FocalTrace metrics from a pipeline output object."""
+    invalid_threshold = violation_threshold if invalid_threshold is None else invalid_threshold
+    conflict_threshold = violation_threshold if conflict_threshold is None else conflict_threshold
     trace = getattr(output, "physical_verification_trace", None)
     if trace is None:
         return {
-            "PHR": 0.0,
-            "false_confident_violation_rate": 0.0,
-            "VPR_at_coverage": 0.0,
-            "focus_supported_valid_mass": 0.0,
-            "uncertainty_selective_focus_consistency": 0.0,
-            "mean_conflict_score": 0.0,
-            "mean_invalid_score": 0.0,
+            "physical_hallucination_rate": float("nan"),
+            "invalid_overconfidence_rate": float("nan"),
+            "VPR_at_coverage": float("nan"),
+            "VPR_at_coverage_std": float("nan"),
+            "coverage": float(coverage),
+            "accepted_coverage": float("nan"),
+            "mean_conflict_score": float("nan"),
+            "mean_invalid_score": float("nan"),
+            "invalid_calibration_error": float("nan"),
+            "diagnostics": {},
         }
 
     focus_support = trace.focus_support.detach().float().clamp(0.0, 1.0)
@@ -64,32 +112,46 @@ def compute_trace_metrics(
         )
 
     uncertainty = uncertainty.float().clamp(0.0, 1.0)
-    violation = torch.maximum(conflict, invalid).clamp(0.0, 1.0)
     confidence = (1.0 - uncertainty).clamp(0.0, 1.0)
     high_confidence = confidence >= confidence_threshold
-    physical_violation = violation >= violation_threshold
-    high_confidence_count = high_confidence.sum().clamp(min=1)
-    false_confident_violation_rate = (high_confidence & physical_violation).float().sum() / high_confidence_count
+    physically_valid_evidence = invalid < invalid_threshold
+    conflict_event = conflict >= conflict_threshold
+    phr_denominator = (high_confidence & physically_valid_evidence).float().sum()
+    phr_numerator = (high_confidence & physically_valid_evidence & conflict_event).float().sum()
+    ior_denominator = (invalid >= invalid_threshold).float().sum()
+    ior_numerator = (high_confidence & (invalid >= invalid_threshold)).float().sum()
+    phr = _safe_ratio(phr_numerator, phr_denominator)
+    ior = _safe_ratio(ior_numerator, ior_denominator)
 
-    flat_confidence = confidence.flatten()
-    flat_violation = violation.flatten()
-    coverage = min(max(float(coverage), 0.0), 1.0)
-    coverage_count = max(1, min(flat_confidence.numel(), int(math.ceil(flat_confidence.numel() * coverage))))
-    top_indices = torch.topk(flat_confidence, k=coverage_count).indices
-    vpr_at_coverage = (flat_violation[top_indices] < violation_threshold).float().mean()
+    vpr_mean, vpr_std = _sample_vpr_at_coverage(
+        confidence=confidence,
+        conflict=conflict,
+        invalid=invalid,
+        coverage=coverage,
+        conflict_threshold=conflict_threshold,
+        invalid_threshold=invalid_threshold,
+    )
 
-    physically_valid = (1.0 - violation).clamp(0.0, 1.0)
+    physically_valid = (invalid < invalid_threshold).to(dtype=focus_support.dtype)
     focus_supported_valid_mass = (focus_support * physically_valid).mean()
-    selective_consistency = (1.0 - torch.abs(uncertainty - violation)).mean()
+    invalid_calibration_error = torch.abs(uncertainty - invalid).mean()
+    accepted_coverage = float(phr_denominator.item() / max(high_confidence.numel(), 1))
 
     return {
-        "PHR": float(false_confident_violation_rate.item()),
-        "false_confident_violation_rate": float(false_confident_violation_rate.item()),
-        "VPR_at_coverage": float(vpr_at_coverage.item()),
-        "focus_supported_valid_mass": float(focus_supported_valid_mass.item()),
-        "uncertainty_selective_focus_consistency": float(selective_consistency.item()),
+        "physical_hallucination_rate": phr,
+        "invalid_overconfidence_rate": ior,
+        "VPR_at_coverage": vpr_mean,
+        "VPR_at_coverage_std": vpr_std,
+        "coverage": float(coverage),
+        "accepted_coverage": accepted_coverage,
         "mean_conflict_score": float(conflict.mean().item()),
         "mean_invalid_score": float(invalid.mean().item()),
+        "invalid_calibration_error": float(invalid_calibration_error.item()),
+        "diagnostics": {
+            "focus_supported_valid_mass": float(focus_supported_valid_mass.item()),
+            "phr_denominator": float(phr_denominator.item()),
+            "ior_denominator": float(ior_denominator.item()),
+        },
     }
 
 

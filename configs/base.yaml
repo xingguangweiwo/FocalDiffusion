@@ -22,6 +22,13 @@ data:
     - name: virtual_kitti
       data_root: /path/to/virtual_kitti
       filelist: data/filelists/vkitti_train.txt
+  self_improvement_sources:
+    - name: hypersim_adapt_unlabeled
+      data_root: /path/to/hypersim
+      filelist: data/filelists/hypersim_adapt_unlabeled.txt
+    - name: virtual_kitti_adapt_unlabeled
+      data_root: /path/to/virtual_kitti
+      filelist: data/filelists/vkitti_adapt_unlabeled.txt
   val_sources:
     - name: hypersim
       data_root: /path/to/hypersim
@@ -72,8 +79,13 @@ training:
   supervision_mode: supervised
   self_improvement:
     enabled: false
+    round_index: 0
     round_id: M0
-    mine_every_n_steps: 100
+    parent_checkpoint: null
+    mining_manifest: outputs/self_improvement/round_1_manifest.jsonl
+    max_mining_batches: 8
+    replay_batch_size: 2
+    replay_batches_per_epoch: 1
     max_buffer_items: 128
     conflict_threshold: 0.5
     confidence_threshold: 0.8
@@ -114,6 +126,13 @@ losses:
 validation:
   num_inference_steps: 30
   guidance_scale: 1.0
+  # Thresholds selected on validation split only; do not tune on test_sources.
+  heldout_verifier:
+    focus_operator: laplacian_tenengrad_heldout
+    confidence_threshold: 0.8
+    invalid_threshold: 0.5
+    conflict_threshold: 0.5
+    coverage: 0.2
 
 logging:
   level: INFO

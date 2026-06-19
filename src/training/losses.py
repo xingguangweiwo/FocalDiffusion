@@ -255,24 +255,18 @@ class VerificationTraceLoss(nn.Module):
         lambda_trace: float = 1.0,
         lambda_invalid: float = 1.0,
         support_weight: float = 1.0,
-        conflict_weight: float = 1.0,
-        verdict_weight: float = 1.0,
     ) -> None:
         """Configure trace-supervision weights for scalar maps and verdict logits."""
         super().__init__()
         self.lambda_trace = lambda_trace
         self.lambda_invalid = lambda_invalid
         self.support_weight = support_weight
-        self.conflict_weight = conflict_weight
-        self.verdict_weight = verdict_weight
 
     def forward(
         self,
         trace: object,
         pred_support: torch.Tensor | None = None,
         pred_invalid: torch.Tensor | None = None,
-        pred_conflict: torch.Tensor | None = None,
-        pred_verdict_logits: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return trace supervision losses and detached trace metrics."""
         target_support = _trace_physical_support(trace)
@@ -284,27 +278,8 @@ class VerificationTraceLoss(nn.Module):
 
         if pred_support is not None:
             loss = loss + self.support_weight * _probability_loss(pred_support, target_support)
-        if pred_conflict is not None:
-            loss = loss + self.conflict_weight * _probability_loss(pred_conflict, target_conflict)
         if pred_invalid is not None:
             loss = loss + self.lambda_invalid * _probability_loss(pred_invalid, target_invalid)
-        if pred_verdict_logits is not None:
-            logits = pred_verdict_logits
-            if logits.dim() != 4 or logits.shape[1] != 3:
-                raise ValueError(
-                    "pred_verdict_logits must have shape [B, 3, H, W], "
-                    f"got {tuple(logits.shape)}"
-                )
-            target_stack = torch.cat(
-                [
-                    _resize_to_reference(target_support, logits[:, :1]),
-                    _resize_to_reference(target_conflict, logits[:, :1]),
-                    _resize_to_reference(target_invalid, logits[:, :1]),
-                ],
-                dim=1,
-            ).detach()
-            target_class = target_stack.argmax(dim=1)
-            loss = loss + self.verdict_weight * F.cross_entropy(logits, target_class)
 
         return {
             "loss_trace": self.lambda_trace * loss,
@@ -344,59 +319,6 @@ class SelectiveViolationLoss(nn.Module):
         }
 
 
-class PhysicalPreferenceLoss(nn.Module):
-    """Rank paired predictions so the higher physical-score output is preferred."""
-
-    def __init__(self, lambda_preference: float = 1.0, margin: float = 0.05) -> None:
-        """Configure pairwise physical preference ranking weight and margin."""
-        super().__init__()
-        self.lambda_preference = lambda_preference
-        self.margin = margin
-
-    @staticmethod
-    def physical_score_from_trace(trace: object) -> torch.Tensor:
-        """Compute a detached scalar physical score from a verification trace."""
-        support = _trace_physical_support(trace)
-        conflict = getattr(trace, "conflict_score").detach().clamp(0.0, 1.0)
-        invalid = getattr(trace, "invalid_score").detach().clamp(0.0, 1.0)
-        return (support - 0.5 * conflict - 0.5 * invalid).mean(dim=(1, 2, 3)).detach()
-
-    def forward(
-        self,
-        score_y0: torch.Tensor | None = None,
-        score_y1: torch.Tensor | None = None,
-        pred_preference_logit: torch.Tensor | None = None,
-        trace_y0: object | None = None,
-        trace_y1: object | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Return a pairwise ranking loss for two candidate outputs ``Y0`` and ``Y1``."""
-        if score_y0 is None:
-            if trace_y0 is None:
-                raise ValueError("Either score_y0 or trace_y0 must be provided.")
-            score_y0 = self.physical_score_from_trace(trace_y0)
-        if score_y1 is None:
-            if trace_y1 is None:
-                raise ValueError("Either score_y1 or trace_y1 must be provided.")
-            score_y1 = self.physical_score_from_trace(trace_y1)
-
-        score_y0 = score_y0.flatten()
-        score_y1 = score_y1.flatten()
-        if score_y0.shape != score_y1.shape:
-            raise ValueError(f"score_y0 and score_y1 must have matching shapes, got {tuple(score_y0.shape)} and {tuple(score_y1.shape)}")
-        target_prefers_y1 = (score_y1.detach() > score_y0.detach()).to(dtype=score_y0.dtype)
-        direction = torch.where(target_prefers_y1 > 0.5, torch.ones_like(score_y0), -torch.ones_like(score_y0))
-
-        if pred_preference_logit is not None:
-            logits = pred_preference_logit.flatten().to(device=score_y0.device, dtype=score_y0.dtype)
-            if logits.shape != score_y0.shape:
-                raise ValueError(f"pred_preference_logit shape {tuple(logits.shape)} must match score shape {tuple(score_y0.shape)}")
-            loss = F.binary_cross_entropy_with_logits(logits, target_prefers_y1)
-        else:
-            score_gap = score_y1 - score_y0
-            loss = F.relu(self.margin - direction * score_gap).mean()
-
-        return {"loss_preference": self.lambda_preference * loss}
-
 
 class FocalStackGenerationLoss(nn.Module):
     """Main FEP training objective for flow, depth, evidence, AIF and uncertainty."""
@@ -422,11 +344,8 @@ class FocalStackGenerationLoss(nn.Module):
         gate_consistency_weight: float = 0.0,
         focal_axis_smoothness_weight: float = 0.0,
         local_affinity_sigma: float = 0.10,
-        verification_conflict_weight: float = 0.02,
-        verification_invalid_weight: float = 0.02,
         lambda_trace: float = 1.0,
         lambda_violation: float = 1.0,
-        lambda_preference: float = 1.0,
         lambda_invalid: float = 1.0,
     ) -> None:
         super().__init__()
@@ -451,15 +370,11 @@ class FocalStackGenerationLoss(nn.Module):
         self.gate_consistency_weight = gate_consistency_weight
         self.focal_axis_smoothness_weight = focal_axis_smoothness_weight
         self.local_affinity_sigma = local_affinity_sigma
-        self.verification_conflict_weight = verification_conflict_weight
-        self.verification_invalid_weight = verification_invalid_weight
         self.lambda_trace = lambda_trace
         self.lambda_violation = lambda_violation
-        self.lambda_preference = lambda_preference
         self.lambda_invalid = lambda_invalid
         self.trace_loss = VerificationTraceLoss(lambda_trace=lambda_trace, lambda_invalid=lambda_invalid)
         self.violation_loss = SelectiveViolationLoss(lambda_violation=lambda_violation)
-        self.preference_loss = PhysicalPreferenceLoss(lambda_preference=lambda_preference)
 
     @staticmethod
     def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
@@ -496,13 +411,6 @@ class FocalStackGenerationLoss(nn.Module):
         physical_verification_trace: object | None = None,
         predicted_verification_support: torch.Tensor | None = None,
         predicted_verification_invalid: torch.Tensor | None = None,
-        predicted_verification_conflict: torch.Tensor | None = None,
-        predicted_verdict_logits: torch.Tensor | None = None,
-        preference_score_y0: torch.Tensor | None = None,
-        preference_score_y1: torch.Tensor | None = None,
-        preference_logit: torch.Tensor | None = None,
-        preference_trace_y0: object | None = None,
-        preference_trace_y1: object | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute focal generation losses with optional PhysicalVerificationTrace penalties."""
         del generative_prior_weight, abstention_weight
@@ -669,28 +577,14 @@ class FocalStackGenerationLoss(nn.Module):
                 trace=physical_verification_trace,
                 pred_support=predicted_verification_support if predicted_verification_support is not None else physical_evidence_support,
                 pred_invalid=predicted_verification_invalid if predicted_verification_invalid is not None else uncertainty,
-                pred_conflict=predicted_verification_conflict,
-                pred_verdict_logits=predicted_verdict_logits,
             )
             losses.update(trace_outputs)
             if uncertainty is not None:
                 losses.update(self.violation_loss(physical_verification_trace, uncertainty))
 
-        if preference_score_y0 is not None or preference_score_y1 is not None or preference_trace_y0 is not None or preference_trace_y1 is not None:
-            losses.update(
-                self.preference_loss(
-                    score_y0=preference_score_y0,
-                    score_y1=preference_score_y1,
-                    pred_preference_logit=preference_logit,
-                    trace_y0=preference_trace_y0,
-                    trace_y1=preference_trace_y1,
-                )
-            )
-
         zero_for_log = torch.zeros_like(losses["loss_flow_matching"])
         losses.setdefault("loss_trace", zero_for_log)
         losses.setdefault("loss_violation", zero_for_log)
-        losses.setdefault("loss_preference", zero_for_log)
         losses.setdefault("mean_conflict_score", zero_for_log.detach())
         losses.setdefault("mean_invalid_score", zero_for_log.detach())
         losses.setdefault("false_confident_violation_rate", zero_for_log.detach())
@@ -724,6 +618,5 @@ class FocalStackGenerationLoss(nn.Module):
         )
         total = total + losses.get("loss_trace", torch.zeros_like(total))
         total = total + losses.get("loss_violation", torch.zeros_like(total))
-        total = total + losses.get("loss_preference", torch.zeros_like(total))
 
         return {**losses, "total": total}

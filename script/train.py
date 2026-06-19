@@ -233,7 +233,7 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
             if key in data_block:
                 data_block[key] = _resolve(data_block[key])
 
-        for sources_key in ("train_sources", "val_sources", "test_sources"):
+        for sources_key in ("train_sources", "self_improvement_sources", "val_sources", "test_sources"):
             sources = data_block.get(sources_key)
             if not isinstance(sources, list):
                 continue
@@ -410,9 +410,9 @@ def validate_config(config: dict) -> None:
             value = value[key]
 
     data_cfg = config.get('data', {})
-    has_sources = any(key in data_cfg for key in ('train_sources', 'val_sources', 'test_sources'))
+    has_sources = any(key in data_cfg for key in ('train_sources', 'self_improvement_sources', 'val_sources', 'test_sources'))
     if has_sources:
-        for split_key in ('train_sources', 'val_sources', 'test_sources'):
+        for split_key in ('train_sources', 'self_improvement_sources', 'val_sources', 'test_sources'):
             sources = data_cfg.get(split_key)
             if sources is None:
                 raise ValueError(f"Missing required config key: data.{split_key}")
@@ -425,6 +425,14 @@ def validate_config(config: dict) -> None:
                     raise ValueError(f"data.{split_key} entry is missing data_root")
                 if 'filelist' not in source:
                     raise ValueError(f"data.{split_key} entry is missing filelist")
+
+        train_files = {str(source.get('filelist')) for source in data_cfg.get('train_sources', [])}
+        adapt_files = {str(source.get('filelist')) for source in data_cfg.get('self_improvement_sources', [])}
+        test_files = {str(source.get('filelist')) for source in data_cfg.get('test_sources', [])}
+        if adapt_files & test_files:
+            raise ValueError("data.self_improvement_sources must not overlap data.test_sources")
+        if not adapt_files:
+            raise ValueError("data.self_improvement_sources must be a non-empty list when source-style data config is used")
     else:
         for key in ('data_root', 'train_filelist', 'val_filelist', 'test_filelist'):
             if key not in data_cfg:
@@ -439,7 +447,7 @@ def validate_config(config: dict) -> None:
 
     # Check paths exist
     if has_sources:
-        for split_key in ('train_sources', 'val_sources', 'test_sources'):
+        for split_key in ('train_sources', 'self_improvement_sources', 'val_sources', 'test_sources'):
             sources = data_cfg.get(split_key) or []
             for source in sources:
                 resolved_root = _resolve_data_root_spec(
@@ -535,6 +543,12 @@ def main():
         raise
 
     trainer = FocalStackGenerationTrainer(config)
+
+    self_improvement_cfg = config.get("training", {}).get("self_improvement", {}) or {}
+    parent_checkpoint = self_improvement_cfg.get("parent_checkpoint")
+    if self_improvement_cfg.get("enabled") and parent_checkpoint and not args.resume:
+        logger.info("Initializing M%s from parent checkpoint: %s", self_improvement_cfg.get("round_index", 1), parent_checkpoint)
+        trainer.load_checkpoint(parent_checkpoint)
 
     # Resume if specified
     start_epoch = 0

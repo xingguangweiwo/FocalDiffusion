@@ -43,6 +43,12 @@ def save_checkpoint(
         'optimizer_state_dict': trainer.optimizer.state_dict(),
         'scheduler_state_dict': trainer.lr_scheduler.state_dict(),
         'config': trainer.config,
+        'self_improvement': {
+            'round_index': getattr(trainer, 'self_improvement_cfg', {}).get('round_index', 0),
+            'parent_checkpoint': getattr(trainer, 'self_improvement_cfg', {}).get('parent_checkpoint'),
+            'mining_manifest': getattr(trainer, 'self_improvement_cfg', {}).get('mining_manifest'),
+            'mined_sample_count': len(getattr(trainer, 'trace_mining_buffer', [])),
+        },
     }
 
     if trainer.config['training']['trainable_modules']['transformer'] != 'frozen':
