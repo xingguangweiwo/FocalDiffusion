@@ -55,7 +55,22 @@ def test_focal_processor_rejects_more_than_one_hundred_slices():
 def test_pipeline_output_dataclass_exposes_focal_evidence_fields():
     from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationOutput
 
-    out = FocalStackGenerationOutput(depth_map=torch.zeros(1, 8, 8), all_in_focus_image=torch.zeros(1, 3, 8, 8))
+    history = [
+        {
+            "step": 0,
+            "final_depth_canonical": torch.zeros(1, 1, 8, 8),
+            "uncertainty_final": torch.ones(1, 1, 8, 8),
+            "mean_conflict_score": 0.1,
+            "mean_invalid_score": 0.2,
+            "mean_focus_support": 0.3,
+            "mean_generation_support": 0.4,
+        }
+    ]
+    out = FocalStackGenerationOutput(
+        depth_map=torch.zeros(1, 8, 8),
+        all_in_focus_image=torch.zeros(1, 3, 8, 8),
+        refinement_history=history,
+    )
     for name in (
         "generated_depth_canonical",
         "focal_depth_canonical",
@@ -71,8 +86,10 @@ def test_pipeline_output_dataclass_exposes_focal_evidence_fields():
         "depth_disagreement",
         "uncertainty_disagreement",
         "uncertainty_final",
+        "refinement_history",
     ):
         assert hasattr(out, name)
+    assert out.refinement_history is history
 
 
 def test_focal_posterior_kl_loss_is_finite():
@@ -268,7 +285,9 @@ def test_focal_physical_verifier_trace_shapes_for_batch_first_stack():
     trace = FocalPhysicalVerifier()(torch.rand(B, K, C, H, W), torch.linspace(0, 1, K), torch.rand(B, 1, H, W), torch.rand(B, C, H, W))
 
     for name in (
-        "focus_peak",
+        "focus_peak_confidence",
+        "focus_peak_index",
+        "focus_peak_coordinate",
         "focus_margin",
         "focus_entropy",
         "operator_agreement",
@@ -282,6 +301,11 @@ def test_focal_physical_verifier_trace_shapes_for_batch_first_stack():
         "invalid_score",
     ):
         assert getattr(trace, name).shape == (B, 1, H, W)
+    assert trace.focus_peak_index.dtype == torch.long
+    assert trace.focus_peak_coordinate.min() >= 0
+    assert trace.focus_peak_coordinate.max() <= 1
+    with pytest.warns(DeprecationWarning, match="focus_peak is deprecated"):
+        assert torch.equal(trace.focus_peak, trace.focus_peak_confidence)
     assert trace.verdict_logits.shape == (B, 3, H, W)
 
 
@@ -313,23 +337,70 @@ def test_trace_refinement_preserves_output_fields():
     assert out.physical_verification_trace is trace
 
 
-def test_evaluate_trace_metrics_computes_fcpv_pvpr():
-    from src.models.physics_modules import FocalPhysicalVerifier
-    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationOutput
+def test_evaluate_trace_metrics_computes_phr_vpr_at_coverage():
+    from types import SimpleNamespace
+
     from script.evaluate import compute_trace_metrics
 
-    B, K, C, H, W = 1, 3, 3, 8, 8
-    trace = FocalPhysicalVerifier()(torch.rand(B, K, C, H, W), torch.linspace(0, 1, K), torch.rand(B, 1, H, W), torch.rand(B, C, H, W))
-    output = FocalStackGenerationOutput(
-        depth_map=torch.rand(B, H, W),
-        all_in_focus_image=torch.rand(B, C, H, W),
-        uncertainty_final=torch.rand(B, H, W),
+    trace = SimpleNamespace(
+        focus_support=torch.ones(1, 1, 2, 2),
+        conflict_score=torch.tensor([[[[0.1, 0.7], [0.2, 0.6]]]]),
+        invalid_score=torch.tensor([[[[0.2, 0.1], [0.8, 0.4]]]]),
+    )
+    output = SimpleNamespace(
+        uncertainty_final=torch.tensor([[[0.1, 0.2], [0.8, 0.3]]]),
         physical_verification_trace=trace,
     )
-    metrics = compute_trace_metrics(output)
 
-    assert "FCPV" in metrics
-    assert "PVPR" in metrics
+    metrics = compute_trace_metrics(
+        output,
+        confidence_threshold=0.7,
+        violation_threshold=0.5,
+        coverage=0.5,
+    )
+
+    assert "FCPV" not in metrics
+    assert "PVPR" not in metrics
+    assert metrics["PHR"] == metrics["false_confident_violation_rate"]
+    assert metrics["false_confident_violation_rate"] == pytest.approx(2 / 3)
+    assert metrics["VPR_at_coverage"] == pytest.approx(0.5)
+    assert metrics["focus_supported_valid_mass"] == pytest.approx(0.425)
+    assert metrics["mean_conflict_score"] == pytest.approx(0.4)
+    assert metrics["mean_invalid_score"] == pytest.approx(0.375)
     assert "uncertainty_selective_focus_consistency" in metrics
-    assert "mean_conflict_score" in metrics
-    assert "mean_invalid_score" in metrics
+
+
+def test_serialize_refinement_history_compacts_tensors_for_json():
+    from script.evaluate import _serialize_refinement_history
+
+    curve = _serialize_refinement_history(
+        [
+            {
+                "step": 2,
+                "final_depth_canonical": torch.zeros(1, 1, 2, 2),
+                "uncertainty_final": torch.ones(1, 1, 2, 2),
+                "mean_conflict_score": 0.1,
+                "mean_invalid_score": 0.2,
+                "mean_focus_support": 0.3,
+                "mean_generation_support": 0.4,
+            }
+        ]
+    )
+
+    assert curve[0]["step"] == 2
+    assert curve[0]["final_depth_canonical"]["shape"] == [1, 1, 2, 2]
+    assert curve[0]["final_depth_canonical"]["mean"] == 0.0
+    assert curve[0]["uncertainty_final"]["mean"] == 1.0
+    assert curve[0]["mean_conflict_score"] == 0.1
+
+
+def test_focus_measure_bank_returns_peak_index_and_deprecated_alias():
+    from src.models.physics_modules import FocusMeasureBank
+
+    bank = FocusMeasureBank()
+    outputs = bank(torch.rand(1, 3, 3, 6, 5))
+
+    assert outputs["focus_peak_confidence"].shape == (1, 1, 6, 5)
+    assert outputs["focus_peak_index"].shape == (1, 1, 6, 5)
+    assert outputs["focus_peak_index"].dtype == torch.long
+    assert torch.equal(outputs["focus_peak"], outputs["focus_peak_confidence"])
