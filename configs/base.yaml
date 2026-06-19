@@ -70,6 +70,13 @@ training:
   lora_rank: 8
   lora_alpha: 16
   supervision_mode: supervised
+  self_improvement:
+    enabled: false
+    round_id: M0
+    mine_every_n_steps: 100
+    max_buffer_items: 128
+    conflict_threshold: 0.5
+    confidence_threshold: 0.8
 
 optimizer:
   type: adamw

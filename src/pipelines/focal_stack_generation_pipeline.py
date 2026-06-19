@@ -550,6 +550,8 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
                 returned as ``depth_focus_metric``.
             num_refinement_steps: Optional inference-time self-refinement steps.
                 ``0`` preserves the original single-pass behavior.
+            return_refinement_history: When ``True`` and refinement is enabled,
+                return per-step depth/uncertainty snapshots and trace summaries.
 
         Raises:
             ValueError: If ``focal_distance_mode`` is not ``"normalized"`` or

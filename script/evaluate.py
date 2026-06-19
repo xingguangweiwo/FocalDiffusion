@@ -4,6 +4,7 @@ Evaluation script for FocalStackGeneration with normalized-depth aware metrics.
 
 import argparse
 import json
+import math
 from pathlib import Path
 import torch
 import numpy as np
@@ -195,6 +196,38 @@ def save_trace_visualizations(output, output_dir: Path, prefix: str) -> None:
     _save_map_png(physical_verdict, output_dir / f"{prefix}_physical_verdict.png", cmap="tab10")
 
 
+
+
+def _tensor_curve_summary(value: torch.Tensor) -> dict[str, float | list[int]]:
+    """Return a compact JSON-serializable summary for a refinement tensor."""
+    value = value.detach().float().cpu()
+    return {
+        "shape": list(value.shape),
+        "mean": float(value.mean().item()),
+        "std": float(value.std().item()) if value.numel() > 1 else 0.0,
+        "min": float(value.min().item()),
+        "max": float(value.max().item()),
+    }
+
+
+def _serialize_refinement_history(history: list[dict]) -> list[dict]:
+    """Convert in-memory refinement history into a compact curve for JSON."""
+    curve = []
+    for index, item in enumerate(history):
+        curve.append(
+            {
+                "step": int(item.get("step", index)),
+                "final_depth_canonical": _tensor_curve_summary(item["final_depth_canonical"]),
+                "uncertainty_final": _tensor_curve_summary(item["uncertainty_final"]),
+                "mean_conflict_score": float(item["mean_conflict_score"]),
+                "mean_invalid_score": float(item["mean_invalid_score"]),
+                "mean_focus_support": float(item["mean_focus_support"]),
+                "mean_generation_support": float(item["mean_generation_support"]),
+            }
+        )
+    return curve
+
+
 def evaluate(args):
     from src.pipelines import load_pipeline
     from src.data import create_dataloader
@@ -225,9 +258,12 @@ def evaluate(args):
     )
 
     all_metrics = []
+    all_trace_metrics = []
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     visualization_dir = output_dir / "visualizations"
+    visualization_dir.mkdir(parents=True, exist_ok=True)
+    refinement_curves = []
 
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
         if args.max_samples and batch_idx * args.batch_size >= args.max_samples:
@@ -244,6 +280,7 @@ def evaluate(args):
                 num_inference_steps=args.num_inference_steps,
                 output_type='pt',
                 num_refinement_steps=args.num_refinement_steps,
+                return_refinement_history=args.num_refinement_steps > 0,
             )
 
         final_depth_canonical = output.depth_map
@@ -265,10 +302,26 @@ def evaluate(args):
                 depth_gt = depth_gt.unsqueeze(1)
             sample_metrics["normalized_loss"] = F.l1_loss(final_depth_canonical, depth_gt).item()
 
-        sample_metrics.update(compute_trace_metrics(output))
+        trace_metrics = compute_trace_metrics(
+            output,
+            confidence_threshold=args.confidence_threshold,
+            violation_threshold=args.violation_threshold,
+            coverage=args.coverage,
+        )
+        sample_metrics.update(trace_metrics)
+        all_trace_metrics.append(trace_metrics)
 
         if batch_idx == 0 or getattr(args, "save_all_visualizations", False):
             save_trace_visualizations(output, visualization_dir, prefix=f"sample_{batch_idx:05d}")
+
+        refinement_history = getattr(output, "refinement_history", None)
+        if refinement_history:
+            refinement_curves.append(
+                {
+                    "sample_index": batch_idx,
+                    "history": _serialize_refinement_history(refinement_history),
+                }
+            )
 
         uncertainty = getattr(output, "uncertainty_final", None)
         if uncertainty is None:
@@ -286,8 +339,19 @@ def evaluate(args):
         values = [m[key] for m in all_metrics if key in m]
         final_metrics[key] = {'mean': float(np.mean(values)), 'std': float(np.std(values)), 'median': float(np.median(values))}
 
+    trace_keys = sorted({k for m in all_trace_metrics for k in m.keys()})
+    final_trace_metrics = {}
+    for key in trace_keys:
+        values = [m[key] for m in all_trace_metrics if key in m]
+        final_trace_metrics[key] = {'mean': float(np.mean(values)), 'std': float(np.std(values)), 'median': float(np.median(values))}
+
     with open(output_dir / 'metrics.json', 'w') as f:
         json.dump(final_metrics, f, indent=2)
+    with open(output_dir / 'trace_metrics.json', 'w') as f:
+        json.dump(final_trace_metrics, f, indent=2)
+    if refinement_curves:
+        with open(output_dir / 'refinement_curve.json', 'w') as f:
+            json.dump(refinement_curves, f, indent=2)
 
     print("\nEvaluation Results:")
     print("-" * 40)
@@ -310,6 +374,24 @@ def main():
     parser.add_argument('--max_samples', type=int, help='Maximum samples to evaluate')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--fp16', action='store_true', help='Use FP16 precision')
+    parser.add_argument(
+        '--confidence-threshold',
+        type=float,
+        default=0.8,
+        help='Confidence threshold for false confident physical violations',
+    )
+    parser.add_argument(
+        '--violation-threshold',
+        type=float,
+        default=0.5,
+        help='Violation threshold for physical trace metrics',
+    )
+    parser.add_argument(
+        '--coverage',
+        type=float,
+        default=0.2,
+        help='Top-confidence coverage fraction for VPR_at_coverage',
+    )
     args = parser.parse_args()
     evaluate(args)
 
