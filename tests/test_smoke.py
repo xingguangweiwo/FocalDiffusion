@@ -88,6 +88,12 @@ def test_load_config_base_smoke():
     config = load_config("configs/base.yaml")
     assert config["model"]["feature_dim"] == 128
     assert config["data"]["dataset_kwargs"]["strict_data"] is True
+    assert config["losses"]["lambda_trace"] == 0.02
+    assert config["losses"]["lambda_violation"] == 0.02
+    assert config["losses"]["lambda_invalid"] == 0.02
+    assert config["training"]["self_improvement"]["enabled"] is False
+    assert config["training"]["self_improvement"]["round_id"] == "M0"
+    assert config["training"]["self_improvement"]["mine_every_n_steps"] == 100
 
 
 def test_dataset_strict_data_raises_on_missing_files(tmp_path):
@@ -429,3 +435,97 @@ def test_loss_forward_minimal_supervised():
 
     assert "total" in loss_dict
     assert torch.isfinite(loss_dict["total"])
+
+
+def test_defocus_consistency_range_invariant_residuals():
+    from src.models import DefocusConsistencyVerifier
+
+    torch.manual_seed(0)
+    focal_stack_unit = torch.rand(2, 4, 3, 16, 16)
+    all_in_focus_unit = focal_stack_unit.mean(dim=1)
+    focal_plane_distances = torch.linspace(0.0, 1.0, 4)
+    depth_canonical = torch.rand(2, 1, 16, 16)
+
+    verifier = DefocusConsistencyVerifier(max_blur_radius=3)
+    unit_outputs = verifier(focal_stack_unit, focal_plane_distances, depth_canonical, all_in_focus_unit)
+    signed_outputs = verifier(
+        focal_stack_unit * 2.0 - 1.0,
+        focal_plane_distances,
+        depth_canonical,
+        all_in_focus_unit * 2.0 - 1.0,
+    )
+
+    assert torch.allclose(
+        unit_outputs["defocus_residual"],
+        signed_outputs["defocus_residual"],
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        unit_outputs["refocus_residual"],
+        signed_outputs["refocus_residual"],
+        atol=1e-6,
+    )
+    assert unit_outputs.keys() == signed_outputs.keys()
+
+
+def test_loss_trace_terms_are_active_with_physical_verification_trace():
+    from types import SimpleNamespace
+
+    batch, height, width = 1, 4, 4
+    trace = SimpleNamespace(
+        focus_support=torch.ones(batch, 1, height, width),
+        generation_support=torch.ones(batch, 1, height, width),
+        conflict_score=torch.full((batch, 1, height, width), 0.75),
+        invalid_score=torch.full((batch, 1, height, width), 0.25),
+    )
+    loss_fn = FocalStackGenerationLoss(
+        lambda_trace=0.02,
+        lambda_violation=0.02,
+        lambda_invalid=0.02,
+    )
+
+    loss_dict = loss_fn(
+        diffusion_pred=torch.zeros(batch, 1, height, width),
+        diffusion_target=torch.zeros(batch, 1, height, width),
+        uncertainty=torch.zeros(batch, 1, height, width),
+        physical_verification_trace=trace,
+        predicted_verification_support=torch.full((batch, 1, height, width), 0.1),
+        predicted_verification_invalid=torch.full((batch, 1, height, width), 0.1),
+    )
+
+    assert loss_dict["loss_trace"] > 0
+    assert loss_dict["loss_violation"] > 0
+    assert loss_dict["mean_conflict_score"] == torch.tensor(0.75)
+    assert loss_dict["false_confident_violation_rate"] == torch.tensor(1.0)
+
+
+def test_trace_mining_buffer_mines_and_replays_small_patches():
+    from types import SimpleNamespace
+
+    from src.training.trainer import TraceMiningBuffer
+
+    trace = SimpleNamespace(
+        conflict_score=torch.tensor([[[[0.1, 0.9], [0.2, 0.3]]]]),
+        invalid_score=torch.tensor([[[[0.2, 0.1], [0.8, 0.4]]]]),
+        depth_focus_discrepancy=torch.tensor([[[[0.7, 0.1], [0.2, 0.1]]]]),
+        focus_support=torch.ones(1, 1, 2, 2),
+    )
+    buffer = TraceMiningBuffer(max_items=4, round_id="M0", patch_size=1)
+    stats = buffer.mine(
+        trace=trace,
+        uncertainty=torch.zeros(1, 1, 2, 2),
+        sample_ids=["sample_a"],
+        batch_index=3,
+        conflict_threshold=0.5,
+        confidence_threshold=0.5,
+    )
+
+    assert stats["mined_trace_items"] == 3
+    assert stats["buffer_size"] == 3
+    assert len(buffer) == 3
+    assert {item["verdict_type"] for item in buffer.items} == {"conflict", "invalid", "focus_discrepancy"}
+    assert all(item["target_patch"].numel() <= 1 for item in buffer.items)
+
+    replay_loss = buffer.replay_loss(torch.full((1, 1, 2, 2), 0.1))
+    assert replay_loss is not None
+    assert replay_loss > 0

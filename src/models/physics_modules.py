@@ -55,6 +55,7 @@ class FocusMeasureBank(nn.Module):
         posterior = torch.softmax(normalized_scores / 0.1, dim=1)
         topk = torch.topk(posterior, k=min(2, posterior.shape[1]), dim=1).values
         peak = topk[:, 0:1]
+        peak_index = posterior.argmax(dim=1, keepdim=True)
         margin = peak if posterior.shape[1] == 1 else topk[:, 0:1] - topk[:, 1:2]
         entropy = -(posterior * torch.log(posterior + self.eps)).sum(dim=1, keepdim=True) / math.log(max(posterior.shape[1], 2))
         winners = measures.argmax(dim=1)
@@ -64,7 +65,9 @@ class FocusMeasureBank(nn.Module):
         return {
             "focus_scores": normalized_scores,
             "focus_posterior": posterior,
-            "focus_peak": peak,
+            "focus_peak_confidence": peak,
+            "focus_peak": peak,  # Deprecated alias; prefer focus_peak_confidence.
+            "focus_peak_index": peak_index,
             "focus_margin": margin.clamp(0.0, 1.0),
             "focus_entropy": entropy.clamp(0.0, 1.0),
             "operator_agreement": agreement.clamp(0.0, 1.0),
@@ -109,14 +112,20 @@ class DefocusConsistencyVerifier(nn.Module):
         batch, planes, _, height, width = focal_stack.shape
         if depth_canonical.dim() == 3:
             depth_canonical = depth_canonical.unsqueeze(1)
+        def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
+            if image.amin() < 0:
+                image = (image + 1.0) * 0.5
+            return image
+
+        focal_stack_unit = _to_unit_range(focal_stack)
         depth = F.interpolate(depth_canonical, size=(height, width), mode="bilinear", align_corners=False).clamp(0.0, 1.0)
-        aif = F.interpolate(all_in_focus, size=(height, width), mode="bilinear", align_corners=False)
+        aif = F.interpolate(_to_unit_range(all_in_focus), size=(height, width), mode="bilinear", align_corners=False)
         coords = self._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype)
         blur_amount = (depth[:, None] - coords[:, :, None, None, None]).abs().clamp(0.0, 1.0)
         blurred = self._multi_blur(aif)[:, None]
         rendered = (1.0 - blur_amount) * aif[:, None] + blur_amount * blurred
-        defocus_residual = (rendered - focal_stack).abs().mean(dim=2).mean(dim=1, keepdim=True).clamp(0.0, 1.0)
-        refocused = focal_stack.mean(dim=1)
+        defocus_residual = (rendered - focal_stack_unit).abs().mean(dim=2).mean(dim=1, keepdim=True).clamp(0.0, 1.0)
+        refocused = focal_stack_unit.mean(dim=1)
         refocus_residual = (refocused - aif).abs().mean(dim=1, keepdim=True).clamp(0.0, 1.0)
         return {"defocus_residual": defocus_residual, "refocus_residual": refocus_residual, "rendered_stack": rendered}
 
@@ -137,12 +146,17 @@ class FocalPhysicalVerifier(nn.Module):
         batch, planes = focal_stack.shape[:2]
         coords = DefocusConsistencyVerifier._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype)
         focus_depth = (focus["focus_posterior"] * coords[:, :, None, None]).sum(dim=1, keepdim=True)
+        focus_peak_coordinate = torch.gather(
+            coords[:, :, None, None].expand(-1, -1, focus_depth.shape[-2], focus_depth.shape[-1]),
+            dim=1,
+            index=focus["focus_peak_index"].to(device=coords.device),
+        )
         depth = F.interpolate(depth_canonical if depth_canonical.dim() == 4 else depth_canonical.unsqueeze(1), size=focus_depth.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
         prior = depth if generated_depth_canonical is None else F.interpolate(generated_depth_canonical if generated_depth_canonical.dim() == 4 else generated_depth_canonical.unsqueeze(1), size=focus_depth.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
         residuals = self.defocus_verifier(focal_stack, focal_plane_distances, depth, all_in_focus)
         discrepancy = (depth - focus_depth).abs().clamp(0.0, 1.0)
         generation_discrepancy = (prior - focus_depth).abs().clamp(0.0, 1.0)
-        focus_support = (focus["focus_peak"] * focus["focus_margin"] * (1.0 - focus["focus_entropy"]) * focus["operator_agreement"] * focus["texture_confidence"]).clamp(0.0, 1.0)
+        focus_support = (focus["focus_peak_confidence"] * focus["focus_margin"] * (1.0 - focus["focus_entropy"]) * focus["operator_agreement"] * focus["texture_confidence"]).clamp(0.0, 1.0)
         physical_penalty = torch.maximum(discrepancy, residuals["defocus_residual"])
         generation_support = ((1.0 - generation_discrepancy) * (1.0 - residuals["refocus_residual"])).clamp(0.0, 1.0)
         conflict_score = torch.maximum(discrepancy, generation_discrepancy).clamp(0.0, 1.0)
@@ -150,7 +164,9 @@ class FocalPhysicalVerifier(nn.Module):
         support_logit = focus_support + generation_support - physical_penalty
         verdict_logits = torch.cat([support_logit, conflict_score, invalid_score], dim=1)
         return PhysicalVerificationTrace(
-            focus_peak=focus["focus_peak"],
+            focus_peak_confidence=focus["focus_peak_confidence"],
+            focus_peak_index=focus["focus_peak_index"],
+            focus_peak_coordinate=focus_peak_coordinate,
             focus_margin=focus["focus_margin"],
             focus_entropy=focus["focus_entropy"],
             operator_agreement=focus["operator_agreement"],

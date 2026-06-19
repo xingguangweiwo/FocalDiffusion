@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 
 import torch
 
@@ -16,7 +17,9 @@ class PhysicalVerificationTrace:
     ``support``, ``conflict``, and ``invalid`` logits.
     """
 
-    focus_peak: torch.Tensor
+    focus_peak_confidence: torch.Tensor
+    focus_peak_index: torch.Tensor
+    focus_peak_coordinate: torch.Tensor | None
     focus_margin: torch.Tensor
     focus_entropy: torch.Tensor
     operator_agreement: torch.Tensor
@@ -29,3 +32,14 @@ class PhysicalVerificationTrace:
     conflict_score: torch.Tensor
     invalid_score: torch.Tensor
     verdict_logits: torch.Tensor
+
+    @property
+    def focus_peak(self) -> torch.Tensor:
+        """Deprecated alias for ``focus_peak_confidence``."""
+        warnings.warn(
+            "PhysicalVerificationTrace.focus_peak is deprecated; use "
+            "focus_peak_confidence instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.focus_peak_confidence
