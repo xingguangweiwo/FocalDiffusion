@@ -18,6 +18,7 @@ from PIL import Image
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from .synthetic_focal_stack_renderer import SyntheticFocalStackRenderer
+from .focal_coordinates import canonicalize_focal_coordinates
 
 logger = logging.getLogger(__name__)
 
@@ -343,9 +344,13 @@ class FocalStackDataset(Dataset):
         if entry.get("all_in_focus") or entry.get("aif") or entry.get("aif_path"):
             sample["all_in_focus"] = entry.get("all_in_focus") or entry.get("aif") or entry.get("aif_path")
 
-        if "focal_plane_distances" in entry:
-            distance_values = entry["focal_plane_distances"]
-            sample["focal_plane_distances"] = [float(v) for v in distance_values]
+        coord_values = entry.get("focal_plane_coordinates", entry.get("focal_plane_distances"))
+        if coord_values is not None:
+            sample["focal_plane_distances"] = [float(v) for v in coord_values]
+
+        for key in ("focal_coordinate_type", "focal_coordinate_unit", "focal_axis_direction", "allow_unknown_ordered"):
+            if key in entry:
+                sample[key] = entry[key]
 
         if "focus_range" in entry and entry["focus_range"]:
             sample["focus_range"] = [float(v) for v in entry["focus_range"]]
@@ -410,12 +415,28 @@ class FocalStackDataset(Dataset):
             focal_plane_distances = self._align_focal_plane_distances(focal_plane_distances, focal_stack.shape[0])
 
         camera_params = self._compose_camera_params(sample_info, depth_meta)
+        coordinate_type = sample_info.get("focal_coordinate_type", "camera_object_distance" if use_generated else "unknown_ordered")
+        coordinate_unit = sample_info.get("focal_coordinate_unit", "meter" if coordinate_type == "camera_object_distance" else "unknown")
+        axis_direction = sample_info.get("focal_axis_direction", "increasing_near_to_far")
+        coordinate_bundle = canonicalize_focal_coordinates(
+            focal_plane_distances,
+            coordinate_type=coordinate_type,
+            unit=coordinate_unit,
+            axis_direction=axis_direction,
+            allow_unknown_ordered=bool(sample_info.get("allow_unknown_ordered", True)),
+        )
 
         sample = {
             "focal_stack": focal_stack,
             "depth": depth,
             "all_in_focus": all_in_focus,
             "focal_plane_distances": focal_plane_distances,
+            "focal_plane_coordinates_raw": coordinate_bundle.raw_values,
+            "focal_coordinate_bundle": coordinate_bundle,
+            "focal_plane_ranks": coordinate_bundle.canonical_rank,
+            "focal_plane_canonical_coordinates": coordinate_bundle.canonical_coordinate,
+            "coordinate_type_id": coordinate_bundle.coordinate_type_id,
+            "physical_coordinate_mask": coordinate_bundle.physical_valid_mask,
             "camera_params": camera_params,
             "sample_path": sample_info.get("focal_stack_dir") or sample_info.get("depth_path", ""),
             "depth_range": torch.tensor(

@@ -139,6 +139,11 @@ def parse_args():
         type=str,
         help='Comma-separated focal-plane distances (uses 0..N-1 index spacing if not specified)'
     )
+    parser.add_argument('--focal-coordinate-type', default='unknown_ordered', help='Focal coordinate type; defaults to unknown_ordered when metadata is absent')
+    parser.add_argument('--focal-coordinate-unit', default='unknown', help='Focal coordinate unit; never defaults to meters')
+    parser.add_argument('--focal-axis-direction', default='increasing_near_to_far', help='Canonical focal-axis direction')
+    parser.add_argument('--verification-protocol', default='rank', choices=['rank', 'coordinate', 'calibrated'], help='Verification protocol')
+    parser.add_argument('--allow-unknown-ordered', action='store_true', help='Allow unknown ordered stacks without metric optical claims')
     parser.add_argument(
         '--focal-distance-mode',
         type=str,

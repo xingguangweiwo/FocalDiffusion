@@ -34,11 +34,10 @@ class FocalEvidenceEncoder(nn.Module):
             nn.Conv2d(hidden, hidden, 3, padding=1),
             nn.SiLU(),
         )
-        self.focal_distance_mlp = nn.Sequential(
-            nn.Linear(1, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-        )
+        self.focal_distance_mlp = nn.Sequential(nn.Linear(1, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
+        self.rank_mlp = nn.Sequential(nn.Linear(1, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
+        self.coordinate_type_embedding = nn.Embedding(32, hidden)
+        self.physical_coordinate_mlp = nn.Sequential(nn.Linear(1, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
         self.posterior_logit_head = nn.Conv2d(hidden, 1, 1)
 
     def _normalize_focal_plane_distances(self, focal_plane_distances: torch.Tensor) -> torch.Tensor:
@@ -46,11 +45,15 @@ class FocalEvidenceEncoder(nn.Module):
         tau_max = focal_plane_distances.max(dim=1, keepdim=True).values
         return (focal_plane_distances - tau_min) / (tau_max - tau_min + self.eps)
 
-    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor | None = None, *, focal_plane_ranks: torch.Tensor | None = None, focal_plane_canonical_coordinates: torch.Tensor | None = None, coordinate_type_id: torch.Tensor | None = None, physical_coordinates: torch.Tensor | None = None, physical_coordinate_mask: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
         if focal_stack.dim() != 5:
             raise ValueError(f"focal_stack must have shape [B, N, C, H, W], got {tuple(focal_stack.shape)}")
         if not torch.isfinite(focal_stack).all():
             raise ValueError("focal_stack must contain only finite values.")
+        if focal_plane_distances is None:
+            focal_plane_distances = focal_plane_canonical_coordinates
+        if focal_plane_distances is None:
+            focal_plane_distances = torch.linspace(0, 1, focal_stack.shape[1], device=focal_stack.device, dtype=focal_stack.dtype)
         if focal_plane_distances.dim() == 1:
             focal_plane_distances = focal_plane_distances.unsqueeze(0)
         if focal_plane_distances.dim() != 2:
@@ -74,7 +77,12 @@ class FocalEvidenceEncoder(nn.Module):
         if not torch.isfinite(focal_plane_distances).all():
             raise ValueError("focal_plane_distances must contain only finite values.")
 
-        focal_coordinates = self._normalize_focal_plane_distances(focal_plane_distances)
+        focal_coordinates = focal_plane_canonical_coordinates.to(device=focal_stack.device, dtype=focal_stack.dtype) if focal_plane_canonical_coordinates is not None else self._normalize_focal_plane_distances(focal_plane_distances)
+        if focal_coordinates.dim() == 1:
+            focal_coordinates = focal_coordinates.unsqueeze(0).expand(batch_size, -1)
+        ranks = focal_plane_ranks.to(device=focal_stack.device, dtype=focal_stack.dtype) if focal_plane_ranks is not None else torch.linspace(0, 1, num_planes, device=focal_stack.device, dtype=focal_stack.dtype).unsqueeze(0).expand(batch_size, -1)
+        if ranks.dim() == 1:
+            ranks = ranks.unsqueeze(0).expand(batch_size, -1)
         stacked = focal_stack.reshape(batch_size * num_planes, channels, height, width)
         if self.use_highpass:
             high_frequency = stacked - F.avg_pool2d(stacked, kernel_size=5, stride=1, padding=2)
@@ -88,7 +96,18 @@ class FocalEvidenceEncoder(nn.Module):
         evidence_input = torch.cat([high_frequency, adjacent_focus_difference], dim=2)
         evidence_input = evidence_input.reshape(batch_size * num_planes, 2 * channels, height, width)
         features = self.local_encoder(evidence_input).reshape(batch_size, num_planes, self.hidden, height, width)
-        focal_distance_embedding = self.focal_distance_mlp(focal_coordinates.unsqueeze(-1)).to(dtype=features.dtype)
+        focal_distance_embedding = self.focal_distance_mlp(focal_coordinates.unsqueeze(-1)) + self.rank_mlp(ranks.unsqueeze(-1))
+        if coordinate_type_id is not None:
+            ids = coordinate_type_id.to(device=focal_stack.device).long().view(-1)
+            if ids.numel() == 1: ids = ids.expand(batch_size)
+            focal_distance_embedding = focal_distance_embedding + self.coordinate_type_embedding(ids).unsqueeze(1)
+        if physical_coordinates is not None and physical_coordinate_mask is not None:
+            phys = physical_coordinates.to(device=focal_stack.device, dtype=focal_stack.dtype)
+            mask = physical_coordinate_mask.to(device=focal_stack.device, dtype=focal_stack.dtype)
+            if phys.dim() == 1: phys = phys.unsqueeze(0).expand(batch_size, -1)
+            if mask.dim() == 1: mask = mask.unsqueeze(0).expand(batch_size, -1)
+            focal_distance_embedding = focal_distance_embedding + self.physical_coordinate_mlp(self._normalize_focal_plane_distances(phys).unsqueeze(-1)) * mask.unsqueeze(-1)
+        focal_distance_embedding = focal_distance_embedding.to(dtype=features.dtype)
         features = features + focal_distance_embedding[:, :, :, None, None]
         features = features.reshape(batch_size * num_planes, self.hidden, height, width)
 
