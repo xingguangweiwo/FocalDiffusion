@@ -120,7 +120,6 @@ training:
   self_improvement:
     enabled: false
     round_index: 0
-    round_id: M0
     parent_checkpoint: null
     mining_manifest: outputs/self_improvement/round_1_manifest.jsonl
     max_mining_batches: 8
@@ -165,13 +164,37 @@ losses:
 validation:
   num_inference_steps: 30
   guidance_scale: 1.0
-  # Thresholds selected on validation split only; do not tune on test_sources.
-  heldout_verifier:
-    focus_operator: laplacian_tenengrad_heldout
-    confidence_threshold: 0.8
-    invalid_threshold: 0.5
-    conflict_threshold: 0.5
-    coverage: 0.2
+
+# Strict zero-shot verifier/refinement configuration. Thresholds must be selected on
+# source validation only and never tuned on target/test sources.
+verification:
+  mining:
+    protocol: coordinate
+    focus_operator: gradient_variance
+    thresholds:
+      confidence: 0.8
+      invalid: 0.5
+      conflict: 0.5
+      coverage: 0.2
+    calibration_requirements: []
+  refinement:
+    protocol: rank
+    focus_operator: gradient_variance
+    thresholds:
+      confidence: 0.8
+      invalid: 0.5
+      conflict: 0.5
+      coverage: 0.2
+    calibration_requirements: []
+  evaluation:
+    protocol: coordinate
+    focus_operator: gradient_variance
+    thresholds:
+      confidence: 0.8
+      invalid: 0.5
+      conflict: 0.5
+      coverage: 0.2
+    calibration_requirements: []
 
 logging:
   level: INFO

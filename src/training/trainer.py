@@ -32,12 +32,65 @@ from ..models.physics_modules import FocalPhysicalVerifier, _split_unit_and_sign
 
 logger = logging.getLogger(__name__)
 
+_ALLOWED_FOCUS_OPERATORS = {"sobel_laplacian", "gradient_variance"}
+
+
+def migrate_verification_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Migrate legacy verifier/manifest fields into the canonical four-block schema."""
+    migrated = dict(config)
+    verification = dict(migrated.get("verification", {}) or {})
+    validation = dict(migrated.get("validation", {}) or {})
+    legacy_eval = validation.pop("evaluation_verifier", None) or validation.pop("heldout_verifier", None) or {}
+
+    def normalize_block(name: str, legacy: dict[str, Any] | None = None) -> dict[str, Any]:
+        block = dict(verification.get(name, {}) or {})
+        if legacy:
+            block = {**legacy, **block}
+        focus_operator = str(block.get("focus_operator", "gradient_variance"))
+        if focus_operator == "laplacian_tenengrad_heldout":
+            focus_operator = "gradient_variance"
+        if focus_operator not in _ALLOWED_FOCUS_OPERATORS:
+            raise ValueError(f"verification.{name}.focus_operator must be one of {sorted(_ALLOWED_FOCUS_OPERATORS)}, got {focus_operator!r}")
+        thresholds = dict(block.get("thresholds", {}) or {})
+        for old, new in (("confidence_threshold", "confidence"), ("invalid_threshold", "invalid"), ("conflict_threshold", "conflict")):
+            if old in block and new not in thresholds:
+                thresholds[new] = block.pop(old)
+        thresholds.setdefault("confidence", 0.8)
+        thresholds.setdefault("invalid", 0.5)
+        thresholds.setdefault("conflict", 0.5)
+        thresholds.setdefault("coverage", block.get("coverage", 0.2))
+        return {
+            "protocol": str(block.get("protocol", "coordinate" if name == "evaluation" else "rank")),
+            "focus_operator": focus_operator,
+            "thresholds": thresholds,
+            "calibration_requirements": list(block.get("calibration_requirements", []) or []),
+        }
+
+    verification = {
+        "mining": normalize_block("mining", legacy_eval),
+        "refinement": normalize_block("refinement"),
+        "evaluation": normalize_block("evaluation", legacy_eval),
+    }
+    migrated["validation"] = validation
+    migrated["verification"] = verification
+
+    self_improvement = dict(migrated.get("training", {}).get("self_improvement", {}) or {})
+    if "round_id" in self_improvement and "round_index" not in self_improvement:
+        raw = str(self_improvement["round_id"]).lstrip("Mm")
+        self_improvement["round_index"] = int(raw) if raw.isdigit() else 0
+    self_improvement.pop("round_id", None)
+    if "training" in migrated:
+        migrated["training"] = dict(migrated["training"])
+        migrated["training"]["self_improvement"] = self_improvement
+    return migrated
+
+
 
 class FocalStackGenerationTrainer:
     """Main trainer class for FocalStackGeneration using file lists"""
 
     def __init__(self, config: dict):
-        self.config = config
+        self.config = migrate_verification_config(config)
         self.setup_logging()
         self.setup_accelerator()
         self.self_improvement_cfg = self.config.get('training', {}).get('self_improvement', {}) or {}
@@ -48,7 +101,6 @@ class FocalStackGenerationTrainer:
 
         self.trace_mining_buffer = TraceMiningBuffer(
             max_items=int(self.self_improvement_cfg.get('max_buffer_items', 128)),
-            round_id=str(self.self_improvement_cfg.get('round_id', 'M0')),
             round_index=int(self.self_improvement_cfg.get('round_index', 0)),
             manifest_path=self.self_improvement_cfg.get('mining_manifest'),
         )
@@ -356,9 +408,10 @@ class FocalStackGenerationTrainer:
         self.physical_evidence_support_head = self.pipeline.physical_evidence_support_head
         self.pipeline.physical_verifier.requires_grad_(False)
         self.pipeline.physical_verifier.eval()
-        evaluation_cfg = self.config.get("validation", {}).get("evaluation_verifier", {}) or {}
+        evaluation_cfg = self.config.get("verification", {}).get("evaluation", {}) or {}
         eval_focus_operator = str(evaluation_cfg.get("focus_operator", "gradient_variance"))
-        self.evaluation_verifier = FocalPhysicalVerifier(focus_operator=eval_focus_operator).to(target_device)
+        eval_protocol = str(evaluation_cfg.get("protocol", "coordinate"))
+        self.evaluation_verifier = FocalPhysicalVerifier(focus_operator=eval_focus_operator, verification_protocol=eval_protocol).to(target_device)
         self.evaluation_verifier.requires_grad_(False)
         self.evaluation_verifier.eval()
 
@@ -1063,13 +1116,11 @@ class TraceMiningBuffer:
     def __init__(
         self,
         max_items: int = 128,
-        round_id: str = "M0",
         patch_size: int = 16,
         round_index: int = 0,
         manifest_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self.max_items = max(1, int(max_items))
-        self.round_id = round_id
         self.patch_size = max(1, int(patch_size))
         self.round_index = int(round_index)
         self.manifest_path = Path(manifest_path) if manifest_path else None
@@ -1085,7 +1136,6 @@ class TraceMiningBuffer:
         """Attach provenance required to replay a mined manifest."""
         self.metadata.update({
             "record_type": "metadata",
-            "round_id": self.round_id,
             "round_index": self.round_index,
             "parent_checkpoint_sha256": parent_checkpoint_sha256,
             "verifier_config_hash": verifier_config_hash,
@@ -1166,10 +1216,8 @@ class TraceMiningBuffer:
         if focal_plane_coordinates is not None:
             focal_plane_coordinates_list = [float(value) for value in focal_plane_coordinates.detach().cpu().flatten().tolist()]
         item = {
-            "round_id": self.round_id,
             "round_index": self.round_index,
             "sample_id": sample_id,
-            "sample_path": sample_id,
             "batch_index": int(batch_index),
             "verdict_type": verdict_type,
             "crop": {"y0": int(y0), "y1": int(y1), "x0": int(x0), "x1": int(x1)},
@@ -1183,8 +1231,6 @@ class TraceMiningBuffer:
             "stack_reprojection_residual_target": float(stack_reprojection[..., y0:y1, x0:x1].mean().item()),
             "focus_support_target": float(focus_support[..., y0:y1, x0:x1].mean().item()),
             "generation_support_target": float(generation_support[..., y0:y1, x0:x1].mean().item()),
-            "conflict_mean": float(conflict_patch.mean().item()),
-            "invalid_mean": float(invalid_patch.mean().item()),
             "uncertainty_mean": float(uncertainty[..., y0:y1, x0:x1].mean().item()),
         }
         optional_maps = {
@@ -1310,8 +1356,8 @@ class TraceMiningBuffer:
             "accepted_invalid_count": float(sum(1 for item in mined if item["verdict_type"] == "invalid")),
             "accepted_reliable_count": float(sum(1 for item in mined if item["verdict_type"] == "reliable_non_conflict")),
             "buffer_size": float(len(self)),
-            "mined_conflict_mean": sum(item["conflict_mean"] for item in mined) / len(mined),
-            "mined_invalid_mean": sum(item["invalid_mean"] for item in mined) / len(mined),
+            "mined_conflict_mean": sum(item["conflict_target"] for item in mined) / len(mined),
+            "mined_invalid_mean": sum(item["invalid_target"] for item in mined) / len(mined),
         }
 
     def save(self, path: str | os.PathLike[str]) -> None:
@@ -1332,8 +1378,26 @@ class TraceMiningBuffer:
                     if record.get("record_type") == "metadata":
                         self.metadata = record
                     else:
-                        loaded.append(record)
+                        loaded.append(self._migrate_manifest_item(record))
         self.items = loaded[-self.max_items :]
+
+    @staticmethod
+    def _migrate_manifest_item(item: dict[str, Any]) -> dict[str, Any]:
+        migrated = dict(item)
+        if "round_index" not in migrated and "round_id" in migrated:
+            raw = str(migrated["round_id"]).lstrip("Mm")
+            migrated["round_index"] = int(raw) if raw.isdigit() else 0
+        migrated.pop("round_id", None)
+        if "sample_id" not in migrated and "sample_path" in migrated:
+            migrated["sample_id"] = migrated["sample_path"]
+        migrated.pop("sample_path", None)
+        if "conflict_target" not in migrated and "conflict_mean" in migrated:
+            migrated["conflict_target"] = migrated["conflict_mean"]
+        if "invalid_target" not in migrated and "invalid_mean" in migrated:
+            migrated["invalid_target"] = migrated["invalid_mean"]
+        migrated.pop("conflict_mean", None)
+        migrated.pop("invalid_mean", None)
+        return migrated
 
     @staticmethod
     def _crop_from_item(item: dict[str, Any]) -> tuple[int, int, int, int]:
@@ -1364,7 +1428,7 @@ class TraceMiningBuffer:
     @staticmethod
     def _batch_index_for_item(item: dict[str, Any], sample_ids: Any, batch_size: int) -> int:
         if isinstance(sample_ids, (list, tuple)):
-            item_ids = {str(item.get("sample_id")), str(item.get("sample_path"))}
+            item_ids = {str(item.get("sample_id"))}
             for index, sample_id in enumerate(sample_ids):
                 if str(sample_id) in item_ids:
                     return min(index, batch_size - 1)
@@ -1398,7 +1462,7 @@ class TraceMiningBuffer:
         losses: list[torch.Tensor] = []
         candidate_items = self.items
         if allowed_sample_ids is not None:
-            candidate_items = [item for item in self.items if str(item.get("sample_id")) in allowed_sample_ids or str(item.get("sample_path")) in allowed_sample_ids]
+            candidate_items = [item for item in self.items if str(item.get("sample_id")) in allowed_sample_ids]
         for item in candidate_items[-max_items:]:
             height, width = self._shape_from_item(item)
             y0, y1, x0, x1 = self._crop_from_item(item)
