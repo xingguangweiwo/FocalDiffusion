@@ -155,11 +155,17 @@ class DefocusConsistencyVerifier(nn.Module):
 class FocalPhysicalVerifier(nn.Module):
     """Fuse fixed focus and defocus checks into a PhysicalVerificationTrace."""
 
-    def __init__(self, eps: float = 1e-6, focus_operator: str = "sobel_laplacian") -> None:
-        """Initialize the conservative FocalTrace physical verifier."""
+    def __init__(self, eps: float = 1e-6, focus_operator: str = "sobel_laplacian", verification_protocol: str = "coordinate") -> None:
+        """Initialize the conservative FocalTrace verifier.
+
+        protocol=rank uses only ordering, coordinate uses canonical coordinates, and calibrated enables metric optical checks.
+        """
         super().__init__()
+        if verification_protocol not in {"rank", "coordinate", "calibrated"}:
+            raise ValueError("verification_protocol must be rank, coordinate, or calibrated")
         self.eps = eps
         self.focus_operator = focus_operator
+        self.verification_protocol = verification_protocol
         self.focus_bank = FocusMeasureBank(eps=eps, operator_variant=focus_operator)
         self.defocus_verifier = DefocusConsistencyVerifier(eps=eps)
 
@@ -169,15 +175,22 @@ class FocalPhysicalVerifier(nn.Module):
             "class": type(self).__name__,
             "eps": float(self.eps),
             "focus_operator": self.focus_operator,
+            "verification_protocol": self.verification_protocol,
             "defocus_max_blur_radius": int(self.defocus_verifier.max_blur_radius),
             "defocus_eps": float(self.defocus_verifier.eps),
         }
 
-    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor, generated_depth_canonical: torch.Tensor | None = None) -> PhysicalVerificationTrace:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor, generated_depth_canonical: torch.Tensor | None = None, verification_protocol: str | None = None) -> PhysicalVerificationTrace:
         """Compute a batch-first physical verification trace for FocalTrace."""
+        protocol = verification_protocol or self.verification_protocol
+        if protocol not in {"rank", "coordinate", "calibrated"}:
+            raise ValueError("verification_protocol must be rank, coordinate, or calibrated")
         focus = self.focus_bank(focal_stack)
         batch, planes = focal_stack.shape[:2]
-        coords = DefocusConsistencyVerifier._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype)
+        if protocol == "rank":
+            coords = torch.linspace(0, 1, planes, device=focal_stack.device, dtype=focal_stack.dtype).unsqueeze(0).expand(batch, -1)
+        else:
+            coords = DefocusConsistencyVerifier._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype)
         focus_depth = (focus["focus_posterior"] * coords[:, :, None, None]).sum(dim=1, keepdim=True)
         focus_peak_coordinate = torch.gather(
             coords[:, :, None, None].expand(-1, -1, focus_depth.shape[-2], focus_depth.shape[-1]),
@@ -186,7 +199,10 @@ class FocalPhysicalVerifier(nn.Module):
         )
         depth = F.interpolate(depth_canonical if depth_canonical.dim() == 4 else depth_canonical.unsqueeze(1), size=focus_depth.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
         prior = depth if generated_depth_canonical is None else F.interpolate(generated_depth_canonical if generated_depth_canonical.dim() == 4 else generated_depth_canonical.unsqueeze(1), size=focus_depth.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
-        residuals = self.defocus_verifier(focal_stack, focal_plane_distances, depth, all_in_focus)
+        if protocol == "calibrated":
+            residuals = self.defocus_verifier(focal_stack, focal_plane_distances, depth, all_in_focus)
+        else:
+            residuals = {"stack_reprojection_residual": torch.zeros_like(depth)}
         discrepancy = (depth - focus_depth).abs().clamp(0.0, 1.0)
         generation_discrepancy = (prior - focus_depth).abs().clamp(0.0, 1.0)
         focus_support = (focus["focus_peak_confidence"] * focus["focus_margin"] * (1.0 - focus["focus_entropy"]) * focus["operator_agreement"] * focus["texture_confidence"]).clamp(0.0, 1.0)

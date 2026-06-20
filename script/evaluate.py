@@ -148,7 +148,7 @@ def compute_trace_metrics(
     conflict_threshold: float | None = None,
     reference_type: str = "internal_verifier",
 ) -> dict[str, object]:
-    """Compute verifier-derived FocalTrace metrics with explicit reference semantics."""
+    """Compute the slim strict-zero-shot reliability metric set."""
     allowed_reference_types = {"internal_verifier", "heldout_verifier", "synthetic_ground_truth", "human_annotation"}
     if reference_type not in allowed_reference_types:
         raise ValueError(f"reference_type must be one of {sorted(allowed_reference_types)}, got {reference_type!r}")
@@ -159,17 +159,12 @@ def compute_trace_metrics(
         nan = float("nan")
         return {
             "reference_type": reference_type,
-            "high_confidence_physical_violation_rate": nan,
-            "HCPVR": nan,
-            "selective_physical_risk_at_coverage": nan,
+            "uncertainty_available": False,
             "physical_risk_coverage_auc": nan,
-            "Physical-AURC": nan,
-            "invalid_overconfidence_rate": nan,
-            "accepted_coverage": nan,
-            "coverage": float(coverage),
-            "error_violation_detection_auroc": nan,
-            "error_violation_detection_auprc": nan,
-            "uncertainty_error_spearman": nan,
+            "error_detection_auprc": nan,
+            "high_confidence_physical_violation_rate": nan,
+            "mean_conflict_score": nan,
+            "mean_invalid_score": nan,
             "diagnostics": {},
         }
 
@@ -180,71 +175,55 @@ def compute_trace_metrics(
     if uncertainty is None:
         uncertainty = _as_bchw(getattr(output, "uncertainty", None))
     if uncertainty is None:
-        uncertainty = torch.zeros_like(conflict)
-    else:
-        uncertainty = uncertainty.detach().float().clamp(0.0, 1.0)
-        if uncertainty.shape[-2:] != conflict.shape[-2:]:
-            uncertainty = F.interpolate(uncertainty, size=conflict.shape[-2:], mode="bilinear", align_corners=False)
-    confidence = (1.0 - uncertainty.float().clamp(0.0, 1.0)).clamp(0.0, 1.0)
-    high_confidence = confidence >= confidence_threshold
+        nan = float("nan")
+        return {
+            "reference_type": reference_type,
+            "uncertainty_available": False,
+            "physical_risk_coverage_auc": nan,
+            "error_detection_auprc": nan,
+            "high_confidence_physical_violation_rate": nan,
+            "mean_conflict_score": float(conflict.mean().item()),
+            "mean_invalid_score": float(invalid.mean().item()),
+            "diagnostics": {"sample_count": int(conflict.shape[0])},
+        }
+
+    uncertainty = uncertainty.detach().float().clamp(0.0, 1.0)
+    if uncertainty.shape[-2:] != conflict.shape[-2:]:
+        uncertainty = F.interpolate(uncertainty, size=conflict.shape[-2:], mode="bilinear", align_corners=False)
+    confidence = (1.0 - uncertainty).clamp(0.0, 1.0)
     violation_event = (conflict >= conflict_threshold) | (invalid >= invalid_threshold)
-    physically_accepted = invalid < invalid_threshold
 
     sample_hcpvr: list[float] = []
-    sample_ior: list[float] = []
-    sample_accepted_coverage: list[float] = []
-    sample_selective_risk: list[float] = []
     sample_aurc: list[float] = []
     for index in range(conflict.shape[0]):
-        high = high_confidence[index]
+        high = confidence[index] >= confidence_threshold
         violation = violation_event[index]
-        invalid_event = invalid[index] >= invalid_threshold
-        accepted = physically_accepted[index]
         high_count = high.float().sum()
-        invalid_count = invalid_event.float().sum()
         sample_hcpvr.append(_safe_ratio((high & violation).float().sum(), high_count))
-        sample_ior.append(_safe_ratio((high & invalid_event).float().sum(), invalid_count))
-        sample_accepted_coverage.append(float((high & accepted).float().sum().item() / max(high.numel(), 1)))
-        sample_selective_risk.append(_selective_risk_for_sample(confidence[index], physical_risk[index], coverage))
         sample_aurc.append(_physical_aurc_for_sample(confidence[index], physical_risk[index]))
 
-    auroc = _binary_auroc(uncertainty, violation_event)
-    auprc = _binary_auprc(uncertainty, violation_event)
-    spearman = _spearman_correlation(uncertainty, physical_risk)
-    hcpvr = _finite_mean(sample_hcpvr)
-    physical_aurc = _finite_mean(sample_aurc)
-    metrics: dict[str, object] = {
-        "reference_type": reference_type,
-        "high_confidence_physical_violation_rate": hcpvr,
-        "HCPVR": hcpvr,
-        "selective_physical_risk_at_coverage": _finite_mean(sample_selective_risk),
-        "physical_risk_coverage_auc": physical_aurc,
-        "Physical-AURC": physical_aurc,
-        "invalid_overconfidence_rate": _finite_mean(sample_ior),
-        "accepted_coverage": _finite_mean(sample_accepted_coverage),
-        "coverage": float(coverage),
-        "mean_conflict_score": float(conflict.mean().item()),
-        "mean_invalid_score": float(invalid.mean().item()),
-        "error_violation_detection_auroc": auroc,
-        "error_violation_detection_auprc": auprc,
-        "uncertainty_error_spearman": spearman,
-        "diagnostics": {
-            "high_confidence_denominator": float(high_confidence.float().sum().item()),
-            "invalid_denominator": float((invalid >= invalid_threshold).float().sum().item()),
-            "sample_count": int(conflict.shape[0]),
-        },
-    }
     reference_verdict = getattr(output, "reference_verdict", None)
     if reference_verdict is None:
         reference_verdict = getattr(trace, "reference_verdict", None)
+    error_detection_auprc = float("nan")
     if reference_verdict is not None:
-        predicted_verdict = torch.stack([
-            1.0 - physical_risk.squeeze(1),
-            conflict.squeeze(1),
-            invalid.squeeze(1),
-        ], dim=1).argmax(dim=1)
-        metrics.update(_agreement_metrics(predicted_verdict, _as_bchw(reference_verdict).squeeze(1)))
-    return metrics
+        reference_error = (_as_bchw(reference_verdict).squeeze(1) > 0).to(device=uncertainty.device)
+        error_detection_auprc = _binary_auprc(uncertainty, reference_error)
+
+    return {
+        "reference_type": reference_type,
+        "uncertainty_available": True,
+        "physical_risk_coverage_auc": _finite_mean(sample_aurc),
+        "error_detection_auprc": error_detection_auprc,
+        "high_confidence_physical_violation_rate": _finite_mean(sample_hcpvr),
+        "mean_conflict_score": float(conflict.mean().item()),
+        "mean_invalid_score": float(invalid.mean().item()),
+        "coverage": float(coverage),
+        "diagnostics": {
+            "high_confidence_denominator": float((confidence >= confidence_threshold).float().sum().item()),
+            "sample_count": int(conflict.shape[0]),
+        },
+    }
 
 
 def _summarize_numeric_metrics(metric_rows: list[dict[str, object]]) -> dict[str, object]:
@@ -448,7 +427,8 @@ def evaluate(args):
         uncertainty = getattr(output, "uncertainty_final", None)
         if uncertainty is None:
             uncertainty = output.uncertainty
-        sample_metrics["uncertainty_mean"] = float(uncertainty.mean().item()) if uncertainty is not None else 0.0
+        sample_metrics["uncertainty_available"] = uncertainty is not None
+        sample_metrics["uncertainty_mean"] = float(uncertainty.mean().item()) if uncertainty is not None else float("nan")
         sample_metrics["focal_entropy_mean"] = float(output.focal_entropy.mean().item()) if output.focal_entropy is not None else 0.0
         sample_metrics["physical_evidence_support_mean"] = float(output.physical_evidence_support.mean().item()) if output.physical_evidence_support is not None else 0.0
         if output.generated_depth_canonical is not None and output.focal_depth_canonical is not None:
@@ -489,6 +469,11 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--num_inference_steps', type=int, default=50)
     parser.add_argument('--num_refinement_steps', type=int, default=0)
+    parser.add_argument('--focal-coordinate-type', default='unknown_ordered', help='Focal coordinate type; defaults to unknown_ordered when metadata is absent')
+    parser.add_argument('--focal-coordinate-unit', default='unknown', help='Focal coordinate unit; never defaults to meters')
+    parser.add_argument('--focal-axis-direction', default='increasing_near_to_far', help='Canonical focal-axis direction')
+    parser.add_argument('--verification-protocol', default='rank', choices=['rank', 'coordinate', 'calibrated'], help='Verification protocol')
+    parser.add_argument('--allow-unknown-ordered', action='store_true', help='Allow unknown ordered stacks without metric optical claims')
     parser.add_argument('--save_all_visualizations', action='store_true')
     parser.add_argument('--max_samples', type=int, help='Maximum samples to evaluate')
     parser.add_argument('--device', type=str, default='cuda')
@@ -509,7 +494,7 @@ def main():
         '--coverage',
         type=float,
         default=0.2,
-        help='Top-confidence coverage fraction for selective_physical_risk_at_coverage',
+        help='Top-confidence coverage fraction used for physical risk coverage diagnostics',
     )
     args = parser.parse_args()
     evaluate(args)

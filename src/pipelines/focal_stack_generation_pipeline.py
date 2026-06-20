@@ -66,6 +66,85 @@ def _module_device_dtype(module: nn.Module, fallback_device: torch.device, fallb
 
 
 @dataclass
+class RefinementState:
+    """Mutable inference-time state for strict zero-shot joint self-refinement."""
+
+    aif_latents: torch.Tensor
+    generated_depth_canonical: torch.Tensor
+    final_depth_canonical: torch.Tensor
+    uncertainty: torch.Tensor
+    focal_gate: torch.Tensor
+    generative_gate: torch.Tensor
+    abstention: torch.Tensor
+    trace: PhysicalVerificationTrace
+    iteration: int
+
+
+class TraceRefiner(nn.Module):
+    """Parameter-free, protocol-aware AIF-depth-uncertainty delta generator."""
+
+    def __init__(self, max_depth_step: float = 0.08, max_latent_step: float = 0.015, max_uncertainty_logit_step: float = 0.5) -> None:
+        super().__init__()
+        self.max_depth_step = float(max_depth_step)
+        self.max_latent_step = float(max_latent_step)
+        self.max_uncertainty_logit_step = float(max_uncertainty_logit_step)
+
+    @staticmethod
+    def protocol_mask(protocol: str) -> tuple[float, float, float]:
+        if protocol == "rank":
+            return 0.5, 0.0, 1.0
+        if protocol == "coordinate":
+            return 1.0, 0.0, 1.0
+        if protocol == "calibrated":
+            return 1.0, 1.0, 1.0
+        return 0.0, 0.0, 1.0
+
+    def forward(
+        self,
+        *,
+        aif_latents: torch.Tensor,
+        current_depth: torch.Tensor,
+        uncertainty: torch.Tensor,
+        focal_depth: torch.Tensor,
+        focal_entropy: torch.Tensor,
+        focus_support: torch.Tensor,
+        evidence_invalidity: torch.Tensor,
+        operator_agreement: torch.Tensor,
+        depth_focus_discrepancy: torch.Tensor,
+        observation_residual: torch.Tensor,
+        previous_depth_focus_discrepancy: torch.Tensor | None = None,
+        verification_protocol: str = "rank",
+    ) -> Dict[str, torch.Tensor]:
+        depth_scale, aif_scale, uncertainty_scale = self.protocol_mask(verification_protocol)
+        valid = (focus_support.clamp(0, 1) * (1 - focal_entropy.clamp(0, 1)) * operator_agreement.clamp(0, 1) * (1 - evidence_invalidity.clamp(0, 1))).clamp(0, 1)
+        raw_depth = (focal_depth - current_depth).clamp(-self.max_depth_step, self.max_depth_step)
+        delta_depth = raw_depth * valid * depth_scale
+
+        if previous_depth_focus_discrepancy is None:
+            improved = torch.zeros_like(depth_focus_discrepancy)
+        else:
+            improved = (previous_depth_focus_discrepancy - depth_focus_discrepancy).clamp(min=0.0)
+        aif_mask = (improved * observation_residual.clamp(0, 1) * (1 - evidence_invalidity.clamp(0, 1))).clamp(0, 1) * aif_scale
+        latent_direction = torch.tanh(aif_latents - aif_latents.mean(dim=(-2, -1), keepdim=True))
+        delta_aif_latent = self.max_latent_step * aif_mask.mean(dim=1, keepdim=True) * latent_direction
+
+        instability = depth_focus_discrepancy.clamp(0, 1) + observation_residual.clamp(0, 1) + focal_entropy.clamp(0, 1)
+        delta_uncertainty_logit = (instability / 3.0 - uncertainty.clamp(0, 1)).clamp(-1, 1) * self.max_uncertainty_logit_step * uncertainty_scale
+        delta_uncertainty_logit = delta_uncertainty_logit.clamp(-self.max_uncertainty_logit_step, self.max_uncertainty_logit_step)
+        delta_focal_gate = (valid - 0.5).clamp(-0.25, 0.25) * depth_scale
+        delta_generative_gate = (-delta_focal_gate).clamp(-0.25, 0.25)
+        return {
+            "delta_aif_latent": delta_aif_latent,
+            "delta_depth": delta_depth.clamp(-self.max_depth_step, self.max_depth_step),
+            "delta_uncertainty_logit": delta_uncertainty_logit,
+            "delta_focal_gate": delta_focal_gate,
+            "delta_generative_gate": delta_generative_gate,
+            "protocol_depth_mask": torch.as_tensor(depth_scale, device=current_depth.device, dtype=current_depth.dtype),
+            "protocol_aif_mask": torch.as_tensor(aif_scale, device=current_depth.device, dtype=current_depth.dtype),
+        }
+
+
+@dataclass
 class FocalStackGenerationOutput(BaseOutput):
     """Output type returned by :class:`FocalStackGenerationPipeline`."""
 
@@ -529,6 +608,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         focal_distance_mode: str = "normalized",
         num_refinement_steps: int = 0,
         trace_refinement_epsilon: float = 1e-4,
+        verification_protocol: str = "rank",
         **kwargs: Any,
     ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, Union[torch.Tensor, Image.Image]]]:
         """Generate canonical depth and all-in-focus outputs from a focal stack.
@@ -740,61 +820,56 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             depth_canonical=final_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
             all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
             generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+            verification_protocol=verification_protocol,
         )
         refinement_history: Optional[List[Dict[str, Any]]] = [] if (return_refinement_history and num_refinement_steps > 0) else None
         accepted_refinement_steps = 0
         rejected_refinement_steps = 0
-        refinement_epsilon = 1e-4
         initial_physical_risk = self._physical_risk(verification_trace)
         physical_risk_before = initial_physical_risk
         physical_risk_after = initial_physical_risk
+
+        state = RefinementState(
+            aif_latents=all_in_focus_latents,
+            generated_depth_canonical=generated_depth_canonical,
+            final_depth_canonical=final_depth_canonical,
+            uncertainty=uncertainty_final,
+            focal_gate=focal_evidence_weight_norm,
+            generative_gate=generative_prior_weight_norm,
+            abstention=abstention_weight,
+            trace=verification_trace,
+            iteration=0,
+        )
+        if num_refinement_steps > 0:
+            self._freeze_parameters_for_zero_shot_refinement()
         for refinement_step in range(num_refinement_steps):
-            candidate_depth, candidate_uncertainty = self._apply_trace_refinement(
-                final_depth_canonical=final_depth_canonical,
+            state, step_record = self._joint_refinement_iteration(
+                state=state,
+                focal_stack=focal_stack,
+                focal_plane_distances=focal_plane_distances,
                 focal_depth_canonical=focal_depth_canonical,
-                generated_depth_canonical=generated_depth_canonical,
-                uncertainty_final=uncertainty_final,
-                trace=verification_trace,
+                focal_entropy=focal_entropy,
+                focal_posterior=focal_posterior,
+                recon=recon,
+                verifier_device=verifier_device,
+                verifier_dtype=verifier_dtype,
+                verification_protocol=verification_protocol,
+                epsilon=trace_refinement_epsilon,
             )
-            candidate_trace = self.physical_verifier(
-                focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
-                focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
-                depth_canonical=candidate_depth.to(device=verifier_device, dtype=verifier_dtype),
-                all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
-                generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
-            )
-            accepted, current_risk, candidate_risk = self._accept_refinement_candidate(
-                verification_trace,
-                candidate_trace,
-                epsilon=refinement_epsilon,
-            )
-            if accepted:
-                final_depth_canonical = candidate_depth
-                uncertainty_final = candidate_uncertainty
-                verification_trace = candidate_trace
+            if refinement_history is not None:
+                refinement_history.append(step_record)
+            if step_record["accepted"]:
                 accepted_refinement_steps += 1
-                physical_risk_after = candidate_risk
+                final_depth_canonical = state.final_depth_canonical
+                uncertainty_final = state.uncertainty
+                verification_trace = state.trace
+                all_in_focus_latents = state.aif_latents
+                physical_risk_after = self._physical_risk(verification_trace)
             else:
                 rejected_refinement_steps += 1
-                physical_risk_after = current_risk
-            depth_map = final_depth_canonical.squeeze(1)
-            if refinement_history is not None:
-                refinement_history.append(
-                    {
-                        "step": refinement_step,
-                        "accepted": accepted,
-                        "physical_risk_before": current_risk,
-                        "physical_risk_after": physical_risk_after,
-                        "final_depth_canonical": final_depth_canonical.detach().cpu(),
-                        "uncertainty_final": uncertainty_final.detach().cpu(),
-                        "mean_conflict_score": float(verification_trace.conflict_score.detach().float().mean().item()),
-                        "mean_invalid_score": float(verification_trace.invalid_score.detach().float().mean().item()),
-                        "mean_focus_support": float(verification_trace.focus_support.detach().float().mean().item()),
-                        "mean_generation_support": float(verification_trace.generation_support.detach().float().mean().item()),
-                    }
-                )
-            if not accepted:
+                physical_risk_after = self._physical_risk(verification_trace)
                 break
+        depth_map = final_depth_canonical.squeeze(1)
 
         if output_type == "pil":
             image = self.numpy_to_pil(recon.cpu().permute(0, 2, 3, 1).numpy())[0]
@@ -837,6 +912,217 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             physical_risk_after=physical_risk_after,
         )
 
+
+    def _freeze_parameters_for_zero_shot_refinement(self) -> None:
+        """Guarantee refinement does not adapt target-domain model parameters."""
+        modules = [
+            getattr(self, name, None)
+            for name in (
+                "transformer", "vae", "text_encoder", "text_encoder_2", "text_encoder_3",
+                "focal_processor", "focal_evidence_head", "physical_evidence_support_head",
+                "task_output_decoder", "physical_verifier",
+            )
+        ]
+        for module in modules:
+            if isinstance(module, nn.Module):
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
+
+    @staticmethod
+    def parameter_checksum(module: nn.Module) -> float:
+        """Deterministic scalar checksum for tests that parameters do not change."""
+        total = 0.0
+        with torch.no_grad():
+            for parameter in module.parameters():
+                total += float(parameter.detach().float().sum().cpu().item())
+        return total
+
+    @staticmethod
+    def _resize_like(value: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        if value.dim() == 3:
+            value = value.unsqueeze(1)
+        if value.shape[-2:] != reference.shape[-2:]:
+            value = F.interpolate(value, size=reference.shape[-2:], mode="bilinear", align_corners=False)
+        return value.to(device=reference.device, dtype=reference.dtype)
+
+    @staticmethod
+    def _map_to_latent(mask: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+        if mask.shape[-2:] != latent.shape[-2:]:
+            mask = F.interpolate(mask, size=latent.shape[-2:], mode="bilinear", align_corners=False)
+        return mask.to(device=latent.device, dtype=latent.dtype)
+
+    @classmethod
+    def _primitive_acceptance_criteria(
+        cls,
+        *,
+        before_trace: PhysicalVerificationTrace,
+        after_trace: PhysicalVerificationTrace,
+        before_uncertainty: torch.Tensor,
+        after_uncertainty: torch.Tensor,
+        delta_depth: torch.Tensor,
+        delta_aif_latent: torch.Tensor,
+        max_depth_step: float,
+        max_aif_deviation: float,
+        epsilon: float,
+    ) -> tuple[bool, str, Dict[str, float]]:
+        valid = (1.0 - before_trace.invalid_score.detach().float()).clamp(0.0, 1.0)
+        before_disc = (before_trace.depth_focus_discrepancy.detach().float() * valid).mean()
+        after_disc = (after_trace.depth_focus_discrepancy.detach().float() * valid).mean()
+        before_res = before_trace.stack_reprojection_residual.detach().float().mean()
+        after_res = after_trace.stack_reprojection_residual.detach().float().mean()
+        before_u = before_uncertainty.detach().float().mean()
+        after_u = after_uncertainty.detach().float().mean()
+        depth_step = delta_depth.detach().float().abs().max()
+        aif_dev = delta_aif_latent.detach().float().abs().max()
+        coverage_before = (before_uncertainty.detach().float() < 0.5).float().mean()
+        coverage_after = (after_uncertainty.detach().float() < 0.5).float().mean()
+        metrics = {
+            "focus_discrepancy_before": float(before_disc.item()),
+            "focus_discrepancy_after": float(after_disc.item()),
+            "observation_residual_before": float(before_res.item()),
+            "observation_residual_after": float(after_res.item()),
+            "mean_uncertainty_before": float(before_u.item()),
+            "mean_uncertainty_after": float(after_u.item()),
+            "coverage_before": float(coverage_before.item()),
+            "coverage_after": float(coverage_after.item()),
+            "max_depth_update": float(depth_step.item()),
+            "max_aif_latent_deviation": float(aif_dev.item()),
+        }
+        if after_disc > before_disc + epsilon:
+            return False, "depth_focus_discrepancy_increased", metrics
+        if after_res > before_res + 0.02:
+            return False, "observation_residual_increased", metrics
+        if after_u > before_u + 0.20 or coverage_after < coverage_before * 0.5:
+            return False, "uncertainty_growth_exceeded", metrics
+        if aif_dev > max_aif_deviation + 1e-8:
+            return False, "aif_trust_region_exceeded", metrics
+        if depth_step > max_depth_step + 1e-8:
+            return False, "depth_step_exceeded", metrics
+        return True, "accepted", metrics
+
+    def _joint_refinement_iteration(
+        self,
+        *,
+        state: RefinementState,
+        focal_stack: torch.Tensor,
+        focal_plane_distances: torch.Tensor,
+        focal_depth_canonical: torch.Tensor,
+        focal_entropy: torch.Tensor,
+        focal_posterior: torch.Tensor,
+        recon: torch.Tensor,
+        verifier_device: torch.device,
+        verifier_dtype: torch.dtype,
+        verification_protocol: str,
+        epsilon: float,
+    ) -> tuple[RefinementState, Dict[str, Any]]:
+        del focal_posterior
+        current_depth = state.final_depth_canonical
+        focal_depth = self._resize_like(focal_depth_canonical, current_depth).clamp(0, 1)
+        entropy = self._resize_like(focal_entropy, current_depth).clamp(0, 1)
+        focus_support = self._resize_like(state.trace.focus_support, current_depth).clamp(0, 1)
+        invalidity = self._resize_like(state.trace.invalid_score, current_depth).clamp(0, 1)
+        operator_agreement = self._resize_like(state.trace.operator_agreement, current_depth).clamp(0, 1)
+        discrepancy = self._resize_like(state.trace.depth_focus_discrepancy, current_depth).clamp(0, 1)
+        residual = self._resize_like(state.trace.stack_reprojection_residual, current_depth).clamp(0, 1)
+
+        refiner = TraceRefiner().to(device=current_depth.device, dtype=current_depth.dtype)
+        deltas_depth = refiner(
+            aif_latents=state.aif_latents,
+            current_depth=current_depth,
+            uncertainty=state.uncertainty,
+            focal_depth=focal_depth,
+            focal_entropy=entropy,
+            focus_support=focus_support,
+            evidence_invalidity=invalidity,
+            operator_agreement=operator_agreement,
+            depth_focus_discrepancy=discrepancy,
+            observation_residual=residual,
+            verification_protocol=verification_protocol,
+        )
+        candidate_depth = (current_depth + deltas_depth["delta_depth"]).clamp(0, 1)
+        depth_trace = self.physical_verifier(
+            focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
+            focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
+            depth_canonical=candidate_depth.to(device=verifier_device, dtype=verifier_dtype),
+            all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
+            generated_depth_canonical=state.generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+            verification_protocol=verification_protocol,
+        )
+        new_discrepancy = self._resize_like(depth_trace.depth_focus_discrepancy, current_depth).clamp(0, 1)
+        deltas_aif = refiner(
+            aif_latents=state.aif_latents,
+            current_depth=candidate_depth,
+            uncertainty=state.uncertainty,
+            focal_depth=focal_depth,
+            focal_entropy=entropy,
+            focus_support=focus_support,
+            evidence_invalidity=invalidity,
+            operator_agreement=operator_agreement,
+            depth_focus_discrepancy=new_discrepancy,
+            previous_depth_focus_discrepancy=discrepancy,
+            observation_residual=residual,
+            verification_protocol=verification_protocol,
+        )
+        candidate_latents = state.aif_latents + deltas_aif["delta_aif_latent"]
+        # AIF latent trust region with high-frequency residual update only; decoded RGB is not edited pixel-wise.
+        candidate_recon = recon
+        if verification_protocol == "calibrated" and deltas_aif["delta_aif_latent"].abs().max() > 0:
+            try:
+                candidate_recon = self.vae.decode(candidate_latents / self.vae.config.scaling_factor, return_dict=False)[0]
+                candidate_recon = (candidate_recon / 2 + 0.5).clamp(0, 1)
+            except Exception:  # pragma: no cover - defensive for lightweight test doubles
+                candidate_recon = recon
+        candidate_trace = self.physical_verifier(
+            focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
+            focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
+            depth_canonical=candidate_depth.to(device=verifier_device, dtype=verifier_dtype),
+            all_in_focus=candidate_recon.to(device=verifier_device, dtype=verifier_dtype),
+            generated_depth_canonical=state.generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+            verification_protocol=verification_protocol,
+        )
+        residual_after = self._resize_like(candidate_trace.stack_reprojection_residual, current_depth).clamp(0, 1)
+        instability = (entropy + self._resize_like(candidate_trace.depth_focus_discrepancy, current_depth) + residual_after) / 3.0
+        candidate_uncertainty = (0.85 * state.uncertainty + 0.15 * instability).clamp(0, 0.95)
+        candidate_uncertainty = torch.maximum(candidate_uncertainty, invalidity * 0.35).clamp(0, 0.95)
+
+        all_delta_aif = deltas_aif["delta_aif_latent"]
+        accepted, reason, metrics = self._primitive_acceptance_criteria(
+            before_trace=state.trace,
+            after_trace=candidate_trace,
+            before_uncertainty=state.uncertainty,
+            after_uncertainty=candidate_uncertainty,
+            delta_depth=deltas_depth["delta_depth"],
+            delta_aif_latent=all_delta_aif,
+            max_depth_step=refiner.max_depth_step,
+            max_aif_deviation=refiner.max_latent_step,
+            epsilon=epsilon,
+        )
+        record: Dict[str, Any] = {
+            "step": state.iteration,
+            "accepted": accepted,
+            "rejected_reason": None if accepted else reason,
+            "verification_protocol": verification_protocol,
+            "depth_change": float(deltas_depth["delta_depth"].detach().float().abs().mean().item()),
+            "aif_latent_change": float(all_delta_aif.detach().float().abs().mean().item()),
+            "uncertainty_change": float((candidate_uncertainty - state.uncertainty).detach().float().abs().mean().item()),
+            **metrics,
+            "final_depth_canonical": (candidate_depth if accepted else state.final_depth_canonical).detach().cpu(),
+            "uncertainty_final": (candidate_uncertainty if accepted else state.uncertainty).detach().cpu(),
+        }
+        if not accepted:
+            return state, record
+        next_state = RefinementState(
+            aif_latents=candidate_latents,
+            generated_depth_canonical=state.generated_depth_canonical,
+            final_depth_canonical=candidate_depth,
+            uncertainty=candidate_uncertainty,
+            focal_gate=(state.focal_gate + deltas_depth["delta_focal_gate"]).clamp(0, 1),
+            generative_gate=(state.generative_gate + deltas_depth["delta_generative_gate"]).clamp(0, 1),
+            abstention=torch.maximum(state.abstention, candidate_uncertainty * 0.25).clamp(0, 1),
+            trace=candidate_trace,
+            iteration=state.iteration + 1,
+        )
+        return next_state, record
 
     @staticmethod
     def _physical_risk(trace: PhysicalVerificationTrace) -> float:
