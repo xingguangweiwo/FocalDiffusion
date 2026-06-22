@@ -6,7 +6,7 @@ from .losses import (
     SelectiveViolationLoss,
     VerificationTraceLoss,
 )
-from .optimizers import get_optimizer, get_scheduler
+from .optimizers import get_optimizer
 
 __all__ = [
     "FocalStackGenerationTrainer",
@@ -14,5 +14,4 @@ __all__ = [
     "VerificationTraceLoss",
     "SelectiveViolationLoss",
     "get_optimizer",
-    "get_scheduler",
 ]

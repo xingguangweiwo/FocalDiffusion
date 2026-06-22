@@ -8,9 +8,11 @@ import importlib.util
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
+
+from src.utils.metrics import ause, rejection_auc, sparsification_curve
 
 logger = logging.getLogger(__name__)
 
@@ -66,36 +68,6 @@ def high_error_labels(abs_rel: np.ndarray, mode: str = "top_percent", high_error
     if mode == "threshold":
         return abs_rel >= rel_error_threshold
     raise ValueError(f"Unsupported high-error mode: {mode}")
-
-
-def sparsification_curve(errors: np.ndarray, scores: np.ndarray, fractions: Iterable[float] | None = None) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute mean retained error after rejecting highest-uncertainty pixels."""
-    errors = np.asarray(errors, dtype=np.float64)
-    scores = np.asarray(scores, dtype=np.float64)
-    if fractions is None:
-        fractions = np.linspace(0.0, 0.95, 20)
-    fractions = np.asarray(list(fractions), dtype=np.float64)
-    order = np.argsort(-scores)
-    sorted_errors = errors[order]
-    values = []
-    n = len(errors)
-    for frac in fractions:
-        start = min(int(round(frac * n)), n - 1)
-        values.append(float(np.mean(sorted_errors[start:])))
-    return fractions, np.asarray(values, dtype=np.float64)
-
-
-def ause(errors: np.ndarray, scores: np.ndarray) -> float:
-    """Area under the sparsification error against an oracle ranking."""
-    fractions, curve = sparsification_curve(errors, scores)
-    _, oracle = sparsification_curve(errors, errors)
-    return float(np.trapz(curve - oracle, fractions))
-
-
-def rejection_auc(errors: np.ndarray, scores: np.ndarray) -> float:
-    """Summarize retained-pixel error as uncertainty-based rejection increases."""
-    fractions, curve = sparsification_curve(errors, scores)
-    return float(np.trapz(curve, fractions))
 
 
 def evaluate_scores(arrays: Dict[str, np.ndarray], high_error_mode: str = "top_percent", high_error_percent: float = 10.0, rel_error_threshold: float = 0.1, seed: int = 0) -> Dict[str, Dict[str, float | list]]:

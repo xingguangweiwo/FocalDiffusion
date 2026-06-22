@@ -13,10 +13,10 @@ data:
       depth_coordinate_type: canonical
       camera_calibration: false
       evaluation_mode: canonical
-  self_improvement_sources:
+  adaptation_sources:
     - name: virtual_kitti_adapt_unlabeled
       data_root: /data/virtual_kitti/vkitti_2.0.3_rgb
-      filelist: data/filelists/vkitti_adapt_unlabeled.txt
+      filelist: data/filelists/vkitti_val.txt
       focal_coordinate_type: normalized_rank
       focal_coordinate_unit: none
       depth_coordinate_type: canonical

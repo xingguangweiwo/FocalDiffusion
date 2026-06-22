@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .trainer import FocalStackGenerationTrainer
 
 
 def _log_state_dict_issues(
@@ -43,11 +46,11 @@ def save_checkpoint(
         'optimizer_state_dict': trainer.optimizer.state_dict(),
         'scheduler_state_dict': trainer.lr_scheduler.state_dict(),
         'config': trainer.config,
-        'self_improvement': {
-            'round_index': getattr(trainer, 'self_improvement_cfg', {}).get('round_index', 0),
-            'parent_checkpoint': getattr(trainer, 'self_improvement_cfg', {}).get('parent_checkpoint'),
-            'mining_manifest': getattr(trainer, 'self_improvement_cfg', {}).get('mining_manifest'),
-            'mined_sample_count': len(getattr(trainer, 'trace_mining_buffer', [])),
+        'unsupervised_adaptation': {
+            'round_index': getattr(trainer, 'adaptation_cfg', {}).get('round_index', 0),
+            'parent_checkpoint': getattr(trainer, 'adaptation_cfg', {}).get('parent_checkpoint'),
+            'mining_manifest': getattr(trainer, 'adaptation_cfg', {}).get('mining_manifest'),
+            'mined_sample_count': len(trainer.trace_mining_buffer) if getattr(trainer, 'trace_mining_buffer', None) is not None else 0,
         },
     }
 

@@ -156,7 +156,7 @@ def _source(name, unit="m", coord_type="distance"):
 def test_m_and_mm_linear_units_are_protocol_compatible_and_canonical_metrics_match():
     data_cfg = {
         "train_sources": [_source("meters", "m"), _source("millimeters", "mm")],
-        "self_improvement_sources": [_source("adapt", "m")],
+        "adaptation_sources": [_source("adapt", "m")],
         "val_sources": [_source("val", "m")],
         "test_sources": [_source("test", "m")],
     }
@@ -174,7 +174,7 @@ def test_m_and_mm_linear_units_are_protocol_compatible_and_canonical_metrics_mat
 def test_distance_and_inverse_distance_are_not_linear_equivalent():
     data_cfg = {
         "train_sources": [_source("distance", "m", "distance"), _source("inverse", "1_per_m", "inverse_distance")],
-        "self_improvement_sources": [_source("adapt", "m")],
+        "adaptation_sources": [_source("adapt", "m")],
         "val_sources": [_source("val", "m")],
         "test_sources": [_source("test", "m")],
     }

@@ -4,7 +4,7 @@ Handles EXIF data, camera parameters, and optical calculations
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 from pathlib import Path
 import exifread
 import logging

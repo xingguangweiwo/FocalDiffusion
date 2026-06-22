@@ -12,6 +12,14 @@ from tqdm import tqdm
 import yaml
 import torch.nn.functional as F
 
+from src.utils.metrics import (
+    binary_auprc as _binary_auprc,
+    binary_auroc as _binary_auroc,
+    risk_coverage_auc as _physical_aurc_for_sample,
+    selective_risk_at_coverage as _selective_risk_for_sample,
+    spearman_correlation as _spearman_correlation,
+)
+
 
 def _as_bchw(value: torch.Tensor | None) -> torch.Tensor | None:
     """Convert optional tensor maps to BCHW format for metric computation."""
@@ -36,85 +44,6 @@ def _finite_mean(values: list[float]) -> float:
     if finite.numel() == 0:
         return float("nan")
     return float(finite.mean().item())
-
-
-def _binary_auroc(scores: torch.Tensor, labels: torch.Tensor) -> float:
-    scores = scores.flatten().float()
-    labels = labels.flatten().bool()
-    valid = torch.isfinite(scores)
-    scores = scores[valid]
-    labels = labels[valid]
-    positives = labels.sum()
-    negatives = (~labels).sum()
-    if positives == 0 or negatives == 0:
-        return float("nan")
-    order = torch.argsort(scores)
-    ranks = torch.empty_like(scores, dtype=torch.float32)
-    ranks[order] = torch.arange(1, scores.numel() + 1, device=scores.device, dtype=torch.float32)
-    pos_ranks = ranks[labels].sum()
-    auc = (pos_ranks - positives.float() * (positives.float() + 1.0) / 2.0) / (positives.float() * negatives.float())
-    return float(auc.item())
-
-
-def _binary_auprc(scores: torch.Tensor, labels: torch.Tensor) -> float:
-    scores = scores.flatten().float()
-    labels = labels.flatten().bool()
-    valid = torch.isfinite(scores)
-    scores = scores[valid]
-    labels = labels[valid]
-    positives = labels.sum().float()
-    if positives == 0 or scores.numel() == 0:
-        return float("nan")
-    order = torch.argsort(scores, descending=True)
-    sorted_labels = labels[order].float()
-    tp = torch.cumsum(sorted_labels, dim=0)
-    precision = tp / torch.arange(1, sorted_labels.numel() + 1, device=scores.device, dtype=torch.float32)
-    recall = tp / positives.clamp(min=1.0)
-    recall_prev = torch.cat([recall.new_zeros(1), recall[:-1]])
-    return float(((recall - recall_prev) * precision).sum().item())
-
-
-def _spearman_correlation(a: torch.Tensor, b: torch.Tensor) -> float:
-    a = a.flatten().float()
-    b = b.flatten().float()
-    valid = torch.isfinite(a) & torch.isfinite(b)
-    a = a[valid]
-    b = b[valid]
-    if a.numel() < 2:
-        return float("nan")
-    a_order = torch.argsort(a)
-    b_order = torch.argsort(b)
-    a_rank = torch.empty_like(a, dtype=torch.float32)
-    b_rank = torch.empty_like(b, dtype=torch.float32)
-    a_rank[a_order] = torch.arange(a.numel(), device=a.device, dtype=torch.float32)
-    b_rank[b_order] = torch.arange(b.numel(), device=b.device, dtype=torch.float32)
-    a_rank = a_rank - a_rank.mean()
-    b_rank = b_rank - b_rank.mean()
-    denom = a_rank.norm() * b_rank.norm()
-    if float(denom.item()) == 0.0:
-        return float("nan")
-    return float((a_rank * b_rank).sum().div(denom).item())
-
-
-def _selective_risk_for_sample(confidence: torch.Tensor, risk: torch.Tensor, coverage: float) -> float:
-    flat_confidence = confidence.flatten()
-    flat_risk = risk.flatten()
-    if flat_confidence.numel() == 0:
-        return float("nan")
-    coverage_count = max(1, min(flat_confidence.numel(), int(math.ceil(flat_confidence.numel() * min(max(float(coverage), 0.0), 1.0)))))
-    top_indices = torch.topk(flat_confidence, k=coverage_count).indices
-    return float(flat_risk[top_indices].mean().item())
-
-
-def _physical_aurc_for_sample(confidence: torch.Tensor, risk: torch.Tensor) -> float:
-    flat_confidence = confidence.flatten()
-    flat_risk = risk.flatten()
-    if flat_confidence.numel() == 0:
-        return float("nan")
-    order = torch.argsort(flat_confidence, descending=True)
-    sorted_risk = flat_risk[order]
-    cumulative_risk = torch.cumsum(sorted_risk, dim=0) / torch.arange(1, sorted_risk.numel() + 1, device=sorted_risk.device, dtype=sorted_risk.dtype)
-    return float(cumulative_risk.mean().item())
 
 
 def _agreement_metrics(predicted_verdict: torch.Tensor, reference_verdict: torch.Tensor) -> dict[str, float]:
@@ -167,8 +96,13 @@ def compute_trace_metrics(
             "invalid_overconfidence_rate": nan,
             "accepted_coverage": nan,
             "coverage": float(coverage),
+            "internal_violation_detection_auroc": nan,
+            "internal_violation_detection_auprc": nan,
             "error_violation_detection_auroc": nan,
             "error_violation_detection_auprc": nan,
+            "gt_depth_error_detection_auroc": nan,
+            "gt_depth_error_detection_auprc": nan,
+            "gt_depth_risk_coverage_auc": nan,
             "uncertainty_error_spearman": nan,
             "diagnostics": {},
         }
@@ -225,6 +159,8 @@ def compute_trace_metrics(
         "coverage": float(coverage),
         "mean_conflict_score": float(conflict.mean().item()),
         "mean_invalid_score": float(invalid.mean().item()),
+        "internal_violation_detection_auroc": auroc,
+        "internal_violation_detection_auprc": auprc,
         "error_violation_detection_auroc": auroc,
         "error_violation_detection_auprc": auprc,
         "uncertainty_error_spearman": spearman,
@@ -234,6 +170,23 @@ def compute_trace_metrics(
             "sample_count": int(conflict.shape[0]),
         },
     }
+    depth_gt = _as_bchw(getattr(output, "depth_gt", None))
+    depth_pred = _as_bchw(getattr(output, "depth_pred", None))
+    if depth_gt is not None and depth_pred is not None:
+        if depth_pred.shape[-2:] != depth_gt.shape[-2:]:
+            depth_pred = F.interpolate(depth_pred.float(), size=depth_gt.shape[-2:], mode="bilinear", align_corners=False)
+        gt_error = torch.abs(depth_pred.float() - depth_gt.float())
+        if gt_error.shape[-2:] != uncertainty.shape[-2:]:
+            gt_error = F.interpolate(gt_error, size=uncertainty.shape[-2:], mode="bilinear", align_corners=False)
+        threshold = float(getattr(output, "depth_error_threshold", gt_error.flatten().median().item()))
+        gt_error_event = gt_error >= threshold
+        metrics["gt_depth_error_detection_auroc"] = _binary_auroc(uncertainty, gt_error_event)
+        metrics["gt_depth_error_detection_auprc"] = _binary_auprc(uncertainty, gt_error_event)
+        metrics["gt_depth_risk_coverage_auc"] = _finite_mean([
+            _physical_aurc_for_sample(confidence[index], gt_error[index].clamp(min=0.0))
+            for index in range(gt_error.shape[0])
+        ])
+
     reference_verdict = getattr(output, "reference_verdict", None)
     if reference_verdict is None:
         reference_verdict = getattr(trace, "reference_verdict", None)
@@ -400,7 +353,6 @@ def evaluate(args):
                 focal_stack=focal_stack,
                 focal_plane_distances=focal_plane_distances,
                 num_inference_steps=args.num_inference_steps,
-                output_type='pt',
                 num_refinement_steps=args.num_refinement_steps,
                 return_refinement_history=args.num_refinement_steps > 0,
             )

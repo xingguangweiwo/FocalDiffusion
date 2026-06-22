@@ -9,28 +9,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .verification_trace import PhysicalVerificationTrace
+from .verification_trace import FocalConsistencyTrace
+from ..data.synthetic_focal_stack_renderer import SyntheticFocalStackRenderer
+from ..utils.image_utils import canonical_focal_coordinates, to_model_range, to_unit_range
 
 
 def _split_unit_and_signed_ranges(image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(unit, signed)`` views for images in either ``[0, 1]`` or ``[-1, 1]``.
+    """Return canonical ``(unit, signed)`` image views for compatibility.
 
-    Range detection intentionally runs before any clamping so signed inputs are
-    not misclassified as unit-range tensors.
+    New code should call :func:`src.utils.image_utils.to_unit_range` and
+    :func:`src.utils.image_utils.to_model_range` directly.
     """
-    if not torch.isfinite(image).all():
-        raise ValueError("image tensors must contain only finite values.")
-    min_value = image.amin()
-    max_value = image.amax()
-    if min_value >= 0.0 and max_value <= 1.0:
-        unit = image
-        signed = image * 2.0 - 1.0
-    elif min_value >= -1.0 and max_value <= 1.0:
-        signed = image
-        unit = (image + 1.0) * 0.5
-    else:
-        raise ValueError("image tensors must be in [0, 1] or [-1, 1] range.")
-    return unit, signed
+    return to_unit_range(image), to_model_range(image)
 
 
 class FocusMeasureBank(nn.Module):
@@ -111,28 +101,19 @@ class DefocusConsistencyVerifier(nn.Module):
         super().__init__()
         self.max_blur_radius = max(1, int(max_blur_radius))
         self.eps = eps
+        self.renderer = SyntheticFocalStackRenderer(max_sigma=float(self.max_blur_radius), num_blur_levels=4)
 
     @staticmethod
     def _normalize_focal_distances(focal_plane_distances: torch.Tensor, batch: int, planes: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Normalize focal distances to ``[B, K]`` canonical coordinates."""
-        distances = focal_plane_distances.to(device=device, dtype=dtype)
-        if distances.dim() == 1:
-            distances = distances.unsqueeze(0)
-        if distances.shape[0] == 1 and batch != 1:
-            distances = distances.expand(batch, -1)
-        if distances.shape != (batch, planes):
+        """Return canonical focal coordinates shared by all focus components."""
+        coords, _ = canonical_focal_coordinates(
+            focal_plane_distances.to(device=device, dtype=dtype),
+            batch_size=batch,
+            coordinate_type="distance",
+        )
+        if coords.shape != (batch, planes):
             raise ValueError(f"focal_plane_distances must have shape [B, K] or [K], got {tuple(focal_plane_distances.shape)}")
-        mn = distances.min(dim=1, keepdim=True).values
-        mx = distances.max(dim=1, keepdim=True).values
-        return (distances - mn) / (mx - mn).clamp(min=1e-6)
-
-    def _multi_blur(self, image: torch.Tensor) -> torch.Tensor:
-        """Approximate defocus by averaging a small bank of box blurs."""
-        blurred = [image]
-        for radius in (1, 3, self.max_blur_radius):
-            kernel = 2 * radius + 1
-            blurred.append(F.avg_pool2d(image, kernel_size=kernel, stride=1, padding=radius))
-        return torch.stack(blurred, dim=1).mean(dim=1)
+        return coords
 
     def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Return residual maps from defocus rendering consistency checks."""
@@ -140,20 +121,23 @@ class DefocusConsistencyVerifier(nn.Module):
         batch, planes, _, height, width = focal_stack.shape
         if depth_canonical.dim() == 3:
             depth_canonical = depth_canonical.unsqueeze(1)
-        focal_stack_unit, _ = _split_unit_and_signed_ranges(focal_stack)
+        focal_stack_unit = to_unit_range(focal_stack)
         depth = F.interpolate(depth_canonical, size=(height, width), mode="bilinear", align_corners=False).clamp(0.0, 1.0)
-        all_in_focus_unit, _ = _split_unit_and_signed_ranges(all_in_focus)
+        all_in_focus_unit = to_unit_range(all_in_focus)
         aif = F.interpolate(all_in_focus_unit, size=(height, width), mode="bilinear", align_corners=False)
         coords = self._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype)
-        blur_amount = (depth[:, None] - coords[:, :, None, None, None]).abs().clamp(0.0, 1.0)
-        blurred = self._multi_blur(aif)[:, None]
-        rendered = (1.0 - blur_amount) * aif[:, None] + blur_amount * blurred
+        sigma = (depth[:, None, 0] - coords[:, :, None, None]).abs().clamp(0.0, 1.0) * float(self.max_blur_radius)
+        rendered = self.renderer.render_from_sigma(aif, sigma)
         stack_reprojection_residual = (rendered - focal_stack_unit).abs().mean(dim=2).mean(dim=1, keepdim=True).clamp(0.0, 1.0)
         return {"stack_reprojection_residual": stack_reprojection_residual, "rendered_stack": rendered}
 
 
-class FocalPhysicalVerifier(nn.Module):
-    """Fuse fixed focus and defocus checks into a PhysicalVerificationTrace."""
+class FocalConsistencyEvaluator(nn.Module):
+    """Fuse fixed focus/image-formation checks into a FocalConsistencyTrace.
+
+    The evaluator reports consistency diagnostics only; it does not provide
+    ground-truth correctness labels.
+    """
 
     def __init__(self, eps: float = 1e-6, focus_operator: str = "sobel_laplacian") -> None:
         """Initialize the conservative FocalTrace physical verifier."""
@@ -173,7 +157,7 @@ class FocalPhysicalVerifier(nn.Module):
             "defocus_eps": float(self.defocus_verifier.eps),
         }
 
-    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor, generated_depth_canonical: torch.Tensor | None = None) -> PhysicalVerificationTrace:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor, generated_depth_canonical: torch.Tensor | None = None) -> FocalConsistencyTrace:
         """Compute a batch-first physical verification trace for FocalTrace."""
         focus = self.focus_bank(focal_stack)
         batch, planes = focal_stack.shape[:2]
@@ -196,7 +180,7 @@ class FocalPhysicalVerifier(nn.Module):
         invalid_score = torch.maximum(focus["focus_entropy"], residuals["stack_reprojection_residual"]).clamp(0.0, 1.0)
         support_score = focus_support + generation_support - physical_penalty
         verdict_scores = torch.cat([support_score, conflict_score, invalid_score], dim=1)
-        return PhysicalVerificationTrace(
+        return FocalConsistencyTrace(
             focus_peak_confidence=focus["focus_peak_confidence"],
             focus_peak_index=focus["focus_peak_index"],
             focus_peak_coordinate=focus_peak_coordinate,
@@ -212,3 +196,7 @@ class FocalPhysicalVerifier(nn.Module):
             invalid_score=invalid_score,
             verdict_scores=verdict_scores,
         )
+
+
+# Backward-compatible alias for existing checkpoints and imports.
+FocalPhysicalVerifier = FocalConsistencyEvaluator

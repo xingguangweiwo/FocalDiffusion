@@ -1,3 +1,11 @@
+protocol:
+  name: source_training
+  source_train: train_sources
+  source_val: val_sources
+  adaptation: adaptation_sources
+  target_test: test_sources
+  threshold_selection: source_val_only
+
 # Default training recipe in a single file.
 # Other configs can extend this base via `defaults: [base]`.
 model:
@@ -32,10 +40,10 @@ data:
       depth_coordinate_type: canonical
       camera_calibration: false
       evaluation_mode: canonical
-  self_improvement_sources:
+  adaptation_sources:
     - name: hypersim_adapt_unlabeled
       data_root: /path/to/hypersim
-      filelist: data/filelists/hypersim_adapt_unlabeled.txt
+      filelist: data/filelists/hypersim_val.txt
       focal_coordinate_type: normalized_rank
       focal_coordinate_unit: none
       depth_coordinate_type: canonical
@@ -43,7 +51,7 @@ data:
       evaluation_mode: canonical
     - name: virtual_kitti_adapt_unlabeled
       data_root: /path/to/virtual_kitti
-      filelist: data/filelists/vkitti_adapt_unlabeled.txt
+      filelist: data/filelists/vkitti_val.txt
       focal_coordinate_type: normalized_rank
       focal_coordinate_unit: none
       depth_coordinate_type: canonical
@@ -117,12 +125,12 @@ training:
   lora_rank: 8
   lora_alpha: 16
   supervision_mode: supervised
-  self_improvement:
+  unsupervised_adaptation:
     enabled: false
     round_index: 0
-    round_id: M0
+    round_id: source
     parent_checkpoint: null
-    mining_manifest: outputs/self_improvement/round_1_manifest.jsonl
+    mining_manifest: outputs/unsupervised_adaptation/round_1_manifest.jsonl
     max_mining_batches: 8
     replay_batch_size: 2
     max_buffer_items: 128
@@ -164,7 +172,6 @@ losses:
 
 validation:
   num_inference_steps: 30
-  guidance_scale: 1.0
   # Thresholds selected on validation split only; do not tune on test_sources.
   heldout_verifier:
     focus_operator: laplacian_tenengrad_heldout

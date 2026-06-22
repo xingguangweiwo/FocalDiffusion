@@ -8,6 +8,8 @@ import math
 import torch
 import torch.nn as nn
 
+from ..utils.image_utils import canonical_focal_coordinates
+
 
 class FocalSweepEncoder(nn.Module):
     """Learned focal-axis encoder using patch tokens and attention across focal sweep."""
@@ -27,9 +29,12 @@ class FocalSweepEncoder(nn.Module):
 
     @staticmethod
     def normalize_focal_plane_distances(focal_plane_distances: torch.Tensor) -> torch.Tensor:
-        tau_min = focal_plane_distances.min(dim=1, keepdim=True).values
-        tau_max = focal_plane_distances.max(dim=1, keepdim=True).values
-        return (focal_plane_distances - tau_min) / (tau_max - tau_min + 1e-6)
+        coords, _ = canonical_focal_coordinates(
+            focal_plane_distances,
+            batch_size=focal_plane_distances.shape[0] if focal_plane_distances.dim() > 1 else None,
+            coordinate_type="distance",
+        )
+        return coords
 
     @staticmethod
     def fourier_embed(tau: torch.Tensor, bands: int = 8) -> torch.Tensor:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import TYPE_CHECKING, Dict, Tuple
 
 import math
 import torch
@@ -11,8 +11,11 @@ from tqdm import tqdm
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
 from ..models.focal_evidence_encoder import build_physical_evidence_features
-from ..models.physics_modules import _split_unit_and_signed_ranges
+from ..utils.image_utils import resize_probability_volume, to_model_range, to_unit_range
 from ..utils.metrics import compute_metrics
+
+if TYPE_CHECKING:
+    from .trainer import FocalStackGenerationTrainer
 
 
 _TEACHER_FORCED_KEYS = (
@@ -160,13 +163,10 @@ def _final_depth_from_heads(
         mode="bilinear",
         align_corners=False,
     ).to(device=generated_depth_canonical.device, dtype=generated_depth_canonical.dtype)
-    focal_posterior = F.interpolate(
+    focal_posterior = resize_probability_volume(
         focal_evidence["focal_posterior"],
-        size=generated_depth_canonical.shape[-2:],
-        mode="bilinear",
-        align_corners=False,
+        generated_depth_canonical.shape[-2:],
     ).to(device=generated_depth_canonical.device, dtype=generated_depth_canonical.dtype)
-    focal_posterior = focal_posterior / focal_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
 
     support_inputs, support_maps = build_physical_evidence_features(
         focal_posterior=focal_posterior,
@@ -236,8 +236,8 @@ def run_teacher_forced_validation(trainer: "FocalStackGenerationTrainer", epoch:
             focal_plane_distances = batch["focal_plane_distances"].to(device)
             rgb_gt = batch["all_in_focus"].to(device)
 
-            _, focal_stack = _split_unit_and_signed_ranges(focal_stack.float())
-            _, rgb_target = _split_unit_and_signed_ranges(rgb_gt.float())
+            _, focal_stack = (to_unit_range(focal_stack.float()), to_model_range(focal_stack.float()))
+            _, rgb_target = (to_unit_range(rgb_gt.float()), to_model_range(rgb_gt.float()))
 
             focal_features = trainer.focal_processor(focal_stack, focal_plane_distances)
             focal_features = {
@@ -334,8 +334,6 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
                 focal_stack=batch['focal_stack'],
                 focal_plane_distances=batch['focal_plane_distances'],
                 num_inference_steps=trainer.config['validation']['num_inference_steps'],
-                guidance_scale=trainer.config['validation']['guidance_scale'],
-                output_type='pt',
                 return_dict=True,
             )
 
@@ -372,7 +370,7 @@ def run_generative_validation(trainer: "FocalStackGenerationTrainer", epoch: int
             trace = getattr(output, "physical_verification_trace", None)
             evaluation_verifier = getattr(trainer, "evaluation_verifier", None)
             if evaluation_verifier is not None and output.final_depth_canonical is not None:
-                focal_stack_unit, _ = _split_unit_and_signed_ranges(batch["focal_stack"].to(final_depth_canonical.device).float())
+                focal_stack_unit, _ = (to_unit_range(batch["focal_stack"].to(final_depth_canonical.device).float()), to_model_range(batch["focal_stack"].to(final_depth_canonical.device).float()))
                 all_in_focus = output.all_in_focus_image
                 if isinstance(all_in_focus, torch.Tensor):
                     trace = evaluation_verifier(
@@ -483,9 +481,10 @@ def run_validation(trainer: "FocalStackGenerationTrainer", epoch: int) -> Dict[s
     val_metrics["abs_rel"] = val_metrics.get("generative_abs_rel", 0.0)
     val_metrics["rmse"] = val_metrics.get("generative_rmse", 0.0)
 
-    self_improvement_cfg = trainer.config.get("training", {}).get("self_improvement", {}) or {}
-    if bool(self_improvement_cfg.get("enabled", False)):
-        baseline = trainer.config.get("validation", {}).get("m0_baseline_metrics", {}) or {}
+    trainer_config = getattr(trainer, "config", {})
+    unsupervised_adaptation_cfg = trainer_config.get("training", {}).get("unsupervised_adaptation", {}) or {}
+    if bool(unsupervised_adaptation_cfg.get("enabled", False)):
+        baseline = trainer_config.get("validation", {}).get("m0_baseline_metrics", {}) or {}
         val_metrics["m1_unlabeled_adaptation_hcpvr"] = val_metrics.get("heldout_high_confidence_physical_violation_rate", float("nan"))
         val_metrics["m1_unlabeled_adaptation_physical_aurc"] = val_metrics.get("heldout_selective_physical_risk_at_coverage", float("nan"))
         val_metrics["m1_unlabeled_adaptation_depth_l1"] = val_metrics.get("generative_l1", float("nan"))

@@ -90,20 +90,38 @@ def test_load_config_base_smoke():
     config = load_config("configs/base.yaml")
     assert config["model"]["feature_dim"] == 128
     assert config["data"]["dataset_kwargs"]["strict_data"] is True
-    assert config["losses"]["lambda_trace"] == 0.02
-    assert config["losses"]["lambda_violation"] == 0.02
-    assert config["losses"]["lambda_invalid"] == 0.02
-    assert config["training"]["self_improvement"]["enabled"] is False
-    assert config["training"]["self_improvement"]["round_id"] == "M0"
-    assert config["training"]["self_improvement"]["round_index"] == 0
-    assert config["data"]["self_improvement_sources"]
+    expected_loss_defaults = {
+        "lambda_trace": 0.05,
+        "lambda_violation": 0.05,
+        "lambda_invalid": 0.05,
+    }
+    assert {key: config["losses"][key] for key in expected_loss_defaults} == expected_loss_defaults
+    assert config["training"]["supervision_mode"] in {"supervised", "semi_supervised"}
+    train_filelists = {source["filelist"] for source in config["data"].get("train_sources", [])}
+    test_filelists = {source["filelist"] for source in config["data"].get("test_sources", [])}
+    assert train_filelists
+    assert not (train_filelists & test_filelists)
+    assert config["training"]["unsupervised_adaptation"]["enabled"] is False
+    assert config["training"]["unsupervised_adaptation"]["round_id"] == "source"
+    assert config["training"]["unsupervised_adaptation"]["round_index"] == 0
+    assert config["data"]["adaptation_sources"]
     train_filelists = {source["filelist"] for source in config["data"]["train_sources"]}
-    adapt_filelists = {source["filelist"] for source in config["data"]["self_improvement_sources"]}
+    adapt_filelists = {source["filelist"] for source in config["data"]["adaptation_sources"]}
     test_filelists = {source["filelist"] for source in config["data"]["test_sources"]}
     assert adapt_filelists.isdisjoint(test_filelists)
     assert train_filelists.isdisjoint(test_filelists)
-    assert config["training"]["self_improvement"]["mining_manifest"]
-    assert "mine_every_n_steps" not in config["training"]["self_improvement"]
+    assert config["training"]["unsupervised_adaptation"]["mining_manifest"]
+    assert "mine_every_n_steps" not in config["training"]["unsupervised_adaptation"]
+
+
+def test_disabled_adaptation_does_not_require_adaptation_sources():
+    from copy import deepcopy
+    from script.train import load_config, validate_config
+
+    config = deepcopy(load_config("configs/base.yaml"))
+    config["training"]["unsupervised_adaptation"]["enabled"] = False
+    config["data"].pop("adaptation_sources", None)
+    validate_config(config)
 
 
 def test_dataset_strict_data_raises_on_missing_files(tmp_path):
@@ -528,6 +546,11 @@ def test_trace_mining_buffer_mines_and_replays_small_patches():
         batch_index=3,
         conflict_threshold=0.5,
         confidence_threshold=0.5,
+        accepted_refinement=True,
+        focal_split_seed=7,
+        heldout_risk_before=0.4,
+        heldout_risk_after=0.2,
+        dataset_split="adaptation",
     )
 
     assert stats["mined_trace_items"] == 4
@@ -715,12 +738,19 @@ def test_trace_manifest_metadata_and_full_replay_targets_drive_generation_output
         focal_gate=torch.ones(1, 1, 2, 2) * 0.3,
         generative_gate=torch.ones(1, 1, 2, 2) * 0.7,
         abstention=torch.ones(1, 1, 2, 2) * 0.1,
+        accepted_refinement=True,
+        focal_split_seed=11,
+        heldout_risk_before=0.6,
+        heldout_risk_after=0.3,
+        dataset_split="adaptation",
     )
     assert stats["mined_trace_items"] > 0
     buffer.save(buffer.manifest_path)
     reloaded = TraceMiningBuffer(max_items=4, manifest_path=buffer.manifest_path)
     assert reloaded.metadata["parent_checkpoint_sha256"] == "parent-sha"
     assert reloaded.metadata["verifier_config_hash"] == "verifier-sha"
+    assert all(item["accepted_refinement"] and item["dataset_split"] == "adaptation" for item in reloaded.items)
+    assert all("focal_split_seed" in item and "heldout_risk_before" in item and "heldout_risk_after" in item for item in reloaded.items)
     assert all("stack_reprojection_residual_target" in item for item in reloaded.items)
     assert all("focal_gate_target" in item and "generative_gate_target" in item for item in reloaded.items)
 
@@ -745,3 +775,117 @@ def test_trace_manifest_metadata_and_full_replay_targets_drive_generation_output
     for tensor in (final_depth, generated_depth, focal_gate, generative_gate, uncertainty):
         assert tensor.grad is not None
         assert torch.isfinite(tensor.grad).all()
+
+
+def test_focal_axis_metric_supervision_uses_focal_coordinate_system():
+    from src.training.losses import metric_depth_to_focal_coordinates
+
+    distances = torch.tensor([[2.0, 4.0, 6.0]])
+    depth = torch.tensor([[[[2.0, 4.0, 6.0, 8.0]]]])
+    coords = metric_depth_to_focal_coordinates(depth, distances)
+    assert torch.allclose(coords, torch.tensor([[[0.0, 0.5, 1.0, 1.0]]]))
+
+
+def test_filelist_allows_focal_stack_only_entries(tmp_path):
+    from PIL import Image
+    from src.data.dataset import FocalStackDataset
+
+    stack_dir = tmp_path / "stack"
+    stack_dir.mkdir()
+    Image.new("RGB", (8, 8), color=(128, 128, 128)).save(stack_dir / "000.png")
+    filelist = tmp_path / "list.txt"
+    filelist.write_text("stack\n", encoding="utf-8")
+    dataset = FocalStackDataset(tmp_path, filelist, image_size=(8, 8), focal_stack_size=1)
+    sample = dataset[0]
+    assert "focal_stack" in sample
+    assert "depth" not in sample
+    assert "all_in_focus" not in sample
+
+
+def test_range_conversion_parity_for_train_inference_adaptation_inputs():
+    from src.models.physics_modules import _split_unit_and_signed_ranges
+
+    unit = torch.rand(1, 3, 3, 4, 4)
+    signed = unit * 2.0 - 1.0
+    train_unit, train_signed = _split_unit_and_signed_ranges(unit)
+    infer_unit, infer_signed = _split_unit_and_signed_ranges(signed)
+    adapt_unit, adapt_signed = _split_unit_and_signed_ranges(unit.clone())
+    assert torch.allclose(train_signed, infer_signed)
+    assert torch.allclose(train_signed, adapt_signed)
+    assert torch.allclose(train_unit, infer_unit)
+    assert torch.allclose(train_unit, adapt_unit)
+
+
+def test_focus_likelihood_masks_duplicate_planes_and_low_texture_is_uncertain():
+    from src.models.focal_evidence_encoder import FocusLikelihoodEstimator
+
+    estimator = FocusLikelihoodEstimator(hidden=8, temperature=0.1)
+    stack = torch.zeros(1, 3, 3, 8, 8)
+    distances = torch.tensor([[0.2, 0.4, 0.4]])
+    out = estimator(stack, distances)
+    assert torch.all(out["focal_posterior"][:, 2] == 0)
+    assert out["texture_confidence"].max() <= 1
+    assert "multimodality_score" in out and "focus_coverage_confidence" in out
+
+
+def test_synthetic_renderer_has_finite_depth_and_aif_gradients():
+    from src.data.synthetic_focal_stack_renderer import SyntheticFocalStackRenderer
+
+    renderer = SyntheticFocalStackRenderer(max_sigma=2.0, num_blur_levels=4)
+    aif = torch.rand(1, 3, 8, 8, requires_grad=True)
+    depth = (torch.rand(1, 1, 8, 8) + 0.5).requires_grad_(True)
+    stack = renderer.generate(aif, depth, torch.tensor([[0.6, 1.0]]))
+    loss = stack.mean()
+    loss.backward()
+    assert aif.grad is not None and torch.isfinite(aif.grad).all()
+    assert depth.grad is not None and torch.isfinite(depth.grad).all()
+
+
+def test_selective_tto_heldout_split_and_rejection_are_deterministic():
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationPipeline
+
+    train_a, val_a = FocalStackGenerationPipeline._split_refinement_planes(5, torch.device("cpu"), seed=123)
+    train_b, val_b = FocalStackGenerationPipeline._split_refinement_planes(5, torch.device("cpu"), seed=123)
+    assert torch.equal(train_a, train_b) and torch.equal(val_a, val_b)
+    assert set(train_a.tolist()).isdisjoint(set(val_a.tolist()))
+    assert not FocalStackGenerationPipeline._should_accept_refinement(torch.tensor(0.1), torch.tensor(0.2), epsilon=0.0)
+
+
+def test_selective_tto_recomputes_uncertainty_not_free_variable():
+    from src.models.physics_modules import FocalPhysicalVerifier
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationPipeline
+
+    stack = torch.rand(1, 4, 3, 8, 8)
+    distances = torch.linspace(0.2, 1.0, 4).unsqueeze(0)
+    depth = torch.full((1, 1, 8, 8), 0.5)
+    aif = stack.mean(dim=1)
+    trace = FocalPhysicalVerifier()(stack, distances, depth, aif, depth)
+    cand_depth, unc, cand_aif = FocalStackGenerationPipeline._selective_test_time_refinement(
+        focal_stack_unit=stack,
+        focal_plane_distances=distances,
+        final_depth_canonical=depth,
+        focus_depth_canonical=depth,
+        prior_depth_canonical=depth,
+        all_in_focus_unit=aif,
+        uncertainty_final=torch.zeros_like(depth),
+        trace=trace,
+        seed=5,
+        inner_steps=1,
+    )
+    assert cand_depth.shape == depth.shape and cand_aif.shape == aif.shape
+    assert unc.shape == depth.shape
+    assert unc.max() > 0
+
+
+def test_legacy_self_improvement_config_keys_migrate_to_unsupervised_adaptation():
+    from script.train import _migrate_protocol_config
+
+    cfg = {
+        "data": {"self_improvement_sources": [{"filelist": "adapt.txt"}]},
+        "training": {"self_improvement": {"enabled": True, "round_index": 1}},
+    }
+    migrated = _migrate_protocol_config(cfg)
+    assert "self_improvement_sources" not in migrated["data"]
+    assert migrated["data"]["adaptation_sources"][0]["filelist"] == "adapt.txt"
+    assert "self_improvement" not in migrated["training"]
+    assert migrated["training"]["unsupervised_adaptation"]["round_index"] == 1

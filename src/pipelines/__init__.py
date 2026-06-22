@@ -4,12 +4,16 @@ from .focal_stack_generation_pipeline import (
     FocalInjectedSD3Transformer,
     FocalStackGenerationOutput,
     FocalStackGenerationPipeline,
+    FocalDiffusionOutput,
+    FocalDiffusionPipeline,
 )
 
 __all__ = [
     "FocalStackGenerationPipeline",
     "FocalStackGenerationOutput",
     "FocalInjectedSD3Transformer",
+    "FocalDiffusionOutput",
+    "FocalDiffusionPipeline",
     "load_pipeline",
     "save_pipeline",
 ]

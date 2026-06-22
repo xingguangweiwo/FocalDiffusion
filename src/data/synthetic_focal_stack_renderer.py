@@ -1,9 +1,8 @@
-"""Utilities to synthesise focal stacks from an all-in-focus image and depth map."""
+"""Differentiable focal-stack renderer with metric thin-lens units."""
 
 from __future__ import annotations
 
 import math
-from functools import lru_cache
 from typing import Dict, Optional
 
 import torch
@@ -11,11 +10,11 @@ import torch.nn.functional as F
 
 
 class SyntheticFocalStackRenderer:
-    """Generate focal stacks via a thin-lens circle-of-confusion model.
+    """Render focal stacks from AIF RGB and metric depth using a blur basis.
 
-    The implementation mirrors the MATLAB reference shared by the project authors:
-    it approximates the spatially varying point-spread function by quantising the
-    per-pixel blur radius and blending Gaussian-blurred versions of the source image.
+    Units: depth, focus distance, focal length, aperture, and pixel size are in
+    metres. The main rendering path is batched and differentiable with respect
+    to both the all-in-focus image and depth map.
     """
 
     def __init__(
@@ -28,17 +27,23 @@ class SyntheticFocalStackRenderer:
         sigma_quantisation: float = 0.25,
         kernel_limit: int = 25,
         eps: float = 1e-6,
+        psf_type: str = "gaussian",
+        num_blur_levels: int | None = None,
+        exposure_normalize: bool = True,
     ) -> None:
+        if psf_type not in {"gaussian", "disc"}:
+            raise ValueError("psf_type must be 'gaussian' or 'disc'.")
         self.default_f_number = default_f_number
         self.default_focal_length = default_focal_length
         self.default_pixel_size = default_pixel_size
         self.min_sigma = min_sigma
         self.max_sigma = max_sigma
         self.sigma_quantisation = max(sigma_quantisation, 1e-3)
-        self.kernel_limit = max(kernel_limit, 5)
-        if self.kernel_limit % 2 == 0:
-            self.kernel_limit += 1
+        self.kernel_limit = max(kernel_limit + (1 - kernel_limit % 2), 5)
         self.eps = eps
+        self.psf_type = psf_type
+        self.num_blur_levels = num_blur_levels or int(math.ceil(max_sigma / self.sigma_quantisation)) + 1
+        self.exposure_normalize = exposure_normalize
 
     def generate(
         self,
@@ -47,154 +52,119 @@ class SyntheticFocalStackRenderer:
         focal_plane_distances: torch.Tensor,
         camera_params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Create a focal stack for the requested focus distances.
+        """Create a focal stack for focus distances in metres.
 
-        Args:
-            all_in_focus: Tensor of shape [C, H, W] in range [0, 1].
-            depth: Tensor of shape [1, H, W] or [H, W] with metric depth in metres.
-            focal_plane_distances: 1D tensor/list with focus distances in metres.
-            camera_params: Optional mapping containing camera metadata. Supported keys
-                include ``f_number``, ``focal_length``, ``pixel_size`` and ``aperture``.
+        Accepts ``all_in_focus`` as ``[C,H,W]`` or ``[B,C,H,W]`` in unit range,
+        ``depth`` as ``[H,W]``, ``[1,H,W]``, ``[B,H,W]`` or ``[B,1,H,W]`` in
+        metres, and focal distances as ``[K]`` or ``[B,K]`` in metres. Returns
+        ``[K,C,H,W]`` for unbatched input and ``[B,K,C,H,W]`` for batched input.
         """
+        unbatched = all_in_focus.dim() == 3
+        if unbatched:
+            all_in_focus = all_in_focus.unsqueeze(0)
+        if all_in_focus.dim() != 4:
+            raise ValueError("all_in_focus must have shape [C,H,W] or [B,C,H,W]")
+        if depth.dim() == 2:
+            depth = depth.unsqueeze(0).unsqueeze(0)
+        elif depth.dim() == 3:
+            depth = depth.unsqueeze(1) if depth.shape[0] == all_in_focus.shape[0] else depth.unsqueeze(0)
+        if depth.dim() != 4 or depth.shape[1] != 1:
+            raise ValueError("depth must have shape [H,W], [1,H,W], [B,H,W] or [B,1,H,W]")
+        image = all_in_focus.float() if not torch.is_floating_point(all_in_focus) else all_in_focus
+        depth = depth.to(device=image.device, dtype=image.dtype)
+        if depth.shape[0] == 1 and image.shape[0] != 1:
+            depth = depth.expand(image.shape[0], -1, -1, -1)
+        if depth.shape[0] != image.shape[0]:
+            raise ValueError("depth batch must be 1 or match all_in_focus batch")
+        focus = torch.as_tensor(focal_plane_distances, device=image.device, dtype=image.dtype)
+        if focus.dim() == 1:
+            focus = focus.unsqueeze(0).expand(image.shape[0], -1)
+        elif focus.dim() == 2 and focus.shape[0] == 1 and image.shape[0] != 1:
+            focus = focus.expand(image.shape[0], -1)
+        if focus.dim() != 2 or focus.shape[0] != image.shape[0]:
+            raise ValueError("focal_plane_distances must have shape [K] or [B,K]")
 
-        if all_in_focus.dim() != 3:
-            raise ValueError("all_in_focus must have shape [C, H, W]")
+        camera = self._prepare_camera_params(camera_params, image.device, image.dtype, image.shape[0])
+        sigma = self._compute_sigma_map(depth, focus, camera)
+        rendered = self.render_from_sigma(image, sigma)
+        return rendered.squeeze(0) if unbatched else rendered
 
-        if depth.dim() == 3 and depth.size(0) == 1:
-            depth = depth.squeeze(0)
-        if depth.dim() != 2:
-            raise ValueError("depth must have shape [H, W] or [1, H, W]")
+    def render_from_sigma(self, image: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        """Blend a precomputed blur basis with continuous CoC-derived weights."""
+        if sigma.dim() != 4:
+            raise ValueError("sigma must have shape [B,K,H,W]")
+        batch, channels, height, width = image.shape
+        _, planes, _, _ = sigma.shape
+        if self.exposure_normalize:
+            image = image / image.mean(dim=(-2, -1), keepdim=True).clamp(min=self.eps) * image.detach().mean(dim=(-2, -1), keepdim=True).clamp(min=self.eps)
+        levels = torch.linspace(0.0, self.max_sigma, self.num_blur_levels, device=image.device, dtype=image.dtype)
+        basis = torch.stack([self._blur(image, level) for level in levels], dim=1)  # [B,L,C,H,W]
+        scaled = (sigma.clamp(0.0, self.max_sigma) / self.max_sigma) * (self.num_blur_levels - 1)
+        lower = torch.floor(scaled).long().clamp(0, self.num_blur_levels - 1)
+        upper = (lower + 1).clamp(0, self.num_blur_levels - 1)
+        frac = (scaled - lower.to(dtype=scaled.dtype)).unsqueeze(2)
+        gather_shape = (batch, planes, channels, height, width)
+        lower_basis = torch.gather(basis, 1, lower[:, :, None].expand(gather_shape))
+        upper_basis = torch.gather(basis, 1, upper[:, :, None].expand(gather_shape))
+        return lower_basis * (1.0 - frac) + upper_basis * frac
 
-        if not torch.is_floating_point(all_in_focus):
-            all_in_focus = all_in_focus.float()
-        if not torch.is_floating_point(depth):
-            depth = depth.float()
-
-        if isinstance(focal_plane_distances, torch.Tensor):
-            focal_plane_distances_tensor = focal_plane_distances.flatten().to(
-                dtype=all_in_focus.dtype, device=all_in_focus.device
-            )
-        else:
-            focal_plane_distances_tensor = torch.as_tensor(
-                focal_plane_distances, dtype=all_in_focus.dtype, device=all_in_focus.device
-            )
-
-        if focal_plane_distances_tensor.numel() == 0:
-            raise ValueError("focal_plane_distances must contain at least one value")
-
-        camera = self._prepare_camera_params(camera_params, all_in_focus.device, all_in_focus.dtype)
-        stack = []
-        for focus_depth in focal_plane_distances_tensor:
-            sigma_map = self._compute_sigma_map(depth, focus_depth, camera)
-            frame = self._apply_spatially_variant_blur(all_in_focus, sigma_map)
-            stack.append(frame)
-
-        return torch.stack(stack, dim=0)
-
-    def _prepare_camera_params(
-        self,
-        camera_params: Optional[Dict[str, torch.Tensor]],
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Dict[str, torch.Tensor]:
+    def _prepare_camera_params(self, camera_params: Optional[Dict[str, torch.Tensor]], device: torch.device, dtype: torch.dtype, batch: int) -> Dict[str, torch.Tensor]:
         camera: Dict[str, torch.Tensor] = {}
-        if camera_params:
-            for key, value in camera_params.items():
-                if isinstance(value, torch.Tensor):
-                    camera[key] = value.to(device=device, dtype=dtype)
-                else:
-                    camera[key] = torch.tensor(float(value), device=device, dtype=dtype)
-
-        def _get(name: str, default: float) -> torch.Tensor:
-            if name in camera:
-                return camera[name]
-            camera[name] = torch.tensor(default, device=device, dtype=dtype)
-            return camera[name]
-
-        # Populate required defaults.
-        f_number = _get("f_number", self.default_f_number)
-        focal_length = _get("focal_length", self.default_focal_length)
-        if "aperture" not in camera:
-            camera["aperture"] = focal_length / torch.clamp(f_number, min=self.eps)
-        _get("pixel_size", self.default_pixel_size)
+        for key, default in {
+            "f_number": self.default_f_number,
+            "focal_length": self.default_focal_length,
+            "pixel_size": self.default_pixel_size,
+        }.items():
+            value = camera_params.get(key, default) if camera_params else default
+            tensor = torch.as_tensor(value, device=device, dtype=dtype).reshape(-1)
+            if tensor.numel() == 1:
+                tensor = tensor.expand(batch)
+            if tensor.numel() != batch:
+                raise ValueError(f"camera parameter {key} must be scalar or length B")
+            camera[key] = tensor.view(batch, 1, 1, 1)
+        if camera_params and "aperture" in camera_params:
+            aperture = torch.as_tensor(camera_params["aperture"], device=device, dtype=dtype).reshape(-1)
+            if aperture.numel() == 1:
+                aperture = aperture.expand(batch)
+            camera["aperture"] = aperture.view(batch, 1, 1, 1)
+        else:
+            camera["aperture"] = camera["focal_length"] / camera["f_number"].clamp(min=self.eps)
         return camera
 
-    def _compute_sigma_map(
-        self,
-        depth: torch.Tensor,
-        focus_distance: torch.Tensor,
-        camera: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        focal_length = camera["focal_length"]
-        aperture = camera["aperture"]
-        pixel_size = camera["pixel_size"]
+    def _compute_sigma_map(self, depth: torch.Tensor, focus: torch.Tensor, camera: Dict[str, torch.Tensor]) -> torch.Tensor:
+        focal_length = camera["focal_length"][:, None]
+        aperture = camera["aperture"][:, None]
+        pixel_size = camera["pixel_size"][:, None]
+        focus = focus[:, :, None, None, None].clamp(min=self.eps)
+        depth_safe = torch.where(torch.isfinite(depth[:, None]) & (depth[:, None] > self.eps), depth[:, None], focus)
+        image_dist_focus = (focus * focal_length) / (focus - focal_length).clamp(min=self.eps)
+        coc = aperture * image_dist_focus.abs() * (
+            1.0 / focal_length.clamp(min=self.eps)
+            - 1.0 / image_dist_focus.clamp(min=self.eps)
+            - 1.0 / depth_safe.clamp(min=self.eps)
+        ).abs()
+        return (coc / (2.0 * pixel_size.clamp(min=self.eps))).squeeze(2).clamp(0.0, self.max_sigma)
 
-        depth_safe = torch.where(
-            torch.isfinite(depth) & (depth > self.eps), depth, focus_distance.clamp(min=self.eps)
-        )
+    def _blur(self, image: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma_t = sigma.to(device=image.device, dtype=image.dtype).clamp(min=self.min_sigma)
+        kernel = self._kernel(sigma_t, image.shape[1])
+        blurred = F.conv2d(image, kernel, padding=kernel.shape[-1] // 2, groups=image.shape[1])
+        identity_weight = (sigma <= self.min_sigma).to(device=image.device, dtype=image.dtype)
+        return identity_weight * image + (1.0 - identity_weight) * blurred
 
-        focus_distance = focus_distance.clamp(min=self.eps)
-        image_dist_focus = (focus_distance * focal_length) / (
-            focus_distance - focal_length + self.eps
-        )
+    def _kernel(self, sigma: torch.Tensor, channels: int) -> torch.Tensor:
+        radius = self.kernel_limit // 2
+        coords = torch.arange(-radius, radius + 1, device=sigma.device, dtype=sigma.dtype)
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        rr2 = xx.square() + yy.square()
+        if self.psf_type == "gaussian":
+            kernel = torch.exp(-rr2 / (2.0 * sigma.square().clamp(min=self.eps)))
+        else:
+            edge = torch.sigmoid((sigma.square() - rr2) / (sigma.clamp(min=self.eps)))
+            kernel = edge
+        kernel = kernel / kernel.sum().clamp(min=self.eps)
+        return kernel.view(1, 1, self.kernel_limit, self.kernel_limit).repeat(channels, 1, 1, 1)
 
-        coc = aperture * torch.abs(image_dist_focus) * torch.abs(
-            (1.0 / torch.clamp(focal_length, min=self.eps))
-            - (1.0 / torch.clamp(image_dist_focus, min=self.eps))
-            - (1.0 / depth_safe)
-        )
-
-        sigma = coc / (2.0 * torch.clamp(pixel_size, min=self.eps))
-        sigma = torch.clamp(sigma, min=0.0, max=self.max_sigma)
-        return sigma
-
-    def _apply_spatially_variant_blur(
-        self, image: torch.Tensor, sigma_map: torch.Tensor
-    ) -> torch.Tensor:
-        if sigma_map.dim() != 2:
-            raise ValueError("sigma_map must have shape [H, W]")
-
-        if image.device != sigma_map.device:
-            sigma_map = sigma_map.to(device=image.device)
-
-        quantised = torch.round(sigma_map / self.sigma_quantisation) * self.sigma_quantisation
-        quantised = torch.clamp(quantised, min=0.0, max=self.max_sigma)
-
-        result = image.clone()
-        unique_sigmas = torch.unique(quantised)
-
-        for sigma in unique_sigmas:
-            sigma_value = float(sigma.item())
-            if sigma_value <= self.min_sigma:
-                continue
-
-            kernel = self._gaussian_kernel(sigma_value, image.device, image.dtype)
-            padding = kernel.shape[-1] // 2
-            blurred = F.conv2d(
-                image.unsqueeze(0), kernel, padding=padding, groups=image.shape[0]
-            ).squeeze(0)
-
-            mask = (quantised == sigma).to(image.dtype)
-            if mask.sum() == 0:
-                continue
-            mask = mask.unsqueeze(0)
-            result = torch.where(mask > 0, blurred, result)
-
-        return result
-
-    @lru_cache(maxsize=128)
-    def _gaussian_kernel(
-        self, sigma: float, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
-        radius = min(int(math.ceil(3 * sigma)), self.kernel_limit // 2)
-        kernel_size = 2 * radius + 1
-        coords = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-        kernel_1d = torch.exp(-(coords**2) / (2 * sigma**2 + self.eps))
-        kernel_1d = kernel_1d / kernel_1d.sum()
-        kernel_2d = torch.outer(kernel_1d, kernel_1d)
-        kernel = kernel_2d.view(1, 1, kernel_size, kernel_size)
-        kernel = kernel / kernel.sum()
-        return kernel.repeat(3, 1, 1, 1)
 
 # Backward-compatible alias for external scripts using the pre-rename API.
 FocalStackSimulator = SyntheticFocalStackRenderer

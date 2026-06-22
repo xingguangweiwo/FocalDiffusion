@@ -18,6 +18,7 @@ from PIL import Image
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from .synthetic_focal_stack_renderer import SyntheticFocalStackRenderer
+from ..utils.image_utils import to_unit_range
 
 logger = logging.getLogger(__name__)
 
@@ -223,12 +224,13 @@ class FocalStackDataset(Dataset):
 
     def _parse_legacy_entry(self, line: str) -> Dict:
         tokens = [part.strip() for part in line.replace(",", " ").split() if part.strip()]
-        if len(tokens) < 2:
+        if len(tokens) < 1:
             raise ValueError(f"Invalid filelist entry: {line}")
 
         sample: Dict = {}
 
-        first_token, second_token = tokens[0], tokens[1]
+        first_token = tokens[0]
+        second_token = tokens[1] if len(tokens) > 1 and "=" not in tokens[1] else None
         first_ext = Path(first_token).suffix.lower()
 
         if first_ext in IMAGE_EXTENSIONS:
@@ -236,9 +238,11 @@ class FocalStackDataset(Dataset):
         else:
             sample["focal_stack_dir"] = first_token
 
-        sample["depth_path"] = second_token
+        if second_token is not None:
+            sample["depth_path"] = second_token
 
-        for extra in tokens[2:]:
+        extras = tokens[2:] if second_token is not None else tokens[1:]
+        for extra in extras:
             if "=" in extra:
                 key, value = extra.split("=", 1)
                 sample[key.strip()] = self._coerce_value(value.strip())
@@ -331,9 +335,8 @@ class FocalStackDataset(Dataset):
         sample: Dict = {}
 
         depth_key = entry.get("depth") or entry.get("depth_path")
-        if not depth_key:
-            raise ValueError("Each entry must provide a depth or depth_path field")
-        sample["depth_path"] = depth_key
+        if depth_key:
+            sample["depth_path"] = depth_key
 
         focal_key = entry.get("focal_stack") or entry.get("focal_stack_dir") or entry.get("scene_path")
         if focal_key:
@@ -389,10 +392,15 @@ class FocalStackDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample_info = self.samples[idx]
 
-        depth, depth_meta = self._load_depth(sample_info)
+        depth: torch.Tensor | None = None
+        depth_meta = self._empty_depth_meta()
+        if sample_info.get("depth_path"):
+            depth, depth_meta = self._load_depth(sample_info)
         use_generated = self._should_generate_stack(sample_info)
 
         if use_generated:
+            if depth is None:
+                raise ValueError("Generating a focal stack from all_in_focus requires depth supervision.")
             focal_plane_distances = self._get_focal_plane_distances(sample_info, self.focal_stack_size)
             all_in_focus = self._load_all_in_focus(sample_info)
             focal_stack = self.simulator.generate(
@@ -404,7 +412,7 @@ class FocalStackDataset(Dataset):
         else:
             focal_stack = self._load_focal_stack(sample_info)
             focal_plane_distances = self._get_focal_plane_distances(sample_info, focal_stack.shape[0])
-            all_in_focus = self._load_all_in_focus(sample_info, fallback=focal_stack)
+            all_in_focus = self._load_all_in_focus(sample_info, fallback=focal_stack if sample_info.get("all_in_focus") else None)
 
         if focal_stack.shape[0] != focal_plane_distances.numel():
             focal_plane_distances = self._align_focal_plane_distances(focal_plane_distances, focal_stack.shape[0])
@@ -413,18 +421,20 @@ class FocalStackDataset(Dataset):
 
         sample = {
             "focal_stack": focal_stack,
-            "depth": depth,
-            "all_in_focus": all_in_focus,
             "focal_plane_distances": focal_plane_distances,
             "camera_params": camera_params,
             "sample_path": sample_info.get("focal_stack_dir") or sample_info.get("depth_path", ""),
-            "depth_range": torch.tensor(
-                [depth_meta["min"], depth_meta["max"]], dtype=torch.float32
-            ),
-            "valid_mask": depth_meta["mask"],
         }
+        if depth is not None:
+            sample["depth"] = depth
+            sample["depth_range"] = torch.tensor([depth_meta["min"], depth_meta["max"]], dtype=torch.float32)
+            sample["valid_mask"] = depth_meta["mask"]
+        if all_in_focus is not None:
+            sample["all_in_focus"] = all_in_focus
 
         if self.transform:
+            if "depth" not in sample or "all_in_focus" not in sample:
+                raise ValueError("Augmentation requires both depth and all_in_focus labels.")
             sample["focal_stack"], sample["depth"], sample["all_in_focus"] = self.transform(
                 sample["focal_stack"], sample["depth"], sample["all_in_focus"]
             )
@@ -449,16 +459,14 @@ class FocalStackDataset(Dataset):
             return self._load_image(self._resolve_path(path, kind="all_in_focus"))
         if fallback is not None:
             return self._generate_all_in_focus(fallback)
-        raise ValueError(
-            "Sample requires all_in_focus image or pre-rendered focal stack"
-        )
+        return None
 
     def _load_image(self, path: Path) -> torch.Tensor:
         with Image.open(path) as img:
             img = img.convert("RGB")
             img, _ = self._resize_with_mode(img, interpolation=Image.Resampling.LANCZOS)
             array = np.array(img, dtype=np.float32) / 255.0
-        return torch.from_numpy(array).permute(2, 0, 1)
+        return to_unit_range(torch.from_numpy(array).permute(2, 0, 1))
 
     def _resize_with_mode(
         self,
@@ -569,6 +577,10 @@ class FocalStackDataset(Dataset):
         params["depth_min"] = torch.tensor(depth_meta["min"], dtype=dtype)
         params["depth_max"] = torch.tensor(depth_meta["max"], dtype=dtype)
         return params
+
+    def _empty_depth_meta(self) -> Dict[str, torch.Tensor | float]:
+        target_w, target_h = self.image_size
+        return {"min": 0.0, "max": 1.0, "mask": torch.zeros((target_h, target_w), dtype=torch.bool)}
 
     def _load_depth(self, sample_info: Dict) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         depth_path = self._resolve_path(sample_info["depth_path"], kind="depth")
@@ -1034,4 +1046,24 @@ def create_dataloader(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=shuffle,
+        collate_fn=_collate_optional,
     )
+
+
+def _collate_optional(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    keys = sorted({key for item in batch for key in item})
+    collated: Dict[str, Any] = {}
+    for key in keys:
+        values = [item.get(key) for item in batch]
+        if any(value is None for value in values):
+            if all(value is None for value in values):
+                continue
+            raise ValueError(f"Cannot collate mixed labeled/unlabeled values for key {key!r} in one batch.")
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            collated[key] = torch.stack(values)
+        elif isinstance(first, Mapping):
+            collated[key] = _collate_optional(values)
+        else:
+            collated[key] = values
+    return collated
