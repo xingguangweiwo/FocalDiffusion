@@ -4,7 +4,7 @@ Optimizer and scheduler utilities
 
 import torch
 from torch.optim import Optimizer
-from typing import Any, Dict, Tuple
+from typing import Tuple
 
 
 def get_optimizer(
@@ -44,22 +44,3 @@ def get_optimizer(
         raise ValueError(f"Unknown optimizer type: {optimizer_type}")
 
     return optimizer
-
-
-def get_scheduler(
-        optimizer: Optimizer,
-        scheduler_type: str = "cosine",
-        num_training_steps: int = 1000,
-        num_warmup_steps: int = 100,
-        **kwargs
-) -> Any:
-    """Get learning rate scheduler"""
-    from diffusers.optimization import get_scheduler as get_diffusers_scheduler
-
-    return get_diffusers_scheduler(
-        scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
-        **kwargs
-    )

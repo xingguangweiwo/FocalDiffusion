@@ -1,4 +1,4 @@
-"""Typed containers for physical verification trace outputs."""
+"""Typed containers for focal-stack consistency diagnostic outputs."""
 
 from __future__ import annotations
 
@@ -7,12 +7,13 @@ import torch
 
 
 @dataclass
-class PhysicalVerificationTrace:
-    """Batch-first, per-pixel physical evidence summary for FocalTrace.
+class FocalConsistencyTrace:
+    """Focus and image-formation consistency diagnostics for a focal stack.
 
-    All score fields are tensors shaped ``[B, 1, H, W]`` except
+    These scores are self-consistency diagnostics, not ground-truth correctness
+    labels. All score fields are tensors shaped ``[B, 1, H, W]`` except
     ``verdict_scores``, which is shaped ``[B, 3, H, W]`` for conservative
-    ``support``, ``conflict``, and ``invalid`` verifier scores.
+    ``support``, ``conflict``, and ``invalid`` consistency scores.
     """
 
     focus_peak_confidence: torch.Tensor
@@ -29,3 +30,7 @@ class PhysicalVerificationTrace:
     conflict_score: torch.Tensor
     invalid_score: torch.Tensor
     verdict_scores: torch.Tensor
+
+
+# Backward-compatible alias for checkpoints and public imports.
+PhysicalVerificationTrace = FocalConsistencyTrace

@@ -27,7 +27,8 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
 from ..models.focal_evidence_encoder import build_physical_evidence_features
-from ..models.physics_modules import FocalPhysicalVerifier, _split_unit_and_signed_ranges
+from ..models.physics_modules import FocalPhysicalVerifier
+from ..utils.image_utils import resize_probability_volume, to_model_range, to_unit_range
 
 
 logger = logging.getLogger(__name__)
@@ -40,22 +41,25 @@ class FocalStackGenerationTrainer:
         self.config = config
         self.setup_logging()
         self.setup_accelerator()
-        self.self_improvement_cfg = self.config.get('training', {}).get('self_improvement', {}) or {}
+        self.adaptation_cfg = self.config.get('training', {}).get('unsupervised_adaptation', {}) or {}
+        self.adaptation_enabled = bool(self.adaptation_cfg.get('enabled', False))
         self.setup_model()
         self.setup_data()
         self.setup_optimization()
         self.setup_tracking()
 
-        self.trace_mining_buffer = TraceMiningBuffer(
-            max_items=int(self.self_improvement_cfg.get('max_buffer_items', 128)),
-            round_id=str(self.self_improvement_cfg.get('round_id', 'M0')),
-            round_index=int(self.self_improvement_cfg.get('round_index', 0)),
-            manifest_path=self.self_improvement_cfg.get('mining_manifest'),
-        )
+        self.trace_mining_buffer: TraceMiningBuffer | None = None
         self.parent_checkpoint_sha256: str | None = None
-        self.mining_verifier_config_hash = self._verifier_config_hash(self.pipeline.physical_verifier)
-        if bool(self.self_improvement_cfg.get('enabled', False)):
-            self._validate_self_improvement_round()
+        self.mining_verifier_config_hash: str | None = None
+        if self.adaptation_enabled:
+            self.trace_mining_buffer = TraceMiningBuffer(
+                max_items=int(self.adaptation_cfg.get('max_buffer_items', 128)),
+                round_id=str(self.adaptation_cfg.get('round_id', 'adaptation')),
+                round_index=int(self.adaptation_cfg.get('round_index', 0)),
+                manifest_path=self.adaptation_cfg.get('mining_manifest'),
+            )
+            self.mining_verifier_config_hash = self._verifier_config_hash(self.pipeline.physical_verifier)
+            self._validate_adaptation_round()
             self._freeze_physical_verifier()
 
         self.current_epoch = 0
@@ -120,7 +124,7 @@ class FocalStackGenerationTrainer:
 
         dataset_type = dataset_cfg.get('dataset_type')
         train_sources = dataset_cfg.get('train_sources')
-        self_improvement_sources = dataset_cfg.get('self_improvement_sources')
+        adaptation_sources = dataset_cfg.get('adaptation_sources')
         val_sources = dataset_cfg.get('val_sources')
         train_filelist = dataset_cfg.get('train_filelist')
         val_filelist = dataset_cfg.get('val_filelist')
@@ -157,14 +161,14 @@ class FocalStackGenerationTrainer:
             sources=val_sources,
             **val_dataset_kwargs,
         )
-        self.self_improvement_dataloader = None
-        if self_improvement_sources:
-            self._ensure_self_improvement_is_not_test(dataset_cfg)
-            self.self_improvement_dataloader = create_dataloader(
+        self.adaptation_dataloader = None
+        if self.adaptation_enabled and adaptation_sources:
+            self._ensure_adaptation_is_not_test(dataset_cfg)
+            self.adaptation_dataloader = create_dataloader(
                 dataset_type=dataset_type,
                 filelist_path=None,
                 data_root=dataset_cfg.get('data_root', "./data"),
-                batch_size=int(self.self_improvement_cfg.get('replay_batch_size', self.config['training']['batch_size'])),
+                batch_size=int(self.adaptation_cfg.get('replay_batch_size', self.config['training']['batch_size'])),
                 num_workers=dataset_cfg['num_workers'],
                 image_size=tuple(dataset_cfg['image_size']),
                 focal_stack_size=dataset_cfg['focal_stack_size'],
@@ -172,26 +176,26 @@ class FocalStackGenerationTrainer:
                 resize_mode=dataset_cfg.get('resize_mode', 'letterbox'),
                 augmentation=False,
                 shuffle=True,
-                max_samples=dataset_cfg.get('max_self_improvement_samples'),
-                sources=self_improvement_sources,
+                max_samples=dataset_cfg.get('max_unsupervised_adaptation_samples'),
+                sources=adaptation_sources,
                 **base_dataset_kwargs,
             )
         logger.info(f"Train samples: {len(self.train_dataloader.dataset)}")
         logger.info(f"Val samples: {len(self.val_dataloader.dataset)}")
-        if self.self_improvement_dataloader is not None:
-            logger.info("Self-improvement adaptation samples: %s", len(self.self_improvement_dataloader.dataset))
+        if self.adaptation_dataloader is not None:
+            logger.info("Unsupervised adaptation samples: %s", len(self.adaptation_dataloader.dataset))
 
     @staticmethod
     def _source_filelists(sources: Iterable[dict[str, Any]] | None) -> set[str]:
         return {str(source.get("filelist")) for source in (sources or []) if source.get("filelist")}
 
-    def _ensure_self_improvement_is_not_test(self, dataset_cfg: dict[str, Any]) -> None:
-        adapt_filelists = self._source_filelists(dataset_cfg.get("self_improvement_sources"))
+    def _ensure_adaptation_is_not_test(self, dataset_cfg: dict[str, Any]) -> None:
+        adapt_filelists = self._source_filelists(dataset_cfg.get("adaptation_sources"))
         test_filelists = self._source_filelists(dataset_cfg.get("test_sources"))
         overlap = adapt_filelists & test_filelists
         if overlap:
             raise ValueError(
-                "data.self_improvement_sources must not overlap data.test_sources; "
+                "data.adaptation_sources must not overlap data.test_sources; "
                 f"overlapping filelists: {sorted(overlap)}"
             )
 
@@ -206,26 +210,28 @@ class FocalStackGenerationTrainer:
         encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    def _validate_self_improvement_round(self) -> None:
-        """Enforce M0→M1+ self-improvement round provenance before training."""
-        round_index = int(self.self_improvement_cfg.get("round_index", 0))
+    def _validate_adaptation_round(self) -> None:
+        """Enforce unsupervised adaptation round provenance before training."""
+        round_index = int(self.adaptation_cfg.get("round_index", 0))
         if round_index < 1:
-            raise ValueError("training.self_improvement.enabled=true requires round_index >= 1; train M0 with enabled=false.")
-        parent_checkpoint = self.self_improvement_cfg.get("parent_checkpoint")
+            raise ValueError("training.unsupervised_adaptation.enabled=true requires round_index >= 1; source training uses enabled=false.")
+        parent_checkpoint = self.adaptation_cfg.get("parent_checkpoint")
         if not parent_checkpoint:
-            raise ValueError("training.self_improvement.enabled=true requires parent_checkpoint.")
+            raise ValueError("training.unsupervised_adaptation.enabled=true requires parent_checkpoint.")
         parent_path = Path(parent_checkpoint)
         if not parent_path.exists():
-            raise FileNotFoundError(f"training.self_improvement.parent_checkpoint does not exist: {parent_path}")
+            raise FileNotFoundError(f"training.unsupervised_adaptation.parent_checkpoint does not exist: {parent_path}")
         self.parent_checkpoint_sha256 = checkpoint_sha256(parent_path)
+        if self.trace_mining_buffer is None:
+            raise ValueError("training.unsupervised_adaptation.enabled=true requires TraceMiningBuffer initialization.")
         manifest_path = self.trace_mining_buffer.manifest_path
         if manifest_path is None:
-            raise ValueError("training.self_improvement.enabled=true requires mining_manifest for checkpoint/verifier provenance.")
+            raise ValueError("training.unsupervised_adaptation.enabled=true requires mining_manifest for checkpoint/verifier provenance.")
         if manifest_path and self.trace_mining_buffer.metadata:
             manifest_parent = self.trace_mining_buffer.metadata.get("parent_checkpoint_sha256")
             manifest_verifier = self.trace_mining_buffer.metadata.get("verifier_config_hash")
             if manifest_parent != self.parent_checkpoint_sha256:
-                raise ValueError("mining manifest parent checkpoint SHA256 does not match training.self_improvement.parent_checkpoint")
+                raise ValueError("mining manifest parent checkpoint SHA256 does not match training.unsupervised_adaptation.parent_checkpoint")
             if manifest_verifier != self.mining_verifier_config_hash:
                 raise ValueError("mining manifest verifier config hash does not match current mining verifier")
         elif manifest_path and manifest_path.exists():
@@ -553,19 +559,19 @@ class FocalStackGenerationTrainer:
             supervision_mode=supervision_mode,
         )
         loss_fn = loss_fn.to(self.accelerator.device)
-        self_improvement_enabled = bool(self.self_improvement_cfg.get('enabled', False))
-        mining_conflict_threshold = float(self.self_improvement_cfg.get('conflict_threshold', 0.5))
-        mining_confidence_threshold = float(self.self_improvement_cfg.get('confidence_threshold', 0.8))
+        adaptation_enabled = self.adaptation_enabled
+        mining_conflict_threshold = float(self.adaptation_cfg.get('conflict_threshold', 0.5))
+        mining_confidence_threshold = float(self.adaptation_cfg.get('confidence_threshold', 0.8))
         trace_replay_weight = float(self.config['losses'].get('lambda_violation', 0.02))
-        if self_improvement_enabled and len(self.trace_mining_buffer) == 0:
-            self._mine_self_improvement_manifest(
-                max_batches=int(self.self_improvement_cfg.get("max_mining_batches", 8)),
+        if adaptation_enabled and self.trace_mining_buffer is not None and len(self.trace_mining_buffer) == 0:
+            self._mine_unsupervised_adaptation_manifest(
+                max_batches=int(self.adaptation_cfg.get("max_mining_batches", 8)),
                 conflict_threshold=mining_conflict_threshold,
                 confidence_threshold=mining_confidence_threshold,
             )
 
         prompt_embeds, pooled_prompt_embeds = self._get_empty_prompt_embeddings()
-        replay_iterator = iter(self.self_improvement_dataloader) if (self_improvement_enabled and self.self_improvement_dataloader is not None) else None
+        replay_iterator = iter(self.adaptation_dataloader) if (adaptation_enabled and self.adaptation_dataloader is not None) else None
         replay_batch_count = 0
         replay_loss_running = 0.0
         source_loss_running = 0.0
@@ -616,10 +622,10 @@ class FocalStackGenerationTrainer:
                     }
 
                 # Normalize inputs without clamping before range detection.
-                focal_stack_unit, focal_stack = _split_unit_and_signed_ranges(focal_stack.float())
+                focal_stack_unit, focal_stack = (to_unit_range(focal_stack.float()), to_model_range(focal_stack.float()))
                 rgb_target = None
                 if rgb_gt is not None:
-                    _, rgb_target = _split_unit_and_signed_ranges(rgb_gt.float())
+                    _, rgb_target = (to_unit_range(rgb_gt.float()), to_model_range(rgb_gt.float()))
 
                 # Extract focal features for SD3 conditioning.
                 focal_features = self.focal_processor(focal_stack, focal_plane_distances)
@@ -674,13 +680,7 @@ class FocalStackGenerationTrainer:
                     focal_evidence = self.focal_evidence_head(focal_stack.float(), focal_plane_distances.float())
                     focal_depth_canonical = F.interpolate(focal_evidence["focal_depth_canonical"], size=generated_depth_canonical.shape[-2:], mode="bilinear", align_corners=False)
                     focal_entropy = F.interpolate(focal_evidence["focal_entropy"], size=generated_depth_canonical.shape[-2:], mode="bilinear", align_corners=False)
-                    focal_posterior = F.interpolate(
-                        focal_evidence["focal_posterior"],
-                        size=generated_depth_canonical.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    focal_posterior = focal_posterior / focal_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                    focal_posterior = resize_probability_volume(focal_evidence["focal_posterior"], generated_depth_canonical.shape[-2:])
                     generative_uncertainty = uncertainty
                     support_inputs, support_maps = build_physical_evidence_features(
                         focal_posterior=focal_posterior,
@@ -709,12 +709,10 @@ class FocalStackGenerationTrainer:
                     rgb_recon = rgb_recon.clamp(-1, 1)
                     # Cast tensors for stable loss computation
                     diffusion_pred = diffusion_pred.float()
-                    diffusion_target = flow_target.float()
-                    depth_target = depth_gt.float() if depth_gt is not None else None
                     rgb_recon = rgb_recon.float()
                     rgb_target_fp32 = rgb_target.float()
                     focal_stack_for_trace = focal_stack_unit.float()
-                    rgb_recon_for_trace, _ = _split_unit_and_signed_ranges(rgb_recon.float())
+                    rgb_recon_for_trace, _ = (to_unit_range(rgb_recon.float()), to_model_range(rgb_recon.float()))
                     with torch.no_grad():
                         physical_verification_trace = self.pipeline.physical_verifier(
                             focal_stack=focal_stack_for_trace,
@@ -755,21 +753,21 @@ class FocalStackGenerationTrainer:
                         "accepted_conflict_count": 0,
                         "accepted_invalid_count": 0,
                         "accepted_reliable_count": 0,
-                        "buffer_size": len(self.trace_mining_buffer),
+                        "buffer_size": len(self.trace_mining_buffer) if self.trace_mining_buffer is not None else 0,
                         "mined_conflict_mean": 0.0,
                         "mined_invalid_mean": 0.0,
                     }
-                    if self_improvement_enabled:
+                    if adaptation_enabled:
                         replay_loss = None
                         if replay_iterator is not None:
                             try:
                                 replay_batch = next(replay_iterator)
                             except StopIteration:
-                                replay_iterator = iter(self.self_improvement_dataloader)
+                                replay_iterator = iter(self.adaptation_dataloader)
                                 replay_batch = next(replay_iterator)
                             replay_loss = self._compute_adaptation_replay_loss(
                                 replay_batch,
-                                max_items=int(self.self_improvement_cfg.get("max_replay_items_per_batch", 4)),
+                                max_items=int(self.adaptation_cfg.get("max_replay_items_per_batch", 4)),
                             )
                         if replay_loss is not None:
                             replay_loss = trace_replay_weight * replay_loss
@@ -834,7 +832,7 @@ class FocalStackGenerationTrainer:
         device = self.accelerator.device
         focal_stack = batch["focal_stack"].to(device)
         focal_plane_distances = batch["focal_plane_distances"].to(device)
-        focal_stack_unit, focal_stack_signed = _split_unit_and_signed_ranges(focal_stack.float())
+        focal_stack_unit, focal_stack_signed = (to_unit_range(focal_stack.float()), to_model_range(focal_stack.float()))
         prompt_embeds, pooled_prompt_embeds = self._get_empty_prompt_embeddings()
         batch_size = focal_stack.shape[0]
         height, width = focal_stack.shape[-2:]
@@ -851,9 +849,9 @@ class FocalStackGenerationTrainer:
             focal_evidence = self.focal_evidence_head(focal_stack_signed.float(), focal_plane_distances.float())
             latent_channels = int(getattr(self.pipeline.transformer.config, "in_channels", self.pipeline.vae.config.latent_channels))
             generator = torch.Generator(device=device)
-            generator.manual_seed(int(self.self_improvement_cfg.get("replay_noise_seed", 0)))
+            generator.manual_seed(int(self.adaptation_cfg.get("replay_noise_seed", 0)))
             latents = torch.randn((batch_size, latent_channels, latent_h, latent_w), device=device, dtype=dtype, generator=generator)
-            self.pipeline.scheduler.set_timesteps(max(1, int(self.self_improvement_cfg.get("adapt_inference_steps", 1))), device=device)
+            self.pipeline.scheduler.set_timesteps(max(1, int(self.adaptation_cfg.get("adapt_inference_steps", 1))), device=device)
             timestep = self.pipeline.scheduler.timesteps[0]
             model_input = self.pipeline.scheduler.scale_model_input(latents, timestep) if hasattr(self.pipeline.scheduler, "scale_model_input") else latents
             batch_prompt_embeds, batch_pooled_prompt_embeds = self._repeat_prompt_embeddings(prompt_embeds, pooled_prompt_embeds, batch_size=batch_size)
@@ -865,13 +863,18 @@ class FocalStackGenerationTrainer:
                 focal_features=focal_features,
                 return_dict=False,
             )[0]
-            decoder_outputs = self.task_output_decoder(diffusion_pred.to(dtype=next(self.task_output_decoder.parameters()).dtype))
+            sigmas = torch.as_tensor(self.pipeline.scheduler.sigmas, device=device, dtype=latents.dtype)[:1].expand(batch_size)
+            clean_latent_pred = predict_clean_latents_from_flow(
+                noisy_latents=latents,
+                model_pred=diffusion_pred,
+                sigmas=sigmas,
+            )
+            decoder_outputs = self.task_output_decoder(clean_latent_pred.to(dtype=next(self.task_output_decoder.parameters()).dtype))
             generated_depth_canonical = F.interpolate(decoder_outputs["generated_depth_canonical"].float(), size=(height, width), mode="bilinear", align_corners=False)
             generative_uncertainty = F.interpolate(decoder_outputs["uncertainty"].float(), size=(height, width), mode="bilinear", align_corners=False)
             focal_depth_canonical = F.interpolate(focal_evidence["focal_depth_canonical"].float(), size=(height, width), mode="bilinear", align_corners=False)
             focal_entropy = F.interpolate(focal_evidence["focal_entropy"].float(), size=(height, width), mode="bilinear", align_corners=False)
-            focal_posterior = F.interpolate(focal_evidence["focal_posterior"].float(), size=(height, width), mode="bilinear", align_corners=False)
-            focal_posterior = focal_posterior / focal_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            focal_posterior = resize_probability_volume(focal_evidence["focal_posterior"].float(), (height, width))
             support_inputs, _ = build_physical_evidence_features(
                 focal_posterior=focal_posterior,
                 focal_entropy=focal_entropy,
@@ -890,7 +893,7 @@ class FocalStackGenerationTrainer:
             uncertainty_final = torch.maximum(support_outputs["uncertainty_final"], abstention).clamp(0.0, 1.0)
             rgb_latents = decoder_outputs["all_in_focus_latents"]
             rgb_recon = self.pipeline.vae.decode(rgb_latents / self.pipeline.vae.config.scaling_factor, return_dict=False)[0].float().clamp(-1, 1)
-            rgb_recon_unit, _ = _split_unit_and_signed_ranges(rgb_recon)
+            rgb_recon_unit, _ = (to_unit_range(rgb_recon), to_model_range(rgb_recon))
             trace = self.pipeline.physical_verifier(
                 focal_stack=focal_stack_unit,
                 focal_plane_distances=focal_plane_distances.float(),
@@ -909,9 +912,11 @@ class FocalStackGenerationTrainer:
             "abstention": abstention,
             "physical_evidence_support": support_outputs["physical_evidence_support"],
             "focal_plane_distances": focal_plane_distances,
+            "focal_stack_unit": focal_stack_unit,
+            "all_in_focus_unit": rgb_recon_unit,
         }
 
-    def _mine_self_improvement_manifest(
+    def _mine_unsupervised_adaptation_manifest(
         self,
         *,
         max_batches: int,
@@ -920,21 +925,20 @@ class FocalStackGenerationTrainer:
     ) -> dict[str, float]:
         """Mine verifier targets from U_adapt with a frozen verifier.
 
-        This is the M0 mining pass. It reads only
-        ``data.self_improvement_sources`` and stores a lightweight manifest
+        This is the source-model mining pass. It reads only
+        ``data.adaptation_sources`` and stores a lightweight manifest
         for replay; no detached prediction tensors are saved.
         """
-        if self.self_improvement_dataloader is None:
-            raise ValueError("self-improvement is enabled but data.self_improvement_sources is not configured")
+        if self.adaptation_dataloader is None:
+            raise ValueError("unsupervised adaptation is enabled but data.adaptation_sources is not configured")
         self._freeze_physical_verifier()
         stats = {
             "mined_sample_count": 0.0,
             "accepted_conflict_count": 0.0,
             "accepted_invalid_count": 0.0,
             "accepted_reliable_count": 0.0,
-            "buffer_size": float(len(self.trace_mining_buffer)),
+            "buffer_size": float(len(self.trace_mining_buffer)) if self.trace_mining_buffer is not None else 0.0,
         }
-        device = self.accelerator.device
         was_training = {
             "focal_evidence_head": self.focal_evidence_head.training,
             "physical_evidence_support_head": self.physical_evidence_support_head.training,
@@ -942,13 +946,41 @@ class FocalStackGenerationTrainer:
         self.focal_evidence_head.eval()
         self.physical_evidence_support_head.eval()
         with torch.no_grad():
-            for batch_index, batch in enumerate(self.self_improvement_dataloader):
+            for batch_index, batch in enumerate(self.adaptation_dataloader):
                 if batch_index >= max_batches:
                     break
                 outputs = self._forward_adaptation_generation(batch, requires_grad=False)
+                split_seed = int(self.adaptation_cfg.get("focal_split_seed", 0)) + batch_index
+                train_idx, val_idx = self.pipeline._split_refinement_planes(outputs["focal_stack_unit"].shape[1], outputs["focal_stack_unit"].device, split_seed)
+                before_risk = self.pipeline._heldout_measurement_loss(
+                    outputs["focal_stack_unit"],
+                    outputs["all_in_focus_unit"],
+                    outputs["final_depth_canonical"],
+                    outputs["focal_plane_distances"],
+                    val_idx,
+                )
+                cand_depth, cand_uncertainty, cand_aif = self.pipeline._selective_test_time_refinement(
+                    focal_stack_unit=outputs["focal_stack_unit"],
+                    focal_plane_distances=outputs["focal_plane_distances"],
+                    final_depth_canonical=outputs["final_depth_canonical"],
+                    focus_depth_canonical=outputs["focal_depth_canonical"],
+                    prior_depth_canonical=outputs["generated_depth_canonical"],
+                    all_in_focus_unit=outputs["all_in_focus_unit"],
+                    uncertainty_final=outputs["uncertainty_final"],
+                    trace=outputs["trace"],
+                    seed=split_seed,
+                    inner_steps=int(self.adaptation_cfg.get("mining_refinement_steps", 2)),
+                )
+                after_risk = self.pipeline._heldout_measurement_loss(
+                    outputs["focal_stack_unit"], cand_aif, cand_depth, outputs["focal_plane_distances"], val_idx
+                )
+                accepted = self.pipeline._should_accept_refinement(before_risk, after_risk, float(self.adaptation_cfg.get("heldout_acceptance_epsilon", 1e-4)))
+                stable_focus = float(outputs["trace"].texture_confidence.detach().mean().item()) >= float(self.adaptation_cfg.get("min_focus_evidence", 0.05))
+                if self.trace_mining_buffer is None:
+                    raise RuntimeError("TraceMiningBuffer is not initialized for unsupervised adaptation.")
                 mined = self.trace_mining_buffer.mine(
                     trace=outputs["trace"],
-                    uncertainty=outputs["uncertainty_final"],
+                    uncertainty=cand_uncertainty,
                     sample_ids=batch.get("sample_path"),
                     batch_index=batch_index,
                     focal_plane_coordinates=outputs["focal_plane_distances"].float().detach().cpu(),
@@ -956,24 +988,29 @@ class FocalStackGenerationTrainer:
                     confidence_threshold=confidence_threshold,
                     generated_depth=outputs["generated_depth_canonical"],
                     focal_depth=outputs["focal_depth_canonical"],
-                    final_depth=outputs["final_depth_canonical"],
+                    final_depth=cand_depth if accepted and stable_focus else None,
                     focal_gate=outputs["focal_gate"],
                     generative_gate=outputs["generative_gate"],
                     abstention=outputs["abstention"],
+                    accepted_refinement=bool(accepted and stable_focus),
+                    focal_split_seed=split_seed,
+                    heldout_risk_before=float(before_risk.detach().item()),
+                    heldout_risk_after=float(after_risk.detach().item()),
+                    dataset_split="adaptation",
                 )
                 for key in ("mined_sample_count", "accepted_conflict_count", "accepted_invalid_count", "accepted_reliable_count"):
                     stats[key] += float(mined.get(key, 0.0))
-                stats["buffer_size"] = float(len(self.trace_mining_buffer))
+                stats["buffer_size"] = float(len(self.trace_mining_buffer)) if self.trace_mining_buffer is not None else 0.0
         if was_training["focal_evidence_head"]:
             self.focal_evidence_head.train()
         if was_training["physical_evidence_support_head"]:
             self.physical_evidence_support_head.train()
-        logger.info("Mined self-improvement manifest: %s", stats)
+        logger.info("Mined unsupervised adaptation manifest: %s", stats)
         return stats
 
     def _compute_adaptation_replay_loss(self, batch: dict[str, Any], max_items: int) -> torch.Tensor | None:
-        """Re-read a U_adapt batch and update full M1 generation outputs from replay targets."""
-        if not self.trace_mining_buffer.items:
+        """Re-read an adaptation batch and update full adapted-model outputs from replay targets."""
+        if self.trace_mining_buffer is None or not self.trace_mining_buffer.items:
             return None
         outputs = self._forward_adaptation_generation(batch, requires_grad=True)
         trace = outputs["trace"]
@@ -1057,13 +1094,13 @@ class TraceMiningBuffer:
     The manifest stores source identity, crop geometry, focal-plane coordinates
     and scalar supervision targets. It intentionally does not store detached
     model predictions; replay must re-read the source focal stack and run the
-    current model forward so gradients update M1 parameters.
+    current model forward so gradients update adapted-model parameters.
     """
 
     def __init__(
         self,
         max_items: int = 128,
-        round_id: str = "M0",
+        round_id: str = "adaptation",
         patch_size: int = 16,
         round_index: int = 0,
         manifest_path: str | os.PathLike[str] | None = None,
@@ -1147,6 +1184,11 @@ class TraceMiningBuffer:
         focal_plane_coordinates: torch.Tensor | None,
         conflict_threshold: float,
         confidence_threshold: float,
+        accepted_refinement: bool,
+        focal_split_seed: int | None,
+        heldout_risk_before: float | None,
+        heldout_risk_after: float | None,
+        dataset_split: str,
     ) -> dict[str, Any] | None:
         eligible = (score_map >= conflict_threshold) & (confidence >= confidence_threshold)
         if not bool(eligible.any()):
@@ -1171,7 +1213,12 @@ class TraceMiningBuffer:
             "sample_id": sample_id,
             "sample_path": sample_id,
             "batch_index": int(batch_index),
+            "dataset_split": dataset_split,
             "verdict_type": verdict_type,
+            "accepted_refinement": bool(accepted_refinement),
+            "focal_split_seed": None if focal_split_seed is None else int(focal_split_seed),
+            "heldout_risk_before": heldout_risk_before,
+            "heldout_risk_after": heldout_risk_after,
             "crop": {"y0": int(y0), "y1": int(y1), "x0": int(x0), "x1": int(x1)},
             "source_shape": {"height": int(height), "width": int(width)},
             "focal_plane_coordinates": focal_plane_coordinates_list,
@@ -1220,7 +1267,23 @@ class TraceMiningBuffer:
         focal_gate: torch.Tensor | None = None,
         generative_gate: torch.Tensor | None = None,
         abstention: torch.Tensor | None = None,
+        accepted_refinement: bool = False,
+        focal_split_seed: int | None = None,
+        heldout_risk_before: float | None = None,
+        heldout_risk_after: float | None = None,
+        dataset_split: str = "adaptation",
     ) -> dict[str, float]:
+        if not accepted_refinement:
+            return {
+                "mined_trace_items": 0,
+                "mined_sample_count": 0,
+                "accepted_conflict_count": 0,
+                "accepted_invalid_count": 0,
+                "accepted_reliable_count": 0,
+                "buffer_size": len(self),
+                "mined_conflict_mean": 0.0,
+                "mined_invalid_mean": 0.0,
+            }
         conflict = self._as_bchw(getattr(trace, "conflict_score")).detach().float().clamp(0.0, 1.0)
         invalid = self._as_bchw(getattr(trace, "invalid_score")).detach().float().clamp(0.0, 1.0)
         discrepancy = self._as_bchw(getattr(trace, "depth_focus_discrepancy")).detach().float().clamp(0.0, 1.0)
@@ -1286,6 +1349,11 @@ class TraceMiningBuffer:
                     focal_plane_coordinates=focal_coords_one,
                     conflict_threshold=threshold,
                     confidence_threshold=confidence_threshold,
+                    accepted_refinement=accepted_refinement,
+                    focal_split_seed=focal_split_seed,
+                    heldout_risk_before=heldout_risk_before,
+                    heldout_risk_after=heldout_risk_after,
+                    dataset_split=dataset_split,
                 )
                 if item is not None:
                     mined.append(item)
@@ -1436,18 +1504,10 @@ class TraceMiningBuffer:
                 continue
 
             if is_conflict:
-                if final_depth_prediction is not None and "focal_depth_target" in item:
-                    final_patch = final_depth_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
-                    losses.append(F.smooth_l1_loss(final_patch, torch.full_like(final_patch, float(item["focal_depth_target"]))))
-                if generated_depth_prediction is not None and "focal_depth_target" in item:
-                    generated_patch = generated_depth_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
-                    losses.append(0.5 * F.smooth_l1_loss(generated_patch, torch.full_like(generated_patch, float(item["focal_depth_target"]))))
-                if generative_gate_prediction is not None:
-                    gate_patch = generative_gate_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
-                    losses.append(F.binary_cross_entropy(gate_patch, torch.zeros_like(gate_patch)))
-                if focal_gate_prediction is not None:
-                    gate_patch = focal_gate_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
-                    losses.append(F.binary_cross_entropy(gate_patch, torch.ones_like(gate_patch)))
+                # Conflict-only pseudo labels supervise reliability/abstention, not a depth correction.
+                if abstention_prediction is not None:
+                    abstention_patch = abstention_prediction[batch_index : batch_index + 1, :, py0:py1, px0:px1]
+                    losses.append(F.binary_cross_entropy(abstention_patch, torch.ones_like(abstention_patch) * max(0.5, invalid_target_value)))
 
             if is_reliable:
                 if final_depth_prediction is not None and "final_depth_target" in item:

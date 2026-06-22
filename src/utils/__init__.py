@@ -6,9 +6,9 @@ from .image_utils import (
     save_all_in_focus,
     colorize_depth,
     create_visualization,
+    visualize_results,
 )
 from .metrics import compute_metrics
-from .visualization import visualize_results
 from .env_utils import ensure_sentencepiece_installed
 
 

@@ -11,7 +11,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, StableDiffusion3Pipeline
 
 try:
@@ -44,6 +43,7 @@ from ..models.focal_attention import FocalCrossAttention
 from ..models.task_output_decoder import TaskOutputDecoder
 from ..models.focal_processor import FocalStackProcessor
 from ..models.physics_modules import FocalPhysicalVerifier
+from ..utils.image_utils import resize_probability_volume, to_model_range, to_unit_range
 from ..models.verification_trace import PhysicalVerificationTrace
 from ..models.focal_evidence_encoder import (
     FocalEvidenceEncoder,
@@ -65,37 +65,104 @@ def _module_device_dtype(module: nn.Module, fallback_device: torch.device, fallb
     return tensor.device, tensor.dtype
 
 
-@dataclass
+@dataclass(init=False)
 class FocalStackGenerationOutput(BaseOutput):
-    """Output type returned by :class:`FocalStackGenerationPipeline`."""
+    """Tensor-only output returned by :class:`FocalStackGenerationPipeline`.
 
-    depth_map: torch.Tensor
-    all_in_focus_image: Union[torch.Tensor, Image.Image]
-    depth_colored: Optional[Image.Image] = None
+    Primary fields mirror the active method: fused depth, AIF reconstruction,
+    uncertainty, diagnostics, and an optional refinement summary. Legacy keyword
+    aliases are accepted temporarily for checkpoint/output migration.
+    """
+
+    depth: torch.Tensor
+    all_in_focus: torch.Tensor
     uncertainty: Optional[torch.Tensor] = None
-    generated_depth_canonical: Optional[torch.Tensor] = None
-    focal_depth_canonical: Optional[torch.Tensor] = None
-    final_depth_canonical: Optional[torch.Tensor] = None
-    focal_posterior: Optional[torch.Tensor] = None
-    focal_entropy: Optional[torch.Tensor] = None
-    focal_peak_confidence: Optional[torch.Tensor] = None
-    physical_evidence_support: Optional[torch.Tensor] = None
-    focal_evidence_weight: Optional[torch.Tensor] = None
-    generative_prior_weight: Optional[torch.Tensor] = None
-    abstention_weight: Optional[torch.Tensor] = None
-    posterior_margin: Optional[torch.Tensor] = None
-    depth_disagreement: Optional[torch.Tensor] = None
-    generative_uncertainty: Optional[torch.Tensor] = None
-    uncertainty_focus: Optional[torch.Tensor] = None
-    uncertainty_disagreement: Optional[torch.Tensor] = None
-    uncertainty_final: Optional[torch.Tensor] = None
-    depth_focus_metric: Optional[torch.Tensor] = None
-    physical_verification_trace: Optional[PhysicalVerificationTrace] = None
-    refinement_history: Optional[List[Dict[str, Any]]] = None
-    accepted_refinement_steps: int = 0
-    rejected_refinement_steps: int = 0
-    physical_risk_before: Optional[float] = None
-    physical_risk_after: Optional[float] = None
+    diagnostics: Dict[str, Any] = None  # type: ignore[assignment]
+    refinement_summary: Dict[str, Any] = None  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        depth: Optional[torch.Tensor] = None,
+        all_in_focus: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+        refinement_summary: Optional[Dict[str, Any]] = None,
+        **legacy: Any,
+    ) -> None:
+        if depth is None:
+            depth = legacy.pop("depth_map", None)
+        if all_in_focus is None:
+            all_in_focus = legacy.pop("all_in_focus_image", None)
+        legacy_uncertainty_final = legacy.get("uncertainty_final")
+        if uncertainty is None:
+            uncertainty = legacy.pop("uncertainty_final", legacy.pop("uncertainty", None))
+        if depth is None or all_in_focus is None:
+            raise TypeError("FocalStackGenerationOutput requires depth and all_in_focus tensors.")
+        diagnostics = dict(diagnostics or {})
+        refinement_summary = dict(refinement_summary or {})
+        legacy.pop("depth_colored", None)
+        if legacy_uncertainty_final is not None:
+            diagnostics.setdefault("uncertainty_final", legacy_uncertainty_final)
+        for key, value in legacy.items():
+            if key in {"refinement_history", "accepted_refinement_steps", "rejected_refinement_steps", "physical_risk_before", "physical_risk_after"}:
+                refinement_summary[key] = value
+            else:
+                diagnostics[key] = value
+        self.depth = depth
+        self.all_in_focus = all_in_focus
+        self.uncertainty = uncertainty
+        self.diagnostics = diagnostics
+        self.refinement_summary = refinement_summary
+
+    @property
+    def depth_map(self) -> torch.Tensor:
+        return self.depth
+
+    @depth_map.setter
+    def depth_map(self, value: torch.Tensor) -> None:
+        self.depth = value
+
+    @property
+    def all_in_focus_image(self) -> torch.Tensor:
+        return self.all_in_focus
+
+    @all_in_focus_image.setter
+    def all_in_focus_image(self, value: torch.Tensor) -> None:
+        self.all_in_focus = value
+
+    @property
+    def depth_colored(self) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self.diagnostics:
+            return self.diagnostics[name]
+        if name in self.refinement_summary:
+            return self.refinement_summary[name]
+        legacy_optional = {
+            "generated_depth_canonical",
+            "focal_depth_canonical",
+            "final_depth_canonical",
+            "focal_posterior",
+            "focal_entropy",
+            "focal_peak_confidence",
+            "physical_evidence_support",
+            "focal_evidence_weight",
+            "generative_prior_weight",
+            "abstention_weight",
+            "posterior_margin",
+            "depth_disagreement",
+            "generative_uncertainty",
+            "uncertainty_focus",
+            "uncertainty_disagreement",
+            "uncertainty_final",
+            "depth_focus_metric",
+            "physical_verification_trace",
+            "refinement_history",
+        }
+        if name in legacy_optional:
+            return None
+        raise AttributeError(name)
 
 
 class FocalInjectedSD3Transformer(nn.Module):
@@ -476,103 +543,50 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         return self.train(False)
 
 
-    @staticmethod
-    def _expand_focal_features_for_model(
-        focal_features: Dict[str, Any],
-        num_images_per_prompt: int,
-        do_classifier_free_guidance: bool,
-    ) -> Dict[str, Any]:
-        """Repeat focal conditioning to match the model input batch.
+    def _get_empty_conditioning(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return cached empty text conditioning used by the focal-stack method."""
+        cache = getattr(self, "_empty_conditioning_cache", None)
+        if cache is not None and cache["prompt_embeds"].device == device and cache["prompt_embeds"].dtype == dtype:
+            return cache["prompt_embeds"], cache["pooled_prompt_embeds"]
+        prompt_embeds, _, pooled_prompt_embeds, _ = self.encode_prompt(
+            prompt="",
+            prompt_2="",
+            prompt_3="",
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=False,
+            device=device,
+        )
+        prompt_embeds = prompt_embeds.to(device=device, dtype=dtype).detach()
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype).detach()
+        self._empty_conditioning_cache = {
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
+        }
+        return prompt_embeds, pooled_prompt_embeds
 
-        SD3 classifier-free guidance doubles the latent and text-conditioning
-        batches by concatenating unconditional and conditional inputs. Focal
-        conditioning is batch-first as well, so it must be expanded in lockstep
-        before being passed to the injected transformer.
-        """
+    def offload_text_encoders(self) -> None:
+        """Move text encoders to CPU after empty conditioning has been cached."""
+        for name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            module = getattr(self, name, None)
+            if isinstance(module, nn.Module):
+                module.to("cpu")
 
-        repeat_count = max(1, num_images_per_prompt)
-
-        def expand(value: Any) -> Any:
-            if isinstance(value, torch.Tensor):
-                expanded = value
-                if repeat_count > 1:
-                    expanded = expanded.repeat_interleave(repeat_count, dim=0)
-                if do_classifier_free_guidance:
-                    expanded = torch.cat([expanded, expanded], dim=0)
-                return expanded
-            if isinstance(value, dict):
-                return {key: expand(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [expand(item) for item in value]
-            if isinstance(value, tuple):
-                return tuple(expand(item) for item in value)
-            return value
-
-        return {key: expand(value) for key, value in focal_features.items()}
-
-    @torch.no_grad()
-    def __call__(
+    def _prepare_focal_inputs(
         self,
-        focal_stack: Union[torch.Tensor, List[Image.Image]],
-        focal_plane_distances: Optional[torch.Tensor] = None,
-        prompt: str = "",
-        negative_prompt: Optional[str] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_inference_steps: int = 28,
-        guidance_scale: float = 7.0,
-        num_images_per_prompt: int = 1,
-        generator: Optional[torch.Generator] = None,
-        latents: Optional[torch.FloatTensor] = None,
-        output_type: str = "pil",
-        return_dict: bool = True,
-        focal_distance_mode: str = "normalized",
-        num_refinement_steps: int = 0,
-        trace_refinement_epsilon: float = 1e-4,
-        **kwargs: Any,
-    ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, Union[torch.Tensor, Image.Image]]]:
-        """Generate canonical depth and all-in-focus outputs from a focal stack.
-
-        Args:
-            focal_stack: Input focal stack as a tensor ``[B, N, C, H, W]`` /
-                ``[N, C, H, W]`` or a list of RGB PIL images.
-            focal_plane_distances: Per-plane focal coordinates with shape
-                ``[N]`` or ``[B, N]``. These are always used to form canonical
-                focal coordinates for the model.
-            focal_distance_mode: Set to ``"normalized"`` when focal-plane
-                values are relative/index-like coordinates; ``depth_focus_metric``
-                will be ``None``. Set to ``"metric"`` only when
-                ``focal_plane_distances`` are calibrated metric distances; then
-                metric focus depth is decoded from ``focal_posterior`` and
-                returned as ``depth_focus_metric``.
-            num_refinement_steps: Optional inference-time self-refinement steps.
-                ``0`` preserves the original single-pass behavior.
-            return_refinement_history: When ``True`` and refinement is enabled,
-                return per-step depth/uncertainty snapshots and trace summaries.
-
-        Raises:
-            ValueError: If ``focal_distance_mode`` is not ``"normalized"`` or
-                ``"metric"``.
-        """
-        if num_refinement_steps < 0:
-            raise ValueError("num_refinement_steps must be non-negative.")
-        if focal_distance_mode not in {"normalized", "metric"}:
-            raise ValueError(
-                "focal_distance_mode must be either 'normalized' or 'metric', "
-                f"got {focal_distance_mode!r}."
-            )
-
-        if kwargs:
-            unexpected = ", ".join(sorted(kwargs))
-            raise TypeError(f"Unexpected FocalStackGenerationPipeline arguments: {unexpected}")
-        if focal_plane_distances is None:
-            raise ValueError("focal_plane_distances is required.")
-
+        focal_stack: torch.Tensor,
+        focal_plane_distances: torch.Tensor,
+        height: Optional[int],
+        width: Optional[int],
+    ) -> Dict[str, Any]:
+        """Validate focal tensors, normalize image ranges, and choose output size."""
+        if not isinstance(focal_stack, torch.Tensor):
+            raise TypeError("FocalStackGenerationPipeline expects focal_stack as a tensor; load PIL images in script/inference.py.")
         focal_stack = self._ensure_tensor_stack(focal_stack)
         device = self._execution_device
         dtype = self.transformer.dtype
-
         focal_stack = focal_stack.to(device=device)
+        focal_stack_unit = to_unit_range(focal_stack.float())
+        focal_stack_signed = to_model_range(focal_stack.float())
         input_h, input_w = focal_stack.shape[-2:]
         target_h = input_h if height is None else int(height)
         target_w = input_w if width is None else int(width)
@@ -582,10 +596,7 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         if focal_plane_distances.dim() == 1:
             focal_plane_distances = focal_plane_distances.unsqueeze(0)
         if focal_plane_distances.dim() != 2:
-            raise ValueError(
-                "focal_plane_distances must have shape [B, N] or [N], "
-                f"got {tuple(focal_plane_distances.shape)}"
-            )
+            raise ValueError(f"focal_plane_distances must have shape [B, N] or [N], got {tuple(focal_plane_distances.shape)}")
         if focal_plane_distances.shape[0] == 1 and focal_stack.shape[0] != 1:
             focal_plane_distances = focal_plane_distances.expand(focal_stack.shape[0], -1)
         if focal_plane_distances.shape != focal_stack.shape[:2]:
@@ -595,248 +606,407 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
             )
         if not torch.isfinite(focal_plane_distances).all():
             raise ValueError("focal_plane_distances must contain only finite values")
-        focal_plane_distances = focal_plane_distances.to(device=device)
+        return {
+            "device": device,
+            "dtype": dtype,
+            "height": height,
+            "width": width,
+            "focal_stack_unit": focal_stack_unit,
+            "focal_stack_signed": focal_stack_signed,
+            "focal_plane_distances": focal_plane_distances.to(device=device),
+        }
 
+    def _encode_focal_stack(self, prepared: Dict[str, Any]) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """Compute focal-sweep features and focus-likelihood outputs."""
+        device = prepared["device"]
+        dtype = prepared["dtype"]
+        stack = prepared["focal_stack_signed"]
+        distances = prepared["focal_plane_distances"]
         evidence_device, evidence_dtype = _module_device_dtype(self.focal_evidence_head, torch.device(device), dtype)
         processor_device, processor_dtype = _module_device_dtype(self.focal_processor, torch.device(device), dtype)
         focal_evidence = self.focal_evidence_head(
-            focal_stack.to(device=evidence_device, dtype=evidence_dtype),
-            focal_plane_distances.to(device=evidence_device, dtype=evidence_dtype),
+            stack.to(device=evidence_device, dtype=evidence_dtype),
+            distances.to(device=evidence_device, dtype=evidence_dtype),
         )
         focal_features = self.focal_processor(
-            focal_stack.to(device=processor_device, dtype=processor_dtype),
-            focal_plane_distances.to(device=processor_device, dtype=processor_dtype),
+            stack.to(device=processor_device, dtype=processor_dtype),
+            distances.to(device=processor_device, dtype=processor_dtype),
         )
         focal_features = {
             key: value.to(device=device, dtype=dtype) if isinstance(value, torch.Tensor) else value
             for key, value in focal_features.items()
         }
+        return focal_features, focal_evidence
 
-        prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = self.encode_prompt(
-            prompt=prompt,
-            prompt_2=prompt,
-            prompt_3=prompt,
-            negative_prompt=negative_prompt,
-            negative_prompt_2=negative_prompt,
-            negative_prompt_3=negative_prompt,
-            num_images_per_prompt=num_images_per_prompt,
-            do_classifier_free_guidance=guidance_scale > 1.0,
-            device=device,
-        )
-
-        batch_size = focal_stack.shape[0] * num_images_per_prompt
+    def _sample_clean_latent(
+        self,
+        prepared: Dict[str, Any],
+        focal_features: Dict[str, torch.Tensor],
+        num_inference_steps: int,
+        generator: Optional[torch.Generator],
+        latents: Optional[torch.FloatTensor],
+    ) -> torch.Tensor:
+        """Sample the SD3 latent with focal conditioning and cached empty text conditioning."""
+        device = prepared["device"]
+        dtype = prepared["dtype"]
+        prompt_embeds, pooled_prompt_embeds = self._get_empty_conditioning(torch.device(device), dtype)
+        batch_size = prepared["focal_stack_signed"].shape[0]
         latents = self.prepare_latents(
             batch_size=batch_size,
             num_channels=self.transformer.config.in_channels,
-            height=height // self.vae_scale_factor,
-            width=width // self.vae_scale_factor,
+            height=prepared["height"] // self.vae_scale_factor,
+            width=prepared["width"] // self.vae_scale_factor,
             dtype=dtype,
             device=device,
             generator=generator,
             latents=latents,
         )
-
-        model_focal_features = self._expand_focal_features_for_model(
-            focal_features,
-            num_images_per_prompt=num_images_per_prompt,
-            do_classifier_free_guidance=guidance_scale > 1.0,
-        )
-
+        if prompt_embeds.shape[0] == 1 and batch_size != 1:
+            prompt_embeds = prompt_embeds.repeat((batch_size,) + (1,) * (prompt_embeds.ndim - 1))
+            pooled_prompt_embeds = pooled_prompt_embeds.repeat((batch_size,) + (1,) * (pooled_prompt_embeds.ndim - 1))
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
-        for timestep in timesteps:
-            latent_model_input = (
-                torch.cat([latents] * 2) if guidance_scale > 1.0 else latents
-            )
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, timestep)
-
+        for timestep in self.scheduler.timesteps:
+            latent_model_input = self.scheduler.scale_model_input(latents, timestep)
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep,
-                encoder_hidden_states=(
-                    torch.cat([negative_prompt_embeds, prompt_embeds])
-                    if guidance_scale > 1.0
-                    else prompt_embeds
-                ),
-                pooled_projections=(
-                    torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds])
-                    if guidance_scale > 1.0
-                    else pooled_prompt_embeds
-                ),
-                focal_features=model_focal_features,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                focal_features=focal_features,
                 return_dict=False,
             )[0]
-
-            if guidance_scale > 1.0:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
             latents = self.scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+        return latents
 
+    def _decode_prediction_heads(self, prepared: Dict[str, Any], latents: torch.Tensor, focal_evidence: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Decode generative heads and align focus-likelihood maps to output size."""
+        device = prepared["device"]
+        dtype = prepared["dtype"]
+        height = prepared["height"]
+        width = prepared["width"]
         decoder_device, decoder_dtype = _module_device_dtype(self.task_output_decoder, torch.device(device), dtype)
         decoder_outputs = self.task_output_decoder(latents.to(device=decoder_device, dtype=decoder_dtype))
-        generated_depth_canonical = decoder_outputs["generated_depth_canonical"]
-        generative_uncertainty = decoder_outputs["uncertainty"]
         all_in_focus_latents = decoder_outputs["all_in_focus_latents"]
-
-        generated_depth_canonical = F.interpolate(generated_depth_canonical, size=(height, width), mode="bilinear", align_corners=False)
-        generative_uncertainty = F.interpolate(generative_uncertainty, size=(height, width), mode="bilinear", align_corners=False)
-        focal_depth_canonical = F.interpolate(focal_evidence["focal_depth_canonical"], size=(height, width), mode="bilinear", align_corners=False)
-        focal_entropy = F.interpolate(focal_evidence["focal_entropy"], size=(height, width), mode="bilinear", align_corners=False)
-        focal_posterior = F.interpolate(focal_evidence["focal_posterior"], size=(height, width), mode="bilinear", align_corners=False)
-        focal_posterior = focal_posterior / focal_posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        if focal_depth_canonical.shape[0] != generated_depth_canonical.shape[0]:
-            repeat_factor = generated_depth_canonical.shape[0] // focal_depth_canonical.shape[0]
-            focal_depth_canonical = focal_depth_canonical.repeat_interleave(repeat_factor, dim=0)
-            focal_entropy = focal_entropy.repeat_interleave(repeat_factor, dim=0)
-            focal_posterior = focal_posterior.repeat_interleave(repeat_factor, dim=0)
-
-        support_inputs, support_maps = build_physical_evidence_features(
-            focal_posterior=focal_posterior,
-            focal_entropy=focal_entropy,
-            focal_depth_canonical=focal_depth_canonical,
-            generated_depth_canonical=generated_depth_canonical,
-            generative_uncertainty=generative_uncertainty,
-        )
-        support_device, support_dtype = _module_device_dtype(self.physical_evidence_support_head, torch.device(device), dtype)
-        support_inputs = support_inputs.to(device=support_device, dtype=support_dtype)
-        support_outputs = self.physical_evidence_support_head(support_inputs)
-        focal_evidence_weight = support_outputs["focal_evidence_weight"]
-        generative_prior_weight = support_outputs["generative_prior_weight"]
-        abstention_weight = support_outputs["abstention_weight"]
-        gate_sum = (focal_evidence_weight + generative_prior_weight).clamp(min=1e-6)
-        focal_evidence_weight_norm = focal_evidence_weight / gate_sum
-        generative_prior_weight_norm = generative_prior_weight / gate_sum
-        final_depth_canonical = focal_evidence_weight_norm * focal_depth_canonical + generative_prior_weight_norm * generated_depth_canonical
-        depth_map = final_depth_canonical.squeeze(1)
-        uncertainty_final = torch.maximum(
-            support_outputs["uncertainty_final"],
-            abstention_weight,
-        ).clamp(0.0, 1.0)
-        physical_evidence_support = support_outputs["physical_evidence_support"]
-        uncertainty_focus = focal_entropy
-        uncertainty_disagreement = support_maps["depth_disagreement"]
-        depth_focus_metric = None
-        if focal_distance_mode == "metric":
-            metric_focal_plane_distances = focal_plane_distances
-            if metric_focal_plane_distances.shape[0] == 1 and focal_posterior.shape[0] != 1:
-                metric_focal_plane_distances = metric_focal_plane_distances.expand(
-                    focal_posterior.shape[0],
-                    -1,
-                )
-            depth_focus_metric = decode_metric_depth_from_focal_posterior(
-                focal_posterior=focal_posterior,
-                focal_plane_distances=metric_focal_plane_distances,
-            ).squeeze(1)
-
         recon = self.vae.decode(all_in_focus_latents / self.vae.config.scaling_factor, return_dict=False)[0]
         recon = (recon / 2 + 0.5).clamp(0, 1)
+        return {
+            "generated_depth_canonical": F.interpolate(decoder_outputs["generated_depth_canonical"], size=(height, width), mode="bilinear", align_corners=False),
+            "generative_uncertainty": F.interpolate(decoder_outputs["uncertainty"], size=(height, width), mode="bilinear", align_corners=False),
+            "focal_depth_canonical": F.interpolate(focal_evidence["focal_depth_canonical"], size=(height, width), mode="bilinear", align_corners=False),
+            "focal_entropy": F.interpolate(focal_evidence["focal_entropy"], size=(height, width), mode="bilinear", align_corners=False),
+            "focal_posterior": resize_probability_volume(focal_evidence["focal_posterior"], (height, width)),
+            "all_in_focus": recon,
+        }
 
-
-        verifier_device, verifier_dtype = _module_device_dtype(self.physical_verifier, torch.device(device), dtype)
-        verification_trace = self.physical_verifier(
-            focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
-            focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
-            depth_canonical=final_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
-            all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
-            generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
+    def _compute_reliability_fusion(self, prepared: Dict[str, Any], heads: Dict[str, torch.Tensor], focal_distance_mode: str) -> Dict[str, Any]:
+        """Fuse focus depth with the generative prior through the reliability head."""
+        device = prepared["device"]
+        dtype = prepared["dtype"]
+        support_inputs, support_maps = build_physical_evidence_features(
+            focal_posterior=heads["focal_posterior"],
+            focal_entropy=heads["focal_entropy"],
+            focal_depth_canonical=heads["focal_depth_canonical"],
+            generated_depth_canonical=heads["generated_depth_canonical"],
+            generative_uncertainty=heads["generative_uncertainty"],
         )
+        support_device, support_dtype = _module_device_dtype(self.physical_evidence_support_head, torch.device(device), dtype)
+        support_outputs = self.physical_evidence_support_head(support_inputs.to(device=support_device, dtype=support_dtype))
+        focal_weight = support_outputs["focal_evidence_weight"]
+        prior_weight = support_outputs["generative_prior_weight"]
+        abstention = support_outputs["abstention_weight"]
+        gate_sum = (focal_weight + prior_weight).clamp(min=1e-6)
+        focal_weight_norm = focal_weight / gate_sum
+        prior_weight_norm = prior_weight / gate_sum
+        final_depth = focal_weight_norm * heads["focal_depth_canonical"] + prior_weight_norm * heads["generated_depth_canonical"]
+        uncertainty = torch.maximum(support_outputs["uncertainty_final"], abstention).clamp(0.0, 1.0)
+        depth_focus_metric = None
+        if focal_distance_mode == "metric":
+            metric_distances = prepared["focal_plane_distances"]
+            if metric_distances.shape[0] == 1 and heads["focal_posterior"].shape[0] != 1:
+                metric_distances = metric_distances.expand(heads["focal_posterior"].shape[0], -1)
+            depth_focus_metric = decode_metric_depth_from_focal_posterior(heads["focal_posterior"], metric_distances).squeeze(1)
+        diagnostics = {
+            **heads,
+            **support_maps,
+            "physical_evidence_support": support_outputs["physical_evidence_support"],
+            "focal_evidence_weight": focal_weight_norm,
+            "generative_prior_weight": prior_weight_norm,
+            "abstention_weight": abstention,
+            "uncertainty_focus": heads["focal_entropy"],
+            "uncertainty_disagreement": support_maps["depth_disagreement"],
+            "uncertainty_final": uncertainty,
+            "depth_focus_metric": depth_focus_metric,
+        }
+        return {"depth": final_depth, "uncertainty": uncertainty, "diagnostics": diagnostics}
+
+    def _compute_consistency_diagnostics(self, prepared: Dict[str, Any], fused: Dict[str, Any]) -> PhysicalVerificationTrace:
+        """Evaluate focal-consistency diagnostics for the fused prediction."""
+        verifier_device, verifier_dtype = _module_device_dtype(self.physical_verifier, torch.device(prepared["device"]), prepared["dtype"])
+        diagnostics = fused["diagnostics"]
+        return self.physical_verifier(
+            focal_stack=prepared["focal_stack_unit"].to(device=verifier_device, dtype=verifier_dtype),
+            focal_plane_distances=prepared["focal_plane_distances"].to(device=verifier_device, dtype=verifier_dtype),
+            depth_canonical=fused["depth"].to(device=verifier_device, dtype=verifier_dtype),
+            all_in_focus=diagnostics["all_in_focus"].to(device=verifier_device, dtype=verifier_dtype),
+            generated_depth_canonical=diagnostics["generated_depth_canonical"].to(device=verifier_device, dtype=verifier_dtype),
+        )
+
+    def _run_test_time_optimization(
+        self,
+        prepared: Dict[str, Any],
+        fused: Dict[str, Any],
+        trace: PhysicalVerificationTrace,
+        *,
+        num_refinement_steps: int,
+        trace_refinement_epsilon: float,
+        refinement_mode: str,
+        refinement_seed: int,
+        return_refinement_history: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, PhysicalVerificationTrace, Dict[str, Any]]:
+        """Optionally run per-instance refinement with held-out consistency checks."""
+        final_depth = fused["depth"]
+        uncertainty = fused["uncertainty"]
+        recon = fused["diagnostics"]["all_in_focus"]
+        generated_depth = fused["diagnostics"]["generated_depth_canonical"]
+        focus_depth = fused["diagnostics"]["focal_depth_canonical"]
         refinement_history: Optional[List[Dict[str, Any]]] = [] if (return_refinement_history and num_refinement_steps > 0) else None
-        accepted_refinement_steps = 0
-        rejected_refinement_steps = 0
-        refinement_epsilon = 1e-4
-        initial_physical_risk = self._physical_risk(verification_trace)
-        physical_risk_before = initial_physical_risk
-        physical_risk_after = initial_physical_risk
+        accepted_steps = 0
+        rejected_steps = 0
+        epsilon = float(trace_refinement_epsilon)
+        initial_risk = self._physical_risk(trace)
+        risk_before = initial_risk
+        risk_after = initial_risk
+        verifier_device, verifier_dtype = _module_device_dtype(self.physical_verifier, torch.device(prepared["device"]), prepared["dtype"])
         for refinement_step in range(num_refinement_steps):
-            candidate_depth, candidate_uncertainty = self._apply_trace_refinement(
-                final_depth_canonical=final_depth_canonical,
-                focal_depth_canonical=focal_depth_canonical,
-                generated_depth_canonical=generated_depth_canonical,
-                uncertainty_final=uncertainty_final,
-                trace=verification_trace,
-            )
-            candidate_trace = self.physical_verifier(
-                focal_stack=focal_stack.to(device=verifier_device, dtype=verifier_dtype),
-                focal_plane_distances=focal_plane_distances.to(device=verifier_device, dtype=verifier_dtype),
-                depth_canonical=candidate_depth.to(device=verifier_device, dtype=verifier_dtype),
-                all_in_focus=recon.to(device=verifier_device, dtype=verifier_dtype),
-                generated_depth_canonical=generated_depth_canonical.to(device=verifier_device, dtype=verifier_dtype),
-            )
-            accepted, current_risk, candidate_risk = self._accept_refinement_candidate(
-                verification_trace,
-                candidate_trace,
-                epsilon=refinement_epsilon,
-            )
-            if accepted:
-                final_depth_canonical = candidate_depth
-                uncertainty_final = candidate_uncertainty
-                verification_trace = candidate_trace
-                accepted_refinement_steps += 1
-                physical_risk_after = candidate_risk
-            else:
-                rejected_refinement_steps += 1
-                physical_risk_after = current_risk
-            depth_map = final_depth_canonical.squeeze(1)
-            if refinement_history is not None:
-                refinement_history.append(
-                    {
-                        "step": refinement_step,
-                        "accepted": accepted,
-                        "physical_risk_before": current_risk,
-                        "physical_risk_after": physical_risk_after,
-                        "final_depth_canonical": final_depth_canonical.detach().cpu(),
-                        "uncertainty_final": uncertainty_final.detach().cpu(),
-                        "mean_conflict_score": float(verification_trace.conflict_score.detach().float().mean().item()),
-                        "mean_invalid_score": float(verification_trace.invalid_score.detach().float().mean().item()),
-                        "mean_focus_support": float(verification_trace.focus_support.detach().float().mean().item()),
-                        "mean_generation_support": float(verification_trace.generation_support.detach().float().mean().item()),
-                    }
+            if refinement_mode == "selective_tto":
+                candidate_depth, candidate_uncertainty, candidate_recon = self._selective_test_time_refinement(
+                    focal_stack_unit=prepared["focal_stack_unit"],
+                    focal_plane_distances=prepared["focal_plane_distances"],
+                    final_depth_canonical=final_depth,
+                    focus_depth_canonical=focus_depth,
+                    prior_depth_canonical=generated_depth,
+                    all_in_focus_unit=recon,
+                    uncertainty_final=uncertainty,
+                    trace=trace,
+                    seed=refinement_seed + refinement_step,
                 )
+            else:
+                candidate_depth, candidate_uncertainty = self._apply_trace_refinement(final_depth, focus_depth, generated_depth, uncertainty, trace)
+                candidate_recon = recon
+            candidate_trace = self.physical_verifier(
+                focal_stack=prepared["focal_stack_unit"].to(device=verifier_device, dtype=verifier_dtype),
+                focal_plane_distances=prepared["focal_plane_distances"].to(device=verifier_device, dtype=verifier_dtype),
+                depth_canonical=candidate_depth.to(device=verifier_device, dtype=verifier_dtype),
+                all_in_focus=candidate_recon.to(device=verifier_device, dtype=verifier_dtype),
+                generated_depth_canonical=generated_depth.to(device=verifier_device, dtype=verifier_dtype),
+            )
+            accepted, current_risk, candidate_risk = self._accept_refinement_candidate(trace, candidate_trace, epsilon=epsilon)
+            _, val_idx = self._split_refinement_planes(prepared["focal_stack_unit"].shape[1], prepared["focal_stack_unit"].device, refinement_seed + refinement_step)
+            current_val = self._heldout_measurement_loss(prepared["focal_stack_unit"], recon, final_depth, prepared["focal_plane_distances"], val_idx)
+            candidate_val = self._heldout_measurement_loss(prepared["focal_stack_unit"], candidate_recon, candidate_depth, prepared["focal_plane_distances"], val_idx)
+            accepted = accepted and self._should_accept_refinement(current_val, candidate_val, epsilon)
+            if accepted:
+                final_depth = candidate_depth
+                uncertainty = candidate_uncertainty
+                recon = candidate_recon
+                trace = candidate_trace
+                accepted_steps += 1
+                risk_after = candidate_risk
+            else:
+                rejected_steps += 1
+                risk_after = current_risk
+            if refinement_history is not None:
+                refinement_history.append({
+                    "step": refinement_step,
+                    "accepted": accepted,
+                    "physical_risk_before": current_risk,
+                    "physical_risk_after": risk_after,
+                    "final_depth_canonical": final_depth.detach().cpu(),
+                    "uncertainty_final": uncertainty.detach().cpu(),
+                    "mean_conflict_score": float(trace.conflict_score.detach().float().mean().item()),
+                    "mean_invalid_score": float(trace.invalid_score.detach().float().mean().item()),
+                    "mean_focus_support": float(trace.focus_support.detach().float().mean().item()),
+                    "mean_generation_support": float(trace.generation_support.detach().float().mean().item()),
+                })
             if not accepted:
                 break
+        return final_depth, uncertainty, recon, trace, {
+            "refinement_history": refinement_history,
+            "accepted_refinement_steps": accepted_steps,
+            "rejected_refinement_steps": rejected_steps,
+            "physical_risk_before": risk_before,
+            "physical_risk_after": risk_after,
+        }
 
-        if output_type == "pil":
-            image = self.numpy_to_pil(recon.cpu().permute(0, 2, 3, 1).numpy())[0]
-            depth_color = self._colorize_depth(depth_map[0].detach().cpu().numpy())
-            result: Union[torch.Tensor, Image.Image] = image
-        else:
-            depth_color = None
-            result = recon
-
+    def _format_output(
+        self,
+        depth: torch.Tensor,
+        all_in_focus: torch.Tensor,
+        uncertainty: torch.Tensor,
+        diagnostics: Dict[str, Any],
+        refinement_summary: Dict[str, Any],
+        return_dict: bool,
+    ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, torch.Tensor]]:
+        """Build a tensor-only output object or tuple."""
+        depth_map = depth.squeeze(1)
+        diagnostics = dict(diagnostics)
+        diagnostics["final_depth_canonical"] = depth_map
+        diagnostics["physical_verification_trace"] = diagnostics.get("physical_verification_trace")
+        for key, value in list(diagnostics.items()):
+            if isinstance(value, torch.Tensor) and value.dim() == 4 and value.shape[1] == 1:
+                diagnostics[key] = value.squeeze(1)
+        uncertainty_map = uncertainty.squeeze(1)
         if not return_dict:
-            return depth_map, result
-
+            return depth_map, all_in_focus
         return FocalStackGenerationOutput(
-            depth_map=depth_map,
-            all_in_focus_image=result,
-            depth_colored=depth_color,
-            uncertainty=uncertainty_final.squeeze(1),
-            generated_depth_canonical=generated_depth_canonical.squeeze(1),
-            focal_depth_canonical=focal_depth_canonical.squeeze(1),
-            final_depth_canonical=final_depth_canonical.squeeze(1),
-            focal_posterior=focal_posterior,
-            focal_entropy=focal_entropy.squeeze(1),
-            focal_peak_confidence=support_maps["focal_peak_confidence"].squeeze(1),
-            posterior_margin=support_maps["posterior_margin"].squeeze(1),
-            depth_disagreement=support_maps["depth_disagreement"].squeeze(1),
-            physical_evidence_support=physical_evidence_support.squeeze(1),
-            focal_evidence_weight=focal_evidence_weight_norm.squeeze(1),
-            generative_prior_weight=generative_prior_weight_norm.squeeze(1),
-            abstention_weight=abstention_weight.squeeze(1),
-            generative_uncertainty=generative_uncertainty.squeeze(1),
-            uncertainty_focus=uncertainty_focus.squeeze(1),
-            uncertainty_disagreement=uncertainty_disagreement.squeeze(1),
-            uncertainty_final=uncertainty_final.squeeze(1),
-            depth_focus_metric=depth_focus_metric,
-            physical_verification_trace=verification_trace,
-            refinement_history=refinement_history,
-            accepted_refinement_steps=accepted_refinement_steps,
-            rejected_refinement_steps=rejected_refinement_steps,
-            physical_risk_before=physical_risk_before,
-            physical_risk_after=physical_risk_after,
+            depth=depth_map,
+            all_in_focus=all_in_focus,
+            uncertainty=uncertainty_map,
+            diagnostics=diagnostics,
+            refinement_summary=refinement_summary,
         )
 
+    @torch.no_grad()
+    def __call__(
+        self,
+        focal_stack: torch.Tensor,
+        focal_plane_distances: torch.Tensor,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 28,
+        generator: Optional[torch.Generator] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        return_dict: bool = True,
+        focal_distance_mode: str = "normalized",
+        num_refinement_steps: int = 0,
+        trace_refinement_epsilon: float = 1e-4,
+        refinement_mode: str = "trace_update",
+        refinement_seed: int = 0,
+        return_refinement_history: bool = False,
+        **kwargs: Any,
+    ) -> Union[FocalStackGenerationOutput, Tuple[torch.Tensor, torch.Tensor]]:
+        """Run the active focal-stack method: encode, sample, decode, fuse, diagnose, optionally refine."""
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected FocalStackGenerationPipeline arguments: {unexpected}")
+        if num_refinement_steps < 0:
+            raise ValueError("num_refinement_steps must be non-negative.")
+        if refinement_mode not in {"trace_update", "selective_tto"}:
+            raise ValueError("refinement_mode must be 'trace_update' or 'selective_tto'.")
+        if focal_distance_mode not in {"normalized", "metric"}:
+            raise ValueError(f"focal_distance_mode must be either 'normalized' or 'metric', got {focal_distance_mode!r}.")
+        prepared = self._prepare_focal_inputs(focal_stack, focal_plane_distances, height, width)
+        focal_features, focal_evidence = self._encode_focal_stack(prepared)
+        clean_latent = self._sample_clean_latent(prepared, focal_features, num_inference_steps, generator, latents)
+        heads = self._decode_prediction_heads(prepared, clean_latent, focal_evidence)
+        fused = self._compute_reliability_fusion(prepared, heads, focal_distance_mode)
+        trace = self._compute_consistency_diagnostics(prepared, fused)
+        fused["diagnostics"]["physical_verification_trace"] = trace
+        depth, uncertainty, aif, trace, refinement_summary = self._run_test_time_optimization(
+            prepared,
+            fused,
+            trace,
+            num_refinement_steps=num_refinement_steps,
+            trace_refinement_epsilon=trace_refinement_epsilon,
+            refinement_mode=refinement_mode,
+            refinement_seed=refinement_seed,
+            return_refinement_history=return_refinement_history,
+        )
+        fused["diagnostics"]["physical_verification_trace"] = trace
+        return self._format_output(depth, aif, uncertainty, fused["diagnostics"], refinement_summary, return_dict)
+
+
+
+    @staticmethod
+    def _split_refinement_planes(num_planes: int, device: torch.device, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        """Deterministically split focal planes into optimization and held-out subsets."""
+        if num_planes < 2:
+            idx = torch.arange(num_planes, device=device)
+            return idx, idx
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        perm = torch.randperm(num_planes, device=device, generator=generator)
+        heldout_count = max(1, num_planes // 3)
+        return perm[heldout_count:], perm[:heldout_count]
+
+    @staticmethod
+    def _render_consistency_stack(all_in_focus_unit: torch.Tensor, depth_canonical: torch.Tensor, focal_plane_distances: torch.Tensor) -> torch.Tensor:
+        """Differentiable approximate focal renderer for test-time consistency when metadata are absent."""
+        if depth_canonical.dim() == 3:
+            depth_canonical = depth_canonical.unsqueeze(1)
+        batch, _, height, width = depth_canonical.shape
+        if focal_plane_distances.dim() == 1:
+            focal_plane_distances = focal_plane_distances.unsqueeze(0).expand(batch, -1)
+        coords = (focal_plane_distances - focal_plane_distances.min(dim=1, keepdim=True).values) / (
+            focal_plane_distances.max(dim=1, keepdim=True).values - focal_plane_distances.min(dim=1, keepdim=True).values
+        ).clamp(min=1e-6)
+        blur = F.avg_pool2d(all_in_focus_unit, kernel_size=5, stride=1, padding=2)
+        amount = (depth_canonical[:, None] - coords[:, :, None, None, None]).abs().clamp(0.0, 1.0)
+        return all_in_focus_unit[:, None] * (1.0 - amount) + blur[:, None] * amount
+
+    @classmethod
+    def _heldout_measurement_loss(
+        cls,
+        focal_stack_unit: torch.Tensor,
+        all_in_focus_unit: torch.Tensor,
+        depth_canonical: torch.Tensor,
+        focal_plane_distances: torch.Tensor,
+        plane_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        rendered = cls._render_consistency_stack(all_in_focus_unit, depth_canonical, focal_plane_distances)
+        residual = rendered.index_select(1, plane_indices) - focal_stack_unit.index_select(1, plane_indices)
+        return torch.sqrt(residual.square() + 1e-4).mean()
+
+    @classmethod
+    def _selective_test_time_refinement(
+        cls,
+        *,
+        focal_stack_unit: torch.Tensor,
+        focal_plane_distances: torch.Tensor,
+        final_depth_canonical: torch.Tensor,
+        focus_depth_canonical: torch.Tensor,
+        prior_depth_canonical: torch.Tensor,
+        all_in_focus_unit: torch.Tensor,
+        uncertainty_final: torch.Tensor,
+        trace: PhysicalVerificationTrace,
+        seed: int = 0,
+        inner_steps: int = 4,
+        lr: float = 0.05,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Optimize detached per-sample AIF/depth state and validate on held-out planes."""
+        torch.manual_seed(int(seed))
+        depth0 = final_depth_canonical.detach().clamp(1e-4, 1.0 - 1e-4)
+        aif0 = all_in_focus_unit.detach().clamp(0.0, 1.0)
+        depth_logits = torch.logit(depth0).detach().clone().requires_grad_(True)
+        aif_delta = torch.zeros_like(aif0, requires_grad=True)
+        train_idx, val_idx = cls._split_refinement_planes(focal_stack_unit.shape[1], focal_stack_unit.device, seed)
+        optimizer = torch.optim.Adam([depth_logits, aif_delta], lr=lr)
+        focus = focus_depth_canonical.detach()
+        prior = prior_depth_canonical.detach()
+        texture_gate = trace.texture_confidence.detach().clamp(0.0, 1.0)
+        for _ in range(inner_steps):
+            optimizer.zero_grad()
+            depth = depth_logits.sigmoid()
+            aif = (aif0 + aif_delta.tanh() * 0.05).clamp(0.0, 1.0)
+            measurement = cls._heldout_measurement_loss(focal_stack_unit, aif, depth, focal_plane_distances, train_idx)
+            focus_loss = (texture_gate * (depth - focus).abs()).mean()
+            trust = (depth - depth0).square().mean() + 0.25 * (depth - prior).square().mean()
+            sharp = -0.01 * (aif[:, :, :, 1:] - aif[:, :, :, :-1]).abs().mean()
+            edge = (depth[:, :, :, 1:] - depth[:, :, :, :-1]).abs().mean() * 0.005
+            loss = measurement + 0.2 * focus_loss + 0.1 * trust + sharp + edge
+            loss.backward()
+            optimizer.step()
+        candidate_depth = depth_logits.sigmoid().detach()
+        candidate_aif = (aif0 + aif_delta.tanh() * 0.05).clamp(0.0, 1.0).detach()
+        heldout_residual = cls._heldout_measurement_loss(focal_stack_unit, candidate_aif, candidate_depth, focal_plane_distances, val_idx).detach()
+        branch_disagreement = (candidate_depth - focus).abs().detach()
+        focus_entropy = trace.focus_entropy.detach().clamp(0.0, 1.0)
+        split_variance = (candidate_depth - depth0).abs().detach()
+        uncertainty = torch.maximum(uncertainty_final.detach(), branch_disagreement)
+        uncertainty = torch.maximum(uncertainty, focus_entropy)
+        uncertainty = torch.maximum(uncertainty, split_variance)
+        uncertainty = torch.maximum(uncertainty, heldout_residual.reshape(1, 1, 1, 1).expand_as(uncertainty)).clamp(0.0, 1.0)
+        return candidate_depth, uncertainty, candidate_aif
 
     @staticmethod
     def _physical_risk(trace: PhysicalVerificationTrace) -> float:
@@ -918,53 +1088,23 @@ class FocalStackGenerationPipeline(StableDiffusion3Pipeline):
         return out_h, out_w
 
 
-    def _ensure_tensor_stack(self, stack: Union[torch.Tensor, List[Image.Image]]) -> torch.Tensor:
-        if isinstance(stack, torch.Tensor):
-            if stack.dim() == 4:
-                stack = stack.unsqueeze(0)
-            if stack.dim() != 5:
-                raise ValueError(
-                    "focal_stack tensor must have shape [B, N, C, H, W] or [N, C, H, W], "
-                    f"got {tuple(stack.shape)}"
-                )
-            if stack.shape[1] < 1:
-                raise ValueError("focal_stack tensor must contain at least one focal plane")
-            if stack.shape[2] != 3:
-                raise ValueError(f"focal_stack tensor must contain RGB images with 3 channels, got {stack.shape[2]}")
-            if not torch.isfinite(stack).all():
-                raise ValueError("focal_stack tensor must contain only finite values")
-            if stack.min() >= 0 and stack.max() <= 1:
-                stack = stack * 2.0 - 1.0
-            return stack
+    def _ensure_tensor_stack(self, stack: torch.Tensor) -> torch.Tensor:
+        """Validate and convert a focal-stack tensor to model range."""
+        if stack.dim() == 4:
+            stack = stack.unsqueeze(0)
+        if stack.dim() != 5:
+            raise ValueError(
+                "focal_stack tensor must have shape [B, N, C, H, W] or [N, C, H, W], "
+                f"got {tuple(stack.shape)}"
+            )
+        if stack.shape[1] < 1:
+            raise ValueError("focal_stack tensor must contain at least one focal plane")
+        if stack.shape[2] != 3:
+            raise ValueError(f"focal_stack tensor must contain RGB images with 3 channels, got {stack.shape[2]}")
+        if not torch.isfinite(stack).all():
+            raise ValueError("focal_stack tensor must contain only finite values")
+        return to_model_range(stack)
 
-        if not stack:
-            raise ValueError("focal_stack image list must not be empty")
-
-        tensors = []
-        import numpy as np  # local import to avoid hard dependency at module import time
-
-        for image in stack:
-            rgb = image.convert("RGB")
-            array = torch.from_numpy(np.array(rgb)).permute(2, 0, 1).float() / 255.0
-            array = array * 2.0 - 1.0
-            tensors.append(array)
-
-        return torch.stack(tensors, dim=0).unsqueeze(0)
-
-    def _colorize_depth(self, depth: np.ndarray) -> Image.Image:
-        import numpy as np
-
-        normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        try:
-            import matplotlib.pyplot as plt  # type: ignore
-
-            colormap = plt.get_cmap("magma")
-            colored = colormap(normalized)[..., :3]
-            colored = (colored * 255).astype(np.uint8)
-            return Image.fromarray(colored)
-        except ModuleNotFoundError:
-            gray = (normalized * 255).astype(np.uint8)
-            return Image.fromarray(gray)
 
 
 # Backward-compatible aliases for external scripts using pre-rename APIs.

@@ -26,7 +26,9 @@ from src.pipelines import load_pipeline
 from src.utils import (
     save_depth_map,
     save_all_in_focus,
+    colorize_depth,
 )
+from src.utils.image_utils import to_model_range
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -156,12 +158,6 @@ def parse_args():
         default=50,
         help='Number of denoising steps'
     )
-    parser.add_argument(
-        '--guidance-scale',
-        type=float,
-        default=1.0,
-        help='Guidance scale for inference (1.0 disables text classifier-free guidance)'
-    )
     parser.add_argument('--height', type=int, default=None, help='Optional inference height override')
     parser.add_argument('--width', type=int, default=None, help='Optional inference width override')
 
@@ -246,6 +242,15 @@ def extract_focal_plane_distances(
     return torch.tensor(distances, dtype=torch.float32)
 
 
+def images_to_focal_tensor(images: List[Image.Image]) -> torch.Tensor:
+    """Convert loaded PIL focal-stack images to a model-range tensor."""
+    tensors = []
+    for image in images:
+        arr = torch.from_numpy(np.array(image.convert("RGB"))).permute(2, 0, 1).float() / 255.0
+        tensors.append(to_model_range(arr))
+    return torch.stack(tensors, dim=0).unsqueeze(0)
+
+
 def process_focal_stack(
         pipeline,
         images: List[Image.Image],
@@ -269,11 +274,9 @@ def process_focal_stack(
     # Run inference
     with torch.no_grad():
         output = pipeline(
-            focal_stack=padded_images,
+            focal_stack=images_to_focal_tensor(padded_images),
             focal_plane_distances=focal_plane_distances,
             num_inference_steps=args.num_inference_steps,
-            guidance_scale=args.guidance_scale,
-            output_type="pil" if args.save_visualization else "pt",
             return_dict=True,
             focal_distance_mode=args.focal_distance_mode,
             **pipeline_kwargs,
@@ -301,17 +304,13 @@ def process_focal_stack(
             setattr(output, attr, unpad_tensor_spatial(value, size_meta["pad"]))
     if isinstance(output.all_in_focus_image, torch.Tensor):
         output.all_in_focus_image = unpad_tensor_spatial(output.all_in_focus_image, size_meta["pad"])
-    elif isinstance(output.all_in_focus_image, Image.Image):
-        top, bottom, left, right = size_meta["pad"]
-        w, h = output.all_in_focus_image.size
-        output.all_in_focus_image = output.all_in_focus_image.crop((left, top, w - right, h - bottom))
 
     # Prepare results
     results = {
         'name': stack_name,
         'depth_map': output.depth_map,
         'all_in_focus': output.all_in_focus_image,
-        'depth_colored': output.depth_colored,
+        'depth_colored': colorize_depth(_to_numpy_map(output.depth_map)),
         'uncertainty': output.uncertainty,
         'generated_depth_canonical': getattr(output, 'generated_depth_canonical', None),
         'focal_depth_canonical': getattr(output, 'focal_depth_canonical', None),
@@ -363,16 +362,15 @@ def save_results(results: Dict, output_dir: Path, args):
     # Save as image
     save_depth_map(depth_np, output_dir / f"{name}_depth.png")
 
-    # Save colored depth if available
+    # Save colored depth presentation from script-level utilities.
     if results['depth_colored'] is not None:
-        if isinstance(results['depth_colored'], Image.Image):
-            results['depth_colored'].save(output_dir / f"{name}_depth_colored.png")
+        results['depth_colored'].save(output_dir / f"{name}_depth_colored.png")
 
     # Save all-in-focus image
-    if isinstance(results['all_in_focus'], Image.Image):
-        results['all_in_focus'].save(output_dir / f"{name}_all_in_focus.png")
-    else:
-        save_all_in_focus(results['all_in_focus'], output_dir / f"{name}_all_in_focus.png")
+    aif_to_save = results['all_in_focus']
+    if isinstance(aif_to_save, torch.Tensor) and aif_to_save.dim() == 4:
+        aif_to_save = aif_to_save[0]
+    save_all_in_focus(aif_to_save, output_dir / f"{name}_all_in_focus.png")
 
     # Save uncertainty if available
     if results.get('uncertainty') is not None:
@@ -418,7 +416,7 @@ def save_results(results: Dict, output_dir: Path, args):
 
     # Create visualization if requested
     if args.save_visualization:
-        from src.utils.visualization import visualize_results
+        from src.utils.image_utils import visualize_results
 
         viz_outputs = {
             'depth': depth_np,

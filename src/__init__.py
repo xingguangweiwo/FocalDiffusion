@@ -1,4 +1,4 @@
-"""FocalStackGeneration: Reliable Zero-Shot Focal-Stack Diffusion via Focal Evidence."""
+"""FocalStackGeneration: focal-stack depth, AIF reconstruction, and reliability diagnostics."""
 
 __version__ = "1.0.0"
 
@@ -26,7 +26,3 @@ def __getattr__(name: str):
         return mapping[name]
 
     raise AttributeError(f"module 'src' has no attribute '{name}'")
-
-from .generation_tasks import GENERATION_TASKS, normalize_generation_task
-
-__all__ = ["GENERATION_TASKS", "normalize_generation_task"]

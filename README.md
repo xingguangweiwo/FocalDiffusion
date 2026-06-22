@@ -1,148 +1,127 @@
-# FocalTrace: Self-Refining Focal-Stack Understanding via Physical Verification Traces
+# FocalTrace / FocalDiffusion
 
-FocalTrace is a task-conditioned diffusion framework for focal-stack understanding with Physical Verification Traces. It supports all-in-focus reconstruction, canonical depth generation, uncertainty estimation, focal evidence estimation, physical trace verification, and inference-time trace-guided self-refinement.
+FocalTrace is a reliability-aware focal-stack reconstruction system for all-in-focus (AIF) image reconstruction, canonical depth estimation, focus-likelihood diagnostics, and focal-stack consistency evaluation. The active method is: focal stack → focal-sweep features → focus likelihood and focus-based depth → generative prior depth and AIF reconstruction → reliability-aware fusion → focal-consistency diagnostics → optional per-instance test-time optimization. Consistency traces describe agreement between focus cues and an image-formation model; they are not ground-truth correctness labels.
 
-The system uses focal stacks as physical evidence, estimates a per-pixel focal-plane posterior, generates canonical depth and uncertainty outputs, and computes a Physical Verification Trace that summarizes focus support, defocus rendering consistency, conflict, invalidity, and physical support signals while preserving the Stable Diffusion 3.5 backbone.
+## Status Table
 
-## Highlights
+| Area | Implemented | Experimental | Planned |
+| --- | --- | --- | --- |
+| Focal-stack conditioning | Focal-sweep features condition the SD3 transformer and multi-output decoder | Attention/fusion ablations | Lightweight non-diffusion baseline |
+| Focus likelihood | Per-plane posterior, entropy, margin, multimodality, texture and coverage diagnostics | Adaptive low-texture temperature and focal-axis unimodality regularization | Calibrated uncertainty for all camera models |
+| Reliability | Reliability fusion head, abstention probability, consistency trace diagnostics | Selective test-time optimization (TTO) with held-out focal planes | Broader evaluator suite for transparent/specular masks |
+| Data protocols | Explicit source/adaptation/test splits and coordinate protocol validation | Unlabeled target adaptation on disjoint file lists | Dataset cards with verified camera metadata |
+| Evaluation | Depth metrics and internal/GT uncertainty detection hooks | AIF perceptual metrics and region-sliced reporting where labels/masks exist | Public benchmark tables after measured runs |
 
-* Task-conditioned focal-stack image generation for all-in-focus reconstruction, depth, uncertainty, and focal evidence outputs.
-* Physical Verification Trace outputs for focus confidence/index/coordinate, depth-focus discrepancy, defocus rendering residuals, support, conflict, invalidity, and verdict scores.
-* Inference-time self-refinement driven by physical verification traces.
-* Evaluation metrics for physical hallucination, valid physical reconstruction at coverage, and conflict/invalid trace scores.
-* Minimal M0→M1 verifier-guided self-improvement workflow: M0 is trained on labeled `train_sources`, mines frozen-verifier trace targets from unlabeled `self_improvement_sources`, and M1 is initialized from `parent_checkpoint` while replaying the manifest alongside source supervision.
+## Protocol Table
 
-## Important Notes
+| Method | Uses target focal stacks? | Uses target labels? | Updates network parameters? | May be called zero-shot? |
+| --- | --- | --- | --- | --- |
+| **M0 feed-forward** frozen source model | Yes, for inference only | No | No | Yes |
+| **M0 + per-instance TTO** | Yes, unlabeled focal stack at test time | No | No; optimizes detached per-sample state | No; report as test-time optimization |
+| **M1 unsupervised adaptation** | Yes, adaptation split only | No | Yes, on unlabeled adaptation split | No; never label M1 as zero-shot |
+| **Target-test evaluation** | Yes, target-test split | GT only inside evaluator metrics | No | Depends on method row above |
 
-* A trained checkpoint is required for meaningful inference.
-* “Zero-shot” means evaluation on unseen datasets or scenes without test-time fine-tuning.
-* Depth is normalized by default.
-* `focal_plane_distances` are currently required by the pipeline and evaluation/inference scripts.
-* Metric depth is interpretable only when focal-plane distances are calibrated metric distances and camera parameters are valid; otherwise outputs should be treated as relative/canonical depth.
+## Configuration Migration
+
+| Legacy key/name | New key/name | Notes |
+| --- | --- | --- |
+| `data.self_improvement_sources` | `data.adaptation_sources` | Legacy configs are migrated on load. |
+| `training.self_improvement` | `training.unsupervised_adaptation` | M0 keeps `enabled: false`; M1 uses `enabled: true` and `round_index >= 1`. |
+| `FocalEvidenceEncoder` | `FocusLikelihoodEstimator` | Legacy import remains as an alias. |
+| `PhysicalEvidenceEstimator` | `ReliabilityFusionHead` | Legacy import remains as an alias. |
+| `build_physical_evidence_features` | `build_reliability_features` | Legacy wrapper remains. |
+| `PhysicalVerificationTrace` | `FocalConsistencyTrace` | Legacy alias remains for checkpoints/imports. |
+| `FocalPhysicalVerifier` | `FocalConsistencyEvaluator` | Legacy alias remains. |
+| `physical_evidence_support` | `reliability_score` | Both output keys are currently emitted. |
+| `generated_depth_canonical` | `prior_depth_canonical` | Legacy key remains in model outputs for compatibility. |
+| `focal_depth_canonical` | `focus_depth_canonical` | Legacy key remains in model outputs for compatibility. |
+| `abstention_weight` | `abstention_probability` | Both output keys are currently emitted. |
 
 ## Installation
 
 ```bash
 pip install -e .
+# Optional extras:
+# pip install -e .[train,datasets,evaluation,development]
 ```
 
-Install the runtime dependencies required by your environment, including PyTorch, diffusers, transformers, accelerate, and optional PEFT/LoRA packages.
+CPU smoke tests use lightweight module and mock paths; they do not download the SD3.5 checkpoint.
 
-## Data Preparation
+## Data and Protocols
 
-Configure dataset roots and file lists in `configs/*.yaml`.
+Configure file lists in `configs/*.yaml` using disjoint splits:
 
-Typical file-list entries may include:
+* `data.train_sources` — labeled source training data.
+* `data.val_sources` — source/validation data for threshold selection.
+* `data.adaptation_sources` — unlabeled target adaptation data for M1 only.
+* `data.test_sources` — held-out target-test data.
 
-* `focal_stack_dir`
-* `all_in_focus`
-* `depth_path`
-* `focal_plane_distances`
-* optional camera metadata
+Every source must declare `focal_coordinate_type`, `focal_coordinate_unit`, `depth_coordinate_type`, `camera_calibration`, and `evaluation_mode`. The loader rejects incompatible calibrated/canonical combinations and adaptation/test file-list overlap.
 
+## Commands
 
-## Training
+### Source training
 
 ```bash
-python -m script.train --config configs/base.yaml
+python -m script.train --config configs/base.yaml \
+  --override training.unsupervised_adaptation.enabled=false protocol.name=source_training
 ```
 
-Before full training, replace placeholder dataset paths in `configs/base.yaml` with real dataset roots and file lists.
-
-## Inference
-
-```bash
-python -m script.inference \
-  --model-path outputs/experiments/base/checkpoints/best.pt \
-  --input path/to/focal_stack \
-  --output outputs/demo \
-  --focal-plane-distances 0.3,0.5,0.8,1.5,3.0 \
-  --focal-distance-mode metric \
-  --num-inference-steps 30 \
-  --guidance-scale 1.0
-```
-
-`--focal-plane-distances` is required. Use `--focal-distance-mode metric` only when those distances are calibrated metric distances. The default mode is `normalized`, which still uses focal-plane values for canonical model conditioning but does not expose `depth_focus_metric`. Without calibrated focal distances and camera parameters, output depth should be interpreted as relative/canonical rather than metric depth.
-
-
-## Evaluation
-
-Use `script.evaluate` as the official evaluation entry point for FocalTrace/FocalStackGeneration checkpoints:
+### Feed-forward zero-shot evaluation
 
 ```bash
 python -m script.evaluate \
   --config configs/base.yaml \
   --checkpoint outputs/experiments/base/checkpoints/best.pt \
-  --dataset hypersim \
-  --data_root /path/to/hypersim \
-  --output_dir outputs/evaluation \
+  --dataset target_test \
+  --output_dir outputs/eval_m0_zero_shot \
   --num_inference_steps 30 \
   --num_refinement_steps 0
 ```
 
-The evaluator writes `metrics.json`, `trace_metrics.json`, and a `visualizations/` directory. When refinement is enabled with `--num_refinement_steps > 0`, it also requests refinement history from the pipeline and writes `refinement_curve.json`. Use `--confidence-threshold`, `--violation-threshold`, and `--coverage` to tune the reported trace metrics.
+### Per-instance test-time optimization
 
-Trace metrics include:
+```bash
+python -m script.evaluate \
+  --config configs/base.yaml \
+  --checkpoint outputs/experiments/base/checkpoints/best.pt \
+  --dataset target_test \
+  --output_dir outputs/eval_m0_tto \
+  --num_inference_steps 30 \
+  --num_refinement_steps 4
+```
 
-* **High-Confidence Physical Violation Rate** (`high_confidence_physical_violation_rate`, HCPVR): verifier-derived violation rate among high-confidence predictions; reported with `reference_type` and not treated as absolute correctness unless the reference is ground truth or human annotation.
-* **Selective Physical Risk at Coverage** (`selective_physical_risk_at_coverage`): mean verifier risk over the top-confidence coverage fraction.
-* **Physical Risk Coverage AUC** (`physical_risk_coverage_auc`, Physical-AURC): threshold-free risk/coverage summary for selective prediction.
-* **`mean_conflict_score`**: average physical conflict score from the trace.
-* **`mean_invalid_score`**: average invalid/physically unreliable score from the trace.
+### Optional unsupervised target adaptation
 
+```bash
+python -m script.train --config configs/base.yaml \
+  --override training.unsupervised_adaptation.enabled=true \
+             training.unsupervised_adaptation.round_index=1 \
+             training.unsupervised_adaptation.parent_checkpoint=outputs/experiments/base/checkpoints/best.pt \
+             protocol.name=unsupervised_target_adaptation
+```
 
-## M0→M1 Self-Improvement
+Evaluate an adapted model only on a disjoint `target_test` split and report it as unsupervised adaptation, not zero-shot.
 
-The training config separates `train_sources`, `self_improvement_sources`, `val_sources`, and `test_sources`. Trace mining is only allowed on `self_improvement_sources`; the trainer rejects overlap between adaptation and test filelists. During the self-improvement round, the physical verifier is frozen and verifier targets are detached before being written to the lightweight `mining_manifest`. Replay re-reads U_adapt focal stacks, runs the current M1 heads forward, and mixes trace-guided replay loss with the original source supervised loss.
+## Metrics and Reporting
 
-Use `training.self_improvement.round_index`, `training.self_improvement.parent_checkpoint`, and `training.self_improvement.mining_manifest` to define the M0→M1 round. M0 evaluation on unseen `test_sources` is zero-shot; M1 evaluation after unlabeled target-domain replay should be reported as verifier-guided unlabeled adaptation, not zero-shot. Held-out verifier thresholds under `validation.heldout_verifier` must be selected on validation splits, not tuned on test splits.
+Implemented metric hooks include depth AbsRel/RMSE/L1, verifier-derived consistency-risk curves, internal violation AUROC/AUPRC, and GT depth-error AUROC/AUPRC when depth GT is passed to the evaluator. AIF PSNR/SSIM/LPIPS, AUSE/AURG, accepted refinement harm/improvement rates, and per-region metrics should be reported only when the corresponding labels or masks are available. Do not report unmeasured benchmark numbers.
 
-## Generation Tasks
+## Unsupported or Not-Yet-Supported Claims
 
-Canonical task names are centralized in `src/generation_tasks.py`:
-
-* `all_in_focus`
-* `depth`
-* `uncertainty`
-* `focal_evidence`
-
-The legacy task alias `aif` is accepted only as a compatibility alias for `all_in_focus`.
-
-## Method
-
-FocalTrace consists of four main components:
-
-1. **Focal Evidence Encoder**
-   Predicts a per-pixel posterior distribution over focal planes from the input focal stack.
-
-2. **Task-Conditioned Generative Decoder**
-   Uses latent diffusion features to reconstruct all-in-focus images and generate canonical depth.
-
-3. **Physical Evidence Estimator**
-   Estimates focal evidence weighting and uncertainty from compact focal evidence diagnostics, including focal entropy, posterior margin, generated-depth disagreement, and generative uncertainty.
-
-4. **Physical Verification Trace**
-   Computes fixed physical checks for focus confidence, focus peak index/coordinate, defocus rendering and stack reprojection residuals, support, conflict, and invalidity. This trace is implemented and can guide inference-time self-refinement. Training-time self-improvement is currently experimental via optional trace mining/replay, not a full multi-round automated loop.
-
-## Limitations
-
-* Metric depth requires calibrated focal-plane distances and valid camera parameters; otherwise output depth is relative/canonical.
-* `focal_plane_distances` are required by the current pipeline.
-* Reliability claims should be supported by high-error detection, sparsification, and calibration evaluation.
-* Large diffusion backbones should be separated from focal-evidence contributions through ablation studies.
+* Transparent-object depth is not solved; use model-mismatch and abstention diagnostics for such regions.
+* Consistency traces are not ground-truth correctness labels.
+* Metric depth claims require calibrated focal-plane distances and valid camera metadata.
+* Target-domain adaptation results require disjoint adaptation/test splits and must not be described as zero-shot.
 
 ## Repository Structure
 
 ```text
-src/models/       Focal evidence encoder, focal processor, attention blocks, decoder
-src/pipelines/    FocalStackGeneration pipeline and injected SD3 transformer
-src/training/     Trainer, losses, validation, optimization
-src/data/         Dataset and synthetic focal-stack rendering utilities
-script/           Training and inference entry points
-configs/          Experiment configurations
-tests/            Smoke and module tests
+src/models/       Focus likelihood, reliability fusion, focal processor, decoder
+src/pipelines/    FocalStackGeneration pipeline and SD3 transformer wrapper
+src/training/     Trainer, losses, validation, unsupervised adaptation replay
+src/data/         Dataset and differentiable focal-stack renderer
+script/           Training, inference, evaluation entry points
+configs/          Protocol/configuration files
+tests/            CPU smoke and module tests
 ```
-
-## License
-
-See the repository license.

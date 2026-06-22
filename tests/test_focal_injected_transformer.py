@@ -40,3 +40,14 @@ def test_getattr_falls_back_to_base_transformer_attributes():
 
     with pytest.raises(AttributeError):
         _ = wrapper.attribute_that_does_not_exist
+
+
+def test_pipeline_public_call_excludes_unevaluated_text_api_args():
+    import inspect
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationPipeline
+
+    parameters = inspect.signature(FocalStackGenerationPipeline.__call__).parameters
+    for name in ("prompt", "negative_prompt", "guidance_scale", "num_images_per_prompt", "output_type"):
+        assert name not in parameters
+    for name in ("focal_stack", "focal_plane_distances", "num_refinement_steps"):
+        assert name in parameters

@@ -6,22 +6,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..utils.image_utils import canonical_focal_coordinates, resize_probability_volume
+
 
 def normalize_focal_coordinates(focal_plane_distances: torch.Tensor) -> torch.Tensor:
-    """Normalize per-sample focus distances to [0, 1]."""
-    mn = focal_plane_distances.min(dim=1, keepdim=True).values
-    mx = focal_plane_distances.max(dim=1, keepdim=True).values
-    return (focal_plane_distances - mn) / (mx - mn + 1e-6)
+    """Return canonical focal coordinates shared by training and inference."""
+    coords, _ = canonical_focal_coordinates(focal_plane_distances, coordinate_type="distance")
+    return coords
+
+
+def metric_depth_to_focal_coordinates(
+    depth_metric: torch.Tensor,
+    focal_plane_distances: torch.Tensor,
+) -> torch.Tensor:
+    """Map metric depth into the canonical coordinate system of focal planes."""
+    depth = depth_metric.squeeze(1) if depth_metric.dim() == 4 else depth_metric
+    if depth.dim() != 3:
+        raise ValueError(f"depth_metric must have shape [B,1,H,W] or [B,H,W], got {tuple(depth_metric.shape)}.")
+    focus = focal_plane_distances.to(device=depth.device, dtype=depth.dtype)
+    coords, valid = canonical_focal_coordinates(focus, batch_size=depth.shape[0], coordinate_type="distance")
+    focus_expanded = focus.unsqueeze(0).expand(depth.shape[0], -1) if focus.dim() == 1 else focus
+    if focus_expanded.shape[0] == 1 and depth.shape[0] != 1:
+        focus_expanded = focus_expanded.expand(depth.shape[0], -1)
+    masked = focus_expanded.masked_fill(~valid, float("nan"))
+    mn = torch.nan_to_num(masked, nan=float("inf")).amin(dim=1, keepdim=True)
+    mx = torch.nan_to_num(masked, nan=float("-inf")).amax(dim=1, keepdim=True)
+    if torch.any(mx <= mn):
+        raise ValueError("focal_plane_distances must span a non-zero range for canonical focal supervision.")
+    del coords
+    return ((depth - mn[:, :, None]) / (mx - mn).clamp(min=1e-6)[:, :, None]).clamp(0.0, 1.0)
 
 
 def build_focal_axis_soft_targets(
-    depth_norm: torch.Tensor,
+    depth_coordinates: torch.Tensor,
     focal_plane_distances: torch.Tensor,
     temperature: float = 0.07,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build a depth-derived soft target posterior over focus planes."""
+    """Build a depth-derived soft target posterior over canonical focus-plane coordinates."""
     focus_coordinates = normalize_focal_coordinates(focal_plane_distances)
-    depth_hw = depth_norm.squeeze(1) if depth_norm.dim() == 4 else depth_norm
+    depth_hw = depth_coordinates.squeeze(1) if depth_coordinates.dim() == 4 else depth_coordinates
     logits = -torch.abs(focus_coordinates[:, :, None, None] - depth_hw[:, None]) / max(temperature, 1e-6)
     return torch.softmax(logits, dim=1), focus_coordinates
 
@@ -104,11 +127,8 @@ def build_coc_posterior_targets(
 # consistency losses. It uses local image affinity from the focal stack or AIF
 # target, without external foundation models or inference-time overhead.
 def _resize_and_normalize_posterior(posterior: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
-    """Resize a focus posterior and re-normalize across focal planes."""
-    if posterior.shape[-2:] == size:
-        return posterior
-    posterior = F.interpolate(posterior, size=size, mode="bilinear", align_corners=False)
-    return posterior / posterior.sum(dim=1, keepdim=True).clamp(min=1e-6)
+    """Resize a focus posterior with the shared probability-volume helper."""
+    return resize_probability_volume(posterior, size)
 
 
 def _build_evidence_image(
@@ -202,6 +222,29 @@ def _gate_consistency_loss(
     loss_x = _weighted_pairwise_mean(diff_x, affinity["x"], _pairwise_valid_mask(valid_mask, "x"))
     loss_y = _weighted_pairwise_mean(diff_y, affinity["y"], _pairwise_valid_mask(valid_mask, "y"))
     return 0.5 * (loss_x + loss_y)
+
+
+def soft_bidirectional_unimodality_loss(
+    focal_posterior: torch.Tensor,
+    evidence_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Penalize mass that increases away from the detached modal focal plane."""
+    if focal_posterior.shape[1] < 3:
+        return focal_posterior.new_tensor(0.0)
+    mode = focal_posterior.detach().argmax(dim=1, keepdim=True)
+    indices = torch.arange(focal_posterior.shape[1], device=focal_posterior.device).view(1, -1, 1, 1)
+    left = indices < mode
+    right = indices >= mode
+    diffs = focal_posterior[:, 1:] - focal_posterior[:, :-1]
+    left_bad = diffs.clamp(max=0).abs() * left[:, 1:].to(dtype=focal_posterior.dtype)
+    right_bad = diffs.clamp(min=0) * right[:, 1:].to(dtype=focal_posterior.dtype)
+    penalty = (left_bad + right_bad).sum(dim=1, keepdim=True)
+    if evidence_mask is not None:
+        evidence_mask = evidence_mask.to(device=penalty.device, dtype=penalty.dtype)
+        if evidence_mask.dim() == 3:
+            evidence_mask = evidence_mask.unsqueeze(1)
+        return (penalty * evidence_mask).sum() / evidence_mask.sum().clamp(min=1.0)
+    return penalty.mean()
 
 
 def _focal_axis_smoothness_loss(focal_posterior: torch.Tensor) -> torch.Tensor:
@@ -438,14 +481,12 @@ class FocalStackGenerationLoss(nn.Module):
                 depth_prior_resized = F.interpolate(generated_depth_canonical, size=depth_target.shape[-2:], mode="bilinear", align_corners=False)
                 losses["loss_depth_prior"] = self._masked_mean(torch.abs(depth_prior_resized - depth_gt_norm), mask)
             if focal_posterior is not None and focal_plane_distances is not None:
-                posterior_resized = focal_posterior
-                if posterior_resized.shape[-2:] != depth_target.shape[-2:]:
-                    posterior_resized = F.interpolate(posterior_resized, size=depth_target.shape[-2:], mode="bilinear", align_corners=False)
-                    posterior_resized = posterior_resized / posterior_resized.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                posterior_resized = resize_probability_volume(focal_posterior, depth_target.shape[-2:])
                 focus_target = None
                 if self.focal_target_type == "normalized":
+                    depth_focal_coordinates = metric_depth_to_focal_coordinates(depth_target, focal_plane_distances)
                     focus_target, _ = build_focal_axis_soft_targets(
-                        depth_gt_norm,
+                        depth_focal_coordinates,
                         focal_plane_distances,
                         temperature=self.focus_target_temperature,
                     )
@@ -571,6 +612,16 @@ class FocalStackGenerationLoss(nn.Module):
             losses["loss_focal_axis_smoothness"] = _focal_axis_smoothness_loss(
                 posterior_for_reg,
             )
+            evidence_mask = None
+            if focal_stack is not None:
+                texture = focal_stack.detach().float().sub(focal_stack.detach().float().mean(dim=1, keepdim=True)).abs().mean(dim=(1, 2), keepdim=True)
+                evidence_mask = (texture > texture.mean(dim=(-2, -1), keepdim=True)).to(dtype=posterior_for_reg.dtype)
+                if evidence_mask.shape[-2:] != posterior_for_reg.shape[-2:]:
+                    evidence_mask = F.interpolate(evidence_mask, size=posterior_for_reg.shape[-2:], mode="nearest")
+            losses["loss_focal_axis_unimodality"] = soft_bidirectional_unimodality_loss(
+                posterior_for_reg,
+                evidence_mask=evidence_mask,
+            )
 
         if physical_verification_trace is not None:
             trace_outputs = self.trace_loss(
@@ -614,6 +665,10 @@ class FocalStackGenerationLoss(nn.Module):
         )
         total = total + self.focal_axis_smoothness_weight * losses.get(
             "loss_focal_axis_smoothness",
+            torch.zeros_like(total),
+        )
+        total = total + self.focal_axis_smoothness_weight * losses.get(
+            "loss_focal_axis_unimodality",
             torch.zeros_like(total),
         )
         total = total + losses.get("loss_trace", torch.zeros_like(total))

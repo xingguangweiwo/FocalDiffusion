@@ -105,35 +105,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def _build_stub_pipeline():
-    class _StubPipeline:
-        def __init__(self) -> None:
-            self.device = "cpu"
-            self.config: dict[str, Any] = {}
-
-        def to(self, device: Any):
-            self.device = device
-            return self
-
-        def register_to_config(self, **kwargs: Any) -> None:
-            self.config.update(kwargs)
-
-    return _StubPipeline()
-
-
-def _run_stub_training(config: dict, reason: str) -> None:
-    logger.warning("%s; running stub training", reason)
-    logger.info(
-        "Config summary: model=%s dataset=%s batch_size=%s",
-        config.get('model', {}).get('base_model_id'),
-        config.get('data', {}).get('dataset_type'),
-        config.get('training', {}).get('batch_size'),
-    )
-    pipeline = _build_stub_pipeline()
-    pipeline.register_to_config(model=config.get('model', {}))
-    pipeline.to("cpu")
-    logger.info("Stub training completed")
-
 
 @lru_cache(maxsize=None)
 def _read_config_document(path: str) -> dict:
@@ -178,8 +149,25 @@ def load_config(config_path: str, _visited: Optional[set] = None) -> dict:
 
     _visited.remove(config_path)
 
-    return config
+    return _migrate_protocol_config(config)
 
+
+
+def _migrate_protocol_config(config: dict) -> dict:
+    """Migrate legacy self_improvement keys to unsupervised_adaptation keys."""
+    data_cfg = config.setdefault("data", {})
+    legacy_sources = data_cfg.pop("self_improvement_sources", None)
+    if "adaptation_sources" not in data_cfg and legacy_sources is not None:
+        data_cfg["adaptation_sources"] = legacy_sources
+    training_cfg = config.setdefault("training", {})
+    legacy_cfg = training_cfg.pop("self_improvement", None)
+    if "unsupervised_adaptation" not in training_cfg and legacy_cfg is not None:
+        training_cfg["unsupervised_adaptation"] = legacy_cfg
+    protocol = config.setdefault("protocol", {})
+    protocol.setdefault("source_name", "source_training")
+    protocol.setdefault("adaptation_name", "unsupervised_target_adaptation")
+    protocol.setdefault("threshold_selection", "source_val_only")
+    return config
 
 def _resolve_default_path(entry: Any, config_dir: Path) -> Path:
     """Convert a defaults entry into an absolute path to a YAML file."""
@@ -234,7 +222,7 @@ def _resolve_paths_inplace(config: dict, base_dir: Path) -> None:
             if key in data_block:
                 data_block[key] = _resolve(data_block[key])
 
-        for sources_key in ("train_sources", "self_improvement_sources", "val_sources", "test_sources"):
+        for sources_key in ("train_sources", "adaptation_sources", "self_improvement_sources", "val_sources", "test_sources"):
             sources = data_block.get(sources_key)
             if not isinstance(sources, list):
                 continue
@@ -272,7 +260,7 @@ def _unit_group(unit: str) -> frozenset[str]:
 def _validate_coordinate_protocols(data_cfg: dict) -> None:
     """Ensure every source declares coordinate semantics and only compatible protocols are grouped."""
     grouped: dict[str, list[tuple[str, str, str]]] = {}
-    for split_key in ("train_sources", "self_improvement_sources", "val_sources", "test_sources"):
+    for split_key in ("train_sources", "adaptation_sources", "self_improvement_sources", "val_sources", "test_sources"):
         for source in data_cfg.get(split_key, []) or []:
             name = str(source.get("name", f"{split_key}_source"))
             missing = [key for key in ("focal_coordinate_type", "focal_coordinate_unit", "depth_coordinate_type", "camera_calibration") if key not in source]
@@ -288,8 +276,16 @@ def _validate_coordinate_protocols(data_cfg: dict) -> None:
             if depth_type not in _DEPTH_COORDINATE_TYPES:
                 raise ValueError(f"Unsupported depth_coordinate_type for {name}: {depth_type}")
             evaluation_mode = str(source.get("evaluation_mode", data_cfg.get("evaluation_mode", "canonical")))
+            if evaluation_mode not in {"canonical", "calibrated"}:
+                raise ValueError(f"Unsupported evaluation_mode for {name}: {evaluation_mode}")
             if evaluation_mode == "calibrated" and not bool(source.get("camera_calibration")):
                 raise ValueError(f"calibrated evaluation requires camera_calibration for {name}")
+            metric_focal = coord_type in {"distance", "inverse_distance", "diopter"}
+            canonical_depth = depth_type in {"canonical", "normalized_rank"}
+            if evaluation_mode == "calibrated" and (not metric_focal or canonical_depth):
+                raise ValueError(f"calibrated evaluation for {name} requires metric focal coordinates and metric depth semantics")
+            if evaluation_mode == "canonical" and bool(source.get("camera_calibration")) and depth_type == "metric_depth" and not metric_focal:
+                raise ValueError(f"metric depth with camera calibration for {name} requires metric focal coordinates")
             grouped.setdefault(split_key, []).append((coord_type, unit, name))
     for split_key, protocols in grouped.items():
         if not protocols:
@@ -344,11 +340,14 @@ def _check_split_identity_isolation(data_cfg: dict) -> None:
     """Reject train/adapt/test overlap by sample ID, scene/sequence, or image hash."""
     split_identities = {
         "train": _read_filelist_identity_sets(data_cfg.get("train_sources", [])),
-        "adapt": _read_filelist_identity_sets(data_cfg.get("self_improvement_sources", [])),
+        "adapt": _read_filelist_identity_sets(data_cfg.get("adaptation_sources", [])),
         "test": _read_filelist_identity_sets(data_cfg.get("test_sources", [])),
     }
-    for left, right in (("train", "adapt"), ("train", "test"), ("adapt", "test")):
+    comparisons = (("adapt", "test", ("sample_ids", "image_hashes")), ("train", "adapt", ("sample_ids", "image_hashes")), ("train", "test", ("sample_ids", "image_hashes")))
+    for left, right, fields in comparisons:
         for field, label in (("sample_ids", "sample ID"), ("scenes", "scene/sequence"), ("image_hashes", "duplicate image hash")):
+            if field not in fields:
+                continue
             overlap = split_identities[left][field] & split_identities[right][field]
             if overlap:
                 preview = ", ".join(sorted(overlap)[:5])
@@ -514,9 +513,13 @@ def validate_config(config: dict) -> None:
             value = value[key]
 
     data_cfg = config.get('data', {})
-    has_sources = any(key in data_cfg for key in ('train_sources', 'self_improvement_sources', 'val_sources', 'test_sources'))
+    adaptation_enabled = bool(config.get('training', {}).get('unsupervised_adaptation', {}).get('enabled', False))
+    has_sources = any(key in data_cfg for key in ('train_sources', 'adaptation_sources', 'val_sources', 'test_sources'))
     if has_sources:
-        for split_key in ('train_sources', 'self_improvement_sources', 'val_sources', 'test_sources'):
+        required_splits = ['train_sources', 'val_sources', 'test_sources']
+        if adaptation_enabled or data_cfg.get('adaptation_sources'):
+            required_splits.append('adaptation_sources')
+        for split_key in required_splits:
             sources = data_cfg.get(split_key)
             if sources is None:
                 raise ValueError(f"Missing required config key: data.{split_key}")
@@ -530,12 +533,12 @@ def validate_config(config: dict) -> None:
                 if 'filelist' not in source:
                     raise ValueError(f"data.{split_key} entry is missing filelist")
 
-        adapt_files = {str(source.get('filelist')) for source in data_cfg.get('self_improvement_sources', [])}
+        adapt_files = {str(source.get('filelist')) for source in data_cfg.get('adaptation_sources', [])}
         test_files = {str(source.get('filelist')) for source in data_cfg.get('test_sources', [])}
         if adapt_files & test_files:
-            raise ValueError("data.self_improvement_sources must not overlap data.test_sources")
-        if not adapt_files:
-            raise ValueError("data.self_improvement_sources must be a non-empty list when source-style data config is used")
+            raise ValueError("data.adaptation_sources must not overlap data.test_sources")
+        if adaptation_enabled and not adapt_files:
+            raise ValueError("data.adaptation_sources must be a non-empty list when unsupervised adaptation is enabled")
         _validate_coordinate_protocols(data_cfg)
         _check_split_identity_isolation(data_cfg)
     else:
@@ -552,7 +555,7 @@ def validate_config(config: dict) -> None:
 
     # Check paths exist
     if has_sources:
-        for split_key in ('train_sources', 'self_improvement_sources', 'val_sources', 'test_sources'):
+        for split_key in ('train_sources', 'val_sources', 'test_sources') + (('adaptation_sources',) if (adaptation_enabled or data_cfg.get('adaptation_sources')) else ()):
             sources = data_cfg.get(split_key) or []
             for source in sources:
                 resolved_root = _resolve_data_root_spec(
@@ -632,27 +635,19 @@ def main():
             "Dry run mode - validating configuration and path resolution only; "
             "model loading, dataloader construction, forward, loss, and backward are not executed."
         )
-        pipeline = _build_stub_pipeline()
-        pipeline.to("cpu")
         logger.info("Dry run successful (configuration-only)")
         return
 
     # Create trainer
     logger.info("Initializing FocalStackGeneration trainer...")
-    try:
-        from src.training.trainer import FocalStackGenerationTrainer  # Lazy import to avoid heavy deps during dry-runs
-    except ModuleNotFoundError as exc:
-        if getattr(exc, "name", None) == "torch":
-            _run_stub_training(config, "PyTorch is not available")
-            return
-        raise
+    from src.training.trainer import FocalStackGenerationTrainer  # Lazy import to avoid heavy deps during dry-runs
 
     trainer = FocalStackGenerationTrainer(config)
 
-    self_improvement_cfg = config.get("training", {}).get("self_improvement", {}) or {}
-    parent_checkpoint = self_improvement_cfg.get("parent_checkpoint")
-    if self_improvement_cfg.get("enabled") and parent_checkpoint and not args.resume:
-        logger.info("Initializing M%s from parent checkpoint: %s", self_improvement_cfg.get("round_index", 1), parent_checkpoint)
+    unsupervised_adaptation_cfg = config.get("training", {}).get("unsupervised_adaptation", {}) or {}
+    parent_checkpoint = unsupervised_adaptation_cfg.get("parent_checkpoint")
+    if unsupervised_adaptation_cfg.get("enabled") and parent_checkpoint and not args.resume:
+        logger.info("Initializing M%s from parent checkpoint: %s", unsupervised_adaptation_cfg.get("round_index", 1), parent_checkpoint)
         trainer.load_checkpoint(parent_checkpoint)
 
     # Resume if specified

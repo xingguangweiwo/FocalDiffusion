@@ -1,5 +1,4 @@
 import pytest
-import math
 import torch
 
 from src.models import FocalStackProcessor
@@ -521,3 +520,119 @@ def test_trace_refinement_accepts_only_when_risk_improves_by_epsilon():
 
     assert FocalStackGenerationPipeline._should_accept_refinement(current_risk, improved_risk, epsilon=0.01)
     assert not FocalStackGenerationPipeline._should_accept_refinement(current_risk, marginal_risk, epsilon=0.01)
+
+def test_canonical_focal_coordinates_are_shared_across_components():
+    from src.models.focal_evidence_encoder import FocusLikelihoodEstimator
+    from src.models.focal_processor import FocalSweepEncoder
+    from src.models.physics_modules import DefocusConsistencyVerifier
+    from src.training.losses import normalize_focal_coordinates
+    from src.utils.image_utils import canonical_focal_coordinates
+
+    distances = torch.tensor([[2.0, 4.0, 8.0], [1.0, 3.0, 5.0]])
+    expected, valid = canonical_focal_coordinates(distances, coordinate_type="distance")
+    assert valid.all()
+    assert torch.allclose(FocusLikelihoodEstimator(hidden=8)._normalize_focal_plane_distances(distances), expected)
+    assert torch.allclose(FocalSweepEncoder.normalize_focal_plane_distances(distances), expected)
+    assert torch.allclose(
+        DefocusConsistencyVerifier._normalize_focal_distances(distances, 2, 3, distances.device, distances.dtype),
+        expected,
+    )
+    assert torch.allclose(normalize_focal_coordinates(distances), expected)
+
+    inverse, _ = canonical_focal_coordinates(distances, coordinate_type="diopter")
+    zpos, _ = canonical_focal_coordinates(distances, coordinate_type="z_position")
+    index, _ = canonical_focal_coordinates(distances, coordinate_type="index")
+    rank, _ = canonical_focal_coordinates(distances, coordinate_type="normalized_rank")
+    metric, _ = canonical_focal_coordinates(distances, coordinate_type="distance", metric_coordinates=distances)
+    assert inverse.shape == zpos.shape == index.shape == rank.shape == metric.shape == distances.shape
+    assert torch.allclose(zpos, expected)
+    assert torch.allclose(metric, expected)
+
+
+def test_image_range_helpers_match_legacy_split_and_pipeline_tensor_ingest():
+    from src.models.physics_modules import _split_unit_and_signed_ranges
+    from src.pipelines.focal_stack_generation_pipeline import FocalStackGenerationPipeline
+    from src.utils.image_utils import to_model_range, to_unit_range
+
+    unit = torch.rand(1, 3, 3, 4, 4)
+    signed = unit * 2.0 - 1.0
+    assert torch.allclose(to_unit_range(signed), unit)
+    assert torch.allclose(to_model_range(unit), signed)
+    legacy_unit, legacy_signed = _split_unit_and_signed_ranges(signed)
+    assert torch.allclose(legacy_unit, unit)
+    assert torch.allclose(legacy_signed, signed)
+    assert torch.allclose(FocalStackGenerationPipeline._ensure_tensor_stack(None, unit.squeeze(0)), signed)
+
+
+def test_resize_probability_volume_masks_and_rejects_all_invalid():
+    from src.utils.image_utils import resize_probability_volume
+
+    posterior = torch.ones(2, 3, 2, 2)
+    mask = torch.tensor([[True, False, True], [False, True, True]])
+    resized = resize_probability_volume(posterior, (4, 4), mask)
+    assert resized.shape == (2, 3, 4, 4)
+    assert torch.all(resized[:, 0] >= 0)
+    assert torch.allclose(resized.sum(dim=1), torch.ones(2, 4, 4))
+    assert torch.all(resized[0, 1] == 0)
+    with pytest.raises(ValueError, match="all-invalid"):
+        resize_probability_volume(posterior[:1], (2, 2), torch.tensor([[False, False, False]]))
+
+
+def test_compatibility_aliases_and_checkpoint_keys_are_preserved():
+    from src.models.focal_evidence import FocalEvidenceEncoder, FocusLikelihoodEstimator
+    from src.pipelines import FocalDiffusionOutput, FocalDiffusionPipeline, FocalStackGenerationOutput, FocalStackGenerationPipeline
+
+    assert FocalEvidenceEncoder is FocusLikelihoodEstimator
+    assert issubclass(FocalDiffusionOutput, FocalStackGenerationOutput)
+    assert issubclass(FocalDiffusionPipeline, FocalStackGenerationPipeline)
+
+    checkpoint = {
+        "focal_processor_state_dict": {},
+        "focal_evidence_head_state_dict": {},
+        "task_output_decoder_state_dict": {},
+        "physical_evidence_support_head_state_dict": {},
+        "optimizer_state_dict": {},
+        "scheduler_state_dict": {},
+        "epoch": 0,
+        "global_step": 0,
+    }
+    assert "focal_evidence_head_state_dict" in checkpoint
+    assert "physical_evidence_support_head_state_dict" in checkpoint
+
+
+def test_legacy_checkpoint_keys_load_through_migration_aliases(tmp_path):
+    from types import SimpleNamespace
+    from src.training.checkpointing import load_checkpoint
+
+    class EmptyModule(torch.nn.Module):
+        pass
+
+    class DummyState:
+        def load_state_dict(self, state):
+            self.state = state
+
+    checkpoint = {
+        "focal_processor_state_dict": {},
+        "focal_evidence_head_state_dict": {"legacy.extra": torch.tensor(1.0)},
+        "task_output_decoder_state_dict": {"legacy.decoder": torch.tensor(2.0)},
+        "physical_evidence_support_head_state_dict": {"legacy.support": torch.tensor(3.0)},
+        "optimizer_state_dict": {"state": {}, "param_groups": []},
+        "scheduler_state_dict": {"last_epoch": 0},
+        "epoch": 7,
+        "global_step": 42,
+    }
+    path = tmp_path / "legacy.pt"
+    torch.save(checkpoint, path)
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(device="cpu"),
+        focal_processor=EmptyModule(),
+        focal_evidence_head=EmptyModule(),
+        task_output_decoder=EmptyModule(),
+        physical_evidence_support_head=EmptyModule(),
+        optimizer=DummyState(),
+        lr_scheduler=DummyState(),
+        ema=None,
+        pipeline=SimpleNamespace(transformer=EmptyModule()),
+    )
+    epoch, step = load_checkpoint(trainer, str(path))
+    assert (epoch, step) == (7, 42)
