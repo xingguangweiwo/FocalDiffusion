@@ -53,7 +53,7 @@ class FocusMeasureBank(nn.Module):
         flat = gray.reshape(batch * planes, 1, height, width)
         return F.conv2d(flat, kernel.to(device=gray.device, dtype=gray.dtype), padding=1).reshape(batch, planes, 1, height, width)
 
-    def forward(self, focal_stack: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_valid_mask: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
         """Return focus posterior and operator scores for a focal stack."""
         self._validate_stack(focal_stack)
         gray = focal_stack.mean(dim=2, keepdim=True)
@@ -70,8 +70,17 @@ class FocusMeasureBank(nn.Module):
             local_mean_abs = (gray - F.avg_pool3d(gray, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1))).abs()
             measures = torch.cat([gradient_l1, local_var, local_mean_abs], dim=2)
         plane_scores = measures.mean(dim=2)
-        normalized_scores = plane_scores / plane_scores.amax(dim=1, keepdim=True).clamp(min=self.eps)
-        posterior = torch.softmax(normalized_scores / 0.1, dim=1)
+        if focal_plane_valid_mask is None:
+            focal_plane_valid_mask = torch.ones((focal_stack.shape[0], focal_stack.shape[1]), device=focal_stack.device, dtype=torch.bool)
+        else:
+            focal_plane_valid_mask = focal_plane_valid_mask.to(device=focal_stack.device, dtype=torch.bool)
+            if focal_plane_valid_mask.dim() == 1:
+                focal_plane_valid_mask = focal_plane_valid_mask.unsqueeze(0).expand(focal_stack.shape[0], -1)
+        normalized_scores = plane_scores / plane_scores.masked_fill(~focal_plane_valid_mask[:, :, None, None], 0.0).amax(dim=1, keepdim=True).clamp(min=self.eps)
+        masked_scores = normalized_scores.masked_fill(~focal_plane_valid_mask[:, :, None, None], -torch.finfo(normalized_scores.dtype).max / 4)
+        posterior = torch.softmax(masked_scores / 0.1, dim=1)
+        posterior = posterior * focal_plane_valid_mask[:, :, None, None].to(dtype=posterior.dtype)
+        posterior = posterior / posterior.sum(dim=1, keepdim=True).clamp(min=self.eps)
         topk = torch.topk(posterior, k=min(2, posterior.shape[1]), dim=1).values
         peak = topk[:, 0:1]
         peak_index = posterior.argmax(dim=1, keepdim=True)
@@ -104,18 +113,19 @@ class DefocusConsistencyVerifier(nn.Module):
         self.renderer = SyntheticFocalStackRenderer(max_sigma=float(self.max_blur_radius), num_blur_levels=4)
 
     @staticmethod
-    def _normalize_focal_distances(focal_plane_distances: torch.Tensor, batch: int, planes: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _normalize_focal_distances(focal_plane_distances: torch.Tensor, batch: int, planes: int, device: torch.device, dtype: torch.dtype, focal_plane_valid_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Return canonical focal coordinates shared by all focus components."""
         coords, _ = canonical_focal_coordinates(
             focal_plane_distances.to(device=device, dtype=dtype),
             batch_size=batch,
             coordinate_type="distance",
+            focal_plane_valid_mask=focal_plane_valid_mask,
         )
         if coords.shape != (batch, planes):
             raise ValueError(f"focal_plane_distances must have shape [B, K] or [K], got {tuple(focal_plane_distances.shape)}")
         return coords
 
-    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor, focal_plane_valid_mask: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
         """Return residual maps from defocus rendering consistency checks."""
         FocusMeasureBank._validate_stack(focal_stack)
         batch, planes, _, height, width = focal_stack.shape
@@ -125,10 +135,18 @@ class DefocusConsistencyVerifier(nn.Module):
         depth = F.interpolate(depth_canonical, size=(height, width), mode="bilinear", align_corners=False).clamp(0.0, 1.0)
         all_in_focus_unit = to_unit_range(all_in_focus)
         aif = F.interpolate(all_in_focus_unit, size=(height, width), mode="bilinear", align_corners=False)
-        coords = self._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype)
+        coords = self._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype, focal_plane_valid_mask)
         sigma = (depth[:, None, 0] - coords[:, :, None, None]).abs().clamp(0.0, 1.0) * float(self.max_blur_radius)
         rendered = self.renderer.render_from_sigma(aif, sigma)
-        stack_reprojection_residual = (rendered - focal_stack_unit).abs().mean(dim=2).mean(dim=1, keepdim=True).clamp(0.0, 1.0)
+        residual_per_plane = (rendered - focal_stack_unit).abs().mean(dim=2)
+        if focal_plane_valid_mask is not None:
+            valid = focal_plane_valid_mask.to(device=focal_stack.device, dtype=residual_per_plane.dtype)
+            if valid.dim() == 1:
+                valid = valid.unsqueeze(0).expand(batch, -1)
+            stack_reprojection_residual = (residual_per_plane * valid[:, :, None, None]).sum(dim=1, keepdim=True) / valid.sum(dim=1).clamp(min=1.0).view(batch, 1, 1, 1)
+        else:
+            stack_reprojection_residual = residual_per_plane.mean(dim=1, keepdim=True)
+        stack_reprojection_residual = stack_reprojection_residual.clamp(0.0, 1.0)
         return {"stack_reprojection_residual": stack_reprojection_residual, "rendered_stack": rendered}
 
 
@@ -157,11 +175,11 @@ class FocalConsistencyEvaluator(nn.Module):
             "defocus_eps": float(self.defocus_verifier.eps),
         }
 
-    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor, generated_depth_canonical: torch.Tensor | None = None) -> FocalConsistencyTrace:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, depth_canonical: torch.Tensor, all_in_focus: torch.Tensor, generated_depth_canonical: torch.Tensor | None = None, focal_plane_valid_mask: torch.Tensor | None = None) -> FocalConsistencyTrace:
         """Compute a batch-first physical verification trace for FocalTrace."""
-        focus = self.focus_bank(focal_stack)
+        focus = self.focus_bank(focal_stack, focal_plane_valid_mask=focal_plane_valid_mask)
         batch, planes = focal_stack.shape[:2]
-        coords = DefocusConsistencyVerifier._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype)
+        coords = DefocusConsistencyVerifier._normalize_focal_distances(focal_plane_distances, batch, planes, focal_stack.device, focal_stack.dtype, focal_plane_valid_mask)
         focus_depth = (focus["focus_posterior"] * coords[:, :, None, None]).sum(dim=1, keepdim=True)
         focus_peak_coordinate = torch.gather(
             coords[:, :, None, None].expand(-1, -1, focus_depth.shape[-2], focus_depth.shape[-1]),
@@ -170,16 +188,20 @@ class FocalConsistencyEvaluator(nn.Module):
         )
         depth = F.interpolate(depth_canonical if depth_canonical.dim() == 4 else depth_canonical.unsqueeze(1), size=focus_depth.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
         prior = depth if generated_depth_canonical is None else F.interpolate(generated_depth_canonical if generated_depth_canonical.dim() == 4 else generated_depth_canonical.unsqueeze(1), size=focus_depth.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
-        residuals = self.defocus_verifier(focal_stack, focal_plane_distances, depth, all_in_focus)
+        residuals = self.defocus_verifier(focal_stack, focal_plane_distances, depth, all_in_focus, focal_plane_valid_mask=focal_plane_valid_mask)
         discrepancy = (depth - focus_depth).abs().clamp(0.0, 1.0)
         generation_discrepancy = (prior - focus_depth).abs().clamp(0.0, 1.0)
-        focus_support = (focus["focus_peak_confidence"] * focus["focus_margin"] * (1.0 - focus["focus_entropy"]) * focus["operator_agreement"] * focus["texture_confidence"]).clamp(0.0, 1.0)
-        physical_penalty = torch.maximum(discrepancy, residuals["stack_reprojection_residual"])
-        generation_support = ((1.0 - generation_discrepancy) * (1.0 - residuals["stack_reprojection_residual"])).clamp(0.0, 1.0)
-        conflict_score = torch.maximum(discrepancy, generation_discrepancy).clamp(0.0, 1.0)
-        invalid_score = torch.maximum(focus["focus_entropy"], residuals["stack_reprojection_residual"]).clamp(0.0, 1.0)
-        support_score = focus_support + generation_support - physical_penalty
-        verdict_scores = torch.cat([support_score, conflict_score, invalid_score], dim=1)
+        focus_identifiability = (0.30 * focus["texture_confidence"] + 0.25 * focus["operator_agreement"] + 0.25 * focus["focus_margin"] + 0.20 * (1.0 - focus["focus_entropy"])).clamp(0.0, 1.0)
+        measurement_residual = residuals["stack_reprojection_residual"].clamp(0.0, 1.0)
+        prior_disagreement = generation_discrepancy
+        model_mismatch_score = torch.maximum(measurement_residual, focus["focus_entropy"]).clamp(0.0, 1.0)
+        abstention_evidence = torch.maximum(model_mismatch_score, torch.minimum(discrepancy, prior_disagreement)).clamp(0.0, 1.0)
+        focus_support = (0.5 * focus_identifiability + 0.5 * (1.0 - discrepancy)).clamp(0.0, 1.0)
+        generation_support = (0.5 * (1.0 - prior_disagreement) + 0.5 * (1.0 - measurement_residual)).clamp(0.0, 1.0)
+        conflict_score = torch.maximum(discrepancy, prior_disagreement).clamp(0.0, 1.0)
+        invalid_score = abstention_evidence
+        diagnostic_logits = torch.cat([focus_support, conflict_score, invalid_score], dim=1)
+        verdict_scores = diagnostic_logits
         return FocalConsistencyTrace(
             focus_peak_confidence=focus["focus_peak_confidence"],
             focus_peak_index=focus["focus_peak_index"],
@@ -195,6 +217,13 @@ class FocalConsistencyEvaluator(nn.Module):
             conflict_score=conflict_score,
             invalid_score=invalid_score,
             verdict_scores=verdict_scores,
+            focus_identifiability=focus_identifiability,
+            focus_depth_disagreement=discrepancy,
+            measurement_residual=measurement_residual,
+            prior_disagreement=prior_disagreement,
+            model_mismatch_score=model_mismatch_score,
+            abstention_evidence=abstention_evidence,
+            diagnostic_logits=diagnostic_logits,
         )
 
 

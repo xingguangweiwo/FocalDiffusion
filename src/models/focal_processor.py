@@ -42,28 +42,30 @@ class FocalSweepEncoder(nn.Module):
         x = tau.unsqueeze(-1) * freq * math.pi
         return torch.cat([torch.sin(x), torch.cos(x)], dim=-1)
 
-    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, focal_plane_valid_mask: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
         B, N, _, H, W = focal_stack.shape
         x = focal_stack.reshape(B * N, 3, H, W)
         tokens_2d = self.patch_embed(x)
         h, w = tokens_2d.shape[-2:]
         tokens = tokens_2d.flatten(2).transpose(1, 2).view(B, N, h * w, self.feature_dim)
 
-        tau = self.normalize_focal_plane_distances(focal_plane_distances)
+        tau, valid = canonical_focal_coordinates(focal_plane_distances, batch_size=B, coordinate_type="distance", focal_plane_valid_mask=focal_plane_valid_mask)
         tau_tokens = self.tau_embed(self.fourier_embed(tau)).unsqueeze(2)
         tokens = tokens + tau_tokens
 
         tokens = tokens.permute(0, 2, 1, 3).contiguous().view(B * h * w, N, self.feature_dim)
         for layer in self.layers:
-            tokens = layer(tokens)
+            tokens = layer(tokens, src_key_padding_mask=~valid[:, None, :].expand(B, h * w, N).reshape(B * h * w, N))
 
         query = self.surface_query.expand(tokens.shape[0], -1, -1)
-        fused, attn = self.query_attn(query, tokens, tokens, need_weights=True)
+        key_padding_mask = ~valid[:, None, :].expand(B, h * w, N).reshape(B * h * w, N)
+        fused, attn = self.query_attn(query, tokens, tokens, key_padding_mask=key_padding_mask, need_weights=True)
         fused = fused.squeeze(1).view(B, h, w, self.feature_dim).permute(0, 3, 1, 2).contiguous()
         attn = attn.squeeze(1).view(B, h, w, N).permute(0, 3, 1, 2).contiguous()
+        attn = attn * valid[:, :, None, None].to(dtype=attn.dtype)
         frame_weights = attn.mean(dim=(-2, -1))
 
-        return {"fused_features": fused, "tau": tau, "attention_weights": frame_weights, "temporal_attention_maps": attn}
+        return {"fused_features": fused, "tau": tau, "attention_weights": frame_weights, "temporal_attention_maps": attn, "focal_plane_valid_mask": valid}
 
 
 class FocalStackProcessor(nn.Module):
@@ -94,10 +96,10 @@ class FocalStackProcessor(nn.Module):
             depth=focal_attention_depth,
         )
 
-    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, focal_stack: torch.Tensor, focal_plane_distances: torch.Tensor, focal_plane_valid_mask: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
         """Process a focal stack into SD3 conditioning features."""
         B, N, C, H, W = focal_stack.shape
         del B, C, H, W
         if N > self.max_sequence_length:
             raise ValueError(f"Sequence length {N} exceeds maximum {self.max_sequence_length}")
-        return self.focal_sweep_encoder(focal_stack, focal_plane_distances)
+        return self.focal_sweep_encoder(focal_stack, focal_plane_distances, focal_plane_valid_mask=focal_plane_valid_mask)

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "focaldiffusion"
 version = "0.1.0"
-description = "All-in-focus image and metric depth recovery from focal stacks."
+description = "All-in-focus image and canonical focal-depth recovery from focal stacks; metric depth is available only in calibrated mode."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

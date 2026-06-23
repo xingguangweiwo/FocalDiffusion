@@ -17,6 +17,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+CHECKPOINT_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 2
+
+
+def migrate_checkpoint_schema(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate legacy checkpoints to the active FocalTrace schema in-memory."""
+    migrated = dict(checkpoint)
+    migrated.setdefault("checkpoint_schema_version", CHECKPOINT_SCHEMA_VERSION)
+    if "physical_evidence_support_head_state_dict" in migrated and "reliability_head_state_dict" not in migrated:
+        migrated["reliability_head_state_dict"] = migrated["physical_evidence_support_head_state_dict"]
+    if "focal_evidence_head_state_dict" in migrated and "focus_likelihood_state_dict" not in migrated:
+        migrated["focus_likelihood_state_dict"] = migrated["focal_evidence_head_state_dict"]
+    return migrated
+
+
+def migrate_config_schema(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate legacy config keys to active FocalTrace names without mutating input."""
+    migrated = dict(config)
+    model = dict(migrated.get("model", {}))
+    key_map = {
+        "focal_evidence_hidden": "focus_likelihood_hidden_dim",
+        "focal_evidence_temperature": "focus_likelihood_temperature",
+        "physical_evidence_support_hidden": "reliability_hidden_dim",
+    }
+    for old, new in key_map.items():
+        if old in model and new not in model:
+            model[new] = model[old]
+    migrated["model"] = model
+    migrated.setdefault("config_schema_version", CONFIG_SCHEMA_VERSION)
+    return migrated
+
 _FOCAL_MODULE_ATTRS = (
     'focal_processor',
     'focal_evidence_head',
@@ -120,8 +151,8 @@ def _build_focal_modules_from_config(config: Optional[Dict[str, Any]], vae: torc
     This avoids shape mismatches when inference checkpoints were trained with
     non-default focal-module dimensions such as ``feature_dim=128``.
     """
-    from ..models.task_output_decoder import TaskOutputDecoder
-    from ..models.focal_evidence_encoder import FocalEvidenceEncoder, PhysicalEvidenceEstimator
+    from ..models.task_output_decoder import JointReconstructionDecoder
+    from ..models.focal_evidence_encoder import FocusLikelihoodEstimator, ReliabilityFusionHead
     from ..models.focal_processor import FocalStackProcessor
 
     model_config = _model_config(config)
@@ -136,15 +167,15 @@ def _build_focal_modules_from_config(config: Optional[Dict[str, Any]], vae: torc
             focal_attention_heads=int(model_config.get('focal_attention_heads', 8)),
             focal_attention_depth=int(model_config.get('focal_attention_depth', 2)),
         ),
-        'focal_evidence_head': FocalEvidenceEncoder(
+        'focal_evidence_head': FocusLikelihoodEstimator(
             hidden=int(model_config.get('focal_evidence_hidden', 48)),
             temperature=float(model_config.get('focal_evidence_temperature', 0.07)),
         ),
-        'physical_evidence_support_head': PhysicalEvidenceEstimator(
-            in_channels=5,
+        'physical_evidence_support_head': ReliabilityFusionHead(
+            in_channels=8,
             hidden=int(model_config.get('physical_evidence_support_hidden', 16)),
         ),
-        'task_output_decoder': TaskOutputDecoder(
+        'task_output_decoder': JointReconstructionDecoder(
             in_channels=latent_channels,
             out_channels_depth=1,
             out_channels_rgb=latent_channels,

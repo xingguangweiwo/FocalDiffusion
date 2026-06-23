@@ -119,6 +119,52 @@ def canonical_focal_coordinates(
     return (coords - mn) / (mx - mn).clamp(min=eps), valid
 
 
+
+def metric_depth_to_canonical_depth(
+        metric_depth: torch.Tensor,
+        focus_near: torch.Tensor | float,
+        focus_far: torch.Tensor | float,
+        *,
+        coordinate_type: str = "distance",
+        boundary_eps: float = 1e-3,
+        eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Map metric depth into the canonical focal-sweep coordinate.
+
+    The canonical coordinate is ``normalize(g(depth), g(focus_near),
+    g(focus_far))`` where ``g`` is metric distance, inverse distance
+    (diopter), or normalized rank. The returned masks identify pixels inside
+    the represented sweep and close to each sweep boundary.
+    """
+    depth = torch.as_tensor(metric_depth)
+    near = torch.as_tensor(focus_near, device=depth.device, dtype=depth.dtype)
+    far = torch.as_tensor(focus_far, device=depth.device, dtype=depth.dtype)
+    while near.dim() < depth.dim():
+        near = near.unsqueeze(-1)
+    while far.dim() < depth.dim():
+        far = far.unsqueeze(-1)
+
+    coord_type = coordinate_type.lower().replace("-", "_")
+    if coord_type in {"distance", "z_position", "z"}:
+        value, lo, hi = depth, near, far
+    elif coord_type in {"inverse_distance", "diopter", "diopters"}:
+        value = 1.0 / depth.clamp(min=eps)
+        lo = 1.0 / far.clamp(min=eps)
+        hi = 1.0 / near.clamp(min=eps)
+    elif coord_type in {"normalized_rank", "rank", "canonical"}:
+        value, lo, hi = depth, near, far
+    else:
+        raise ValueError(f"Unsupported canonical depth coordinate type: {coordinate_type}")
+
+    lower = torch.minimum(lo, hi)
+    upper = torch.maximum(lo, hi)
+    span = (upper - lower).clamp(min=eps)
+    canonical = ((value - lower) / span).clamp(0.0, 1.0)
+    within = (value >= lower) & (value <= upper) & torch.isfinite(value)
+    near_boundary = within & (((value - lower).abs() / span) <= boundary_eps)
+    far_boundary = within & (((upper - value).abs() / span) <= boundary_eps)
+    return canonical, within, near_boundary, far_boundary
+
 def resize_probability_volume(
         posterior: torch.Tensor,
         size: Tuple[int, int],
