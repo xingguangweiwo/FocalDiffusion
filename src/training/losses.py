@@ -2,12 +2,63 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ..utils.image_utils import canonical_focal_coordinates, resize_probability_volume
 
+
+
+@dataclass
+class LossInputs:
+    """Structured loss inputs grouped by scientific objective."""
+
+    diffusion_pred: torch.Tensor
+    diffusion_target: torch.Tensor
+    depth: dict[str, torch.Tensor | None] | None = None
+    aif: dict[str, torch.Tensor | None] | None = None
+    focus: dict[str, torch.Tensor | None] | None = None
+    reliability: dict[str, torch.Tensor | None] | None = None
+    consistency: object | None = None
+    masks: dict[str, torch.Tensor | None] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+def _legacy_kwargs_from_loss_inputs(inputs: LossInputs) -> dict[str, Any]:
+    """Flatten structured LossInputs for the legacy-compatible implementation."""
+    depth = inputs.depth or {}
+    aif = inputs.aif or {}
+    focus = inputs.focus or {}
+    reliability = inputs.reliability or {}
+    masks = inputs.masks or {}
+    metadata = inputs.metadata or {}
+    return {
+        "diffusion_pred": inputs.diffusion_pred,
+        "diffusion_target": inputs.diffusion_target,
+        "depth_target": depth.get("target"),
+        "generated_depth_canonical": depth.get("prior"),
+        "focal_depth_canonical": depth.get("focus"),
+        "final_depth_canonical": depth.get("final"),
+        "rgb_pred": aif.get("pred"),
+        "rgb_target": aif.get("target"),
+        "focal_posterior": focus.get("posterior"),
+        "focal_entropy": focus.get("entropy"),
+        "focal_plane_distances": metadata.get("focal_plane_distances"),
+        "focal_stack": metadata.get("focal_stack"),
+        "uncertainty": reliability.get("uncertainty"),
+        "focal_evidence_weight": reliability.get("focus_weight"),
+        "generative_prior_weight": reliability.get("prior_weight"),
+        "abstention_weight": reliability.get("abstention"),
+        "physical_evidence_support": reliability.get("support"),
+        "physical_verification_trace": inputs.consistency,
+        "depth_mask": masks.get("depth"),
+        "depth_range": metadata.get("depth_range"),
+        "camera_params": metadata.get("camera_params"),
+    }
 
 def normalize_focal_coordinates(focal_plane_distances: torch.Tensor) -> torch.Tensor:
     """Return canonical focal coordinates shared by training and inference."""
@@ -386,6 +437,7 @@ class FocalStackGenerationLoss(nn.Module):
         depth_affinity_smoothness_weight: float = 0.01,
         gate_consistency_weight: float = 0.0,
         focal_axis_smoothness_weight: float = 0.0,
+        focal_axis_unimodality_weight: float = 0.0,
         local_affinity_sigma: float = 0.10,
         lambda_trace: float = 1.0,
         lambda_violation: float = 1.0,
@@ -412,6 +464,7 @@ class FocalStackGenerationLoss(nn.Module):
         self.depth_affinity_smoothness_weight = depth_affinity_smoothness_weight
         self.gate_consistency_weight = gate_consistency_weight
         self.focal_axis_smoothness_weight = focal_axis_smoothness_weight
+        self.focal_axis_unimodality_weight = focal_axis_unimodality_weight if focal_axis_unimodality_weight != 0.0 else focal_axis_smoothness_weight
         self.local_affinity_sigma = local_affinity_sigma
         self.lambda_trace = lambda_trace
         self.lambda_violation = lambda_violation
@@ -431,8 +484,8 @@ class FocalStackGenerationLoss(nn.Module):
 
     def forward(
         self,
-        diffusion_pred: torch.Tensor,
-        diffusion_target: torch.Tensor,
+        diffusion_pred: torch.Tensor | LossInputs,
+        diffusion_target: torch.Tensor | None = None,
         depth_target: torch.Tensor | None = None,
         rgb_pred: torch.Tensor | None = None,
         rgb_target: torch.Tensor | None = None,
@@ -456,7 +509,7 @@ class FocalStackGenerationLoss(nn.Module):
         predicted_verification_invalid: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute focal generation losses with optional PhysicalVerificationTrace penalties."""
-        del generative_prior_weight, abstention_weight
+
 
         losses: dict[str, torch.Tensor] = {
             "loss_flow_matching": F.mse_loss(diffusion_pred, diffusion_target),
@@ -514,16 +567,30 @@ class FocalStackGenerationLoss(nn.Module):
                     prior_for_gate = F.interpolate(prior_for_gate, size=depth_target.shape[-2:], mode="bilinear", align_corners=False)
                 err_focus = torch.abs(focus_for_gate - depth_gt_norm)
                 err_prior = torch.abs(prior_for_gate - depth_gt_norm)
-                target_focus = (err_focus < err_prior).float()
+                preference = torch.softmax(torch.cat([-err_focus / max(self.focus_target_temperature, 1e-6), -err_prior / max(self.focus_target_temperature, 1e-6)], dim=1), dim=1)
                 pred_focus = focal_evidence_weight
-                if pred_focus.shape[-2:] != target_focus.shape[-2:]:
-                    pred_focus = F.interpolate(pred_focus, size=target_focus.shape[-2:], mode="bilinear", align_corners=False)
-                loss_focal_evidence_weight = F.binary_cross_entropy(
-                    pred_focus.clamp(1e-6, 1.0 - 1e-6),
-                    target_focus,
-                    reduction="none",
-                )
-                losses["loss_focal_evidence_weight"] = self._masked_mean(loss_focal_evidence_weight, mask)
+                pred_prior = generative_prior_weight if generative_prior_weight is not None else (1.0 - focal_evidence_weight)
+                if pred_focus.shape[-2:] != preference.shape[-2:]:
+                    pred_focus = F.interpolate(pred_focus, size=preference.shape[-2:], mode="bilinear", align_corners=False)
+                    pred_prior = F.interpolate(pred_prior, size=preference.shape[-2:], mode="bilinear", align_corners=False)
+                pred_mix = torch.cat([pred_focus, pred_prior], dim=1).clamp(1e-6, 1.0)
+                pred_mix = pred_mix / pred_mix.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                gate_ce = -(preference.detach() * torch.log(pred_mix)).sum(dim=1, keepdim=True)
+                losses["loss_focal_evidence_weight"] = self._masked_mean(gate_ce, mask)
+                focus_selected = (pred_focus >= pred_prior).to(dtype=err_focus.dtype)
+                focus_oracle = (err_focus <= err_prior).to(dtype=err_focus.dtype)
+                losses["focus_selection_accuracy"] = self._masked_mean((focus_selected == focus_oracle).to(dtype=err_focus.dtype), mask).detach()
+                fused_oracle = torch.minimum(err_focus, err_prior)
+                losses["oracle_fusion_gap"] = self._masked_mean(torch.abs(depth_final_resized.detach() - depth_gt_norm) - fused_oracle, mask).detach()
+                both_wrong = ((err_focus > self.focus_target_temperature) & (err_prior > self.focus_target_temperature)).to(dtype=err_focus.dtype)
+                losses["both_branches_wrong_rate"] = self._masked_mean(both_wrong, mask).detach()
+                if abstention_weight is not None:
+                    abstention_pred = abstention_weight
+                    if abstention_pred.shape[-2:] != both_wrong.shape[-2:]:
+                        abstention_pred = F.interpolate(abstention_pred, size=both_wrong.shape[-2:], mode="bilinear", align_corners=False)
+                    abstention_target = both_wrong.detach()
+                    losses["loss_abstention_calibration"] = self._masked_mean(F.binary_cross_entropy(abstention_pred.clamp(1e-6, 1.0 - 1e-6), abstention_target, reduction="none"), mask)
+                    losses["abstention_calibration"] = (1.0 - torch.abs(abstention_pred.detach() - abstention_target)).mean().detach()
 
         if enable_supervised and rgb_pred is not None and rgb_target is not None:
             losses["loss_rgb_reconstruction"] = F.l1_loss(rgb_pred, rgb_target)
@@ -609,19 +676,23 @@ class FocalStackGenerationLoss(nn.Module):
                     valid_mask=valid_mask_for_reg,
                 )
 
-            losses["loss_focal_axis_smoothness"] = _focal_axis_smoothness_loss(
-                posterior_for_reg,
-            )
+            losses["loss_focal_axis_smoothness"] = _focal_axis_smoothness_loss(posterior_for_reg)
             evidence_mask = None
-            if focal_stack is not None:
+            if physical_verification_trace is not None:
+                identifiability = getattr(physical_verification_trace, "focus_identifiability", None)
+                entropy = getattr(physical_verification_trace, "focus_entropy", None)
+                if identifiability is not None and entropy is not None:
+                    evidence_mask = (identifiability.detach() * (1.0 - entropy.detach()).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+            if evidence_mask is None and focal_stack is not None:
                 texture = focal_stack.detach().float().sub(focal_stack.detach().float().mean(dim=1, keepdim=True)).abs().mean(dim=(1, 2), keepdim=True)
-                evidence_mask = (texture > texture.mean(dim=(-2, -1), keepdim=True)).to(dtype=posterior_for_reg.dtype)
-                if evidence_mask.shape[-2:] != posterior_for_reg.shape[-2:]:
-                    evidence_mask = F.interpolate(evidence_mask, size=posterior_for_reg.shape[-2:], mode="nearest")
-            losses["loss_focal_axis_unimodality"] = soft_bidirectional_unimodality_loss(
-                posterior_for_reg,
-                evidence_mask=evidence_mask,
-            )
+                entropy = focal_entropy.detach().clamp(0.0, 1.0) if focal_entropy is not None else None
+                if entropy is not None and entropy.shape[-2:] != texture.shape[-2:]:
+                    entropy = F.interpolate(entropy, size=texture.shape[-2:], mode="bilinear", align_corners=False)
+                texture_weight = (texture / texture.mean(dim=(-2, -1), keepdim=True).clamp(min=1e-6)).clamp(0.0, 1.0)
+                evidence_mask = texture_weight if entropy is None else (texture_weight * (1.0 - entropy)).detach().clamp(0.0, 1.0)
+            if evidence_mask is not None and evidence_mask.shape[-2:] != posterior_for_reg.shape[-2:]:
+                evidence_mask = F.interpolate(evidence_mask, size=posterior_for_reg.shape[-2:], mode="bilinear", align_corners=False)
+            losses["loss_focal_axis_unimodality"] = soft_bidirectional_unimodality_loss(posterior_for_reg, evidence_mask=evidence_mask)
 
         if physical_verification_trace is not None:
             trace_outputs = self.trace_loss(
@@ -651,6 +722,7 @@ class FocalStackGenerationLoss(nn.Module):
         total = total + self.uncertainty_focus_weight * losses.get("loss_uncertainty_focus", torch.zeros_like(total))
         total = total + self.uncertainty_error_weight * losses.get("loss_uncertainty_error", torch.zeros_like(total))
         total = total + self.gate_calibration_weight * losses.get("loss_focal_evidence_weight", torch.zeros_like(total))
+        total = total + self.gate_calibration_weight * losses.get("loss_abstention_calibration", torch.zeros_like(total))
         total = total + self.posterior_consistency_weight * losses.get(
             "loss_posterior_consistency",
             torch.zeros_like(total),
@@ -667,11 +739,21 @@ class FocalStackGenerationLoss(nn.Module):
             "loss_focal_axis_smoothness",
             torch.zeros_like(total),
         )
-        total = total + self.focal_axis_smoothness_weight * losses.get(
+        total = total + self.focal_axis_unimodality_weight * losses.get(
             "loss_focal_axis_unimodality",
             torch.zeros_like(total),
         )
         total = total + losses.get("loss_trace", torch.zeros_like(total))
         total = total + losses.get("loss_violation", torch.zeros_like(total))
 
-        return {**losses, "total": total}
+        weighted_terms = {
+            "reconstruction": self.diffusion_weight * losses.get("loss_flow_matching", torch.zeros_like(total)) + self.rgb_weight * losses.get("loss_rgb_reconstruction", torch.zeros_like(total)),
+            "depth": self.depth_weight * losses.get("loss_depth_final", torch.zeros_like(total)) + self.focus_depth_weight * losses.get("loss_depth_focus", torch.zeros_like(total)) + self.prior_depth_weight * losses.get("loss_depth_prior", torch.zeros_like(total)),
+            "focus_likelihood": self.focal_posterior_kl_weight * losses.get("loss_focal_posterior_kl", torch.zeros_like(total)),
+            "reliability": self.gate_calibration_weight * (losses.get("loss_focal_evidence_weight", torch.zeros_like(total)) + losses.get("loss_abstention_calibration", torch.zeros_like(total))),
+            "uncertainty": self.uncertainty_focus_weight * losses.get("loss_uncertainty_focus", torch.zeros_like(total)) + self.uncertainty_error_weight * losses.get("loss_uncertainty_error", torch.zeros_like(total)),
+            "regularization": self.posterior_consistency_weight * losses.get("loss_posterior_consistency", torch.zeros_like(total)) + self.depth_affinity_smoothness_weight * losses.get("loss_depth_affinity_smoothness", torch.zeros_like(total)) + self.gate_consistency_weight * losses.get("loss_gate_consistency", torch.zeros_like(total)) + self.focal_axis_smoothness_weight * losses.get("loss_focal_axis_smoothness", torch.zeros_like(total)) + self.focal_axis_unimodality_weight * losses.get("loss_focal_axis_unimodality", torch.zeros_like(total)),
+            "consistency": losses.get("loss_trace", torch.zeros_like(total)) + losses.get("loss_violation", torch.zeros_like(total)),
+        }
+        unweighted_terms = {key: value.detach() for key, value in losses.items() if key.startswith("loss_")}
+        return {**losses, "loss_groups_unweighted": unweighted_terms, "loss_groups_weighted": weighted_terms, "loss_total": total, "total": total}

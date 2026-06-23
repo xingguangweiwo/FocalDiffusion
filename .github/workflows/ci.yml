@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  cpu-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install package and development tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[development]
+      - name: Ruff
+        run: ruff check src script tests
+      - name: Pyright
+        run: pyright
+      - name: Compile all
+        run: python -m compileall src script tests
+      - name: README evaluation command dry-run
+        run: python -m script.evaluate --config configs/base.yaml --checkpoint /tmp/mock.pt --dataset target_test --data_root /tmp --split target_test --dry-run --device cpu
+      - name: CPU pytest and checkpoint schema migration tests
+        run: pytest -q

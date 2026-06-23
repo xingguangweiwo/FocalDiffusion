@@ -15,8 +15,14 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from accelerate import Accelerator
-from accelerate.utils import set_seed
+try:
+    from accelerate import Accelerator
+    from accelerate.utils import set_seed
+except ModuleNotFoundError:  # optional unless FocalStackGenerationTrainer is instantiated
+    Accelerator = None  # type: ignore[assignment]
+
+    def set_seed(seed: int) -> None:
+        torch.manual_seed(seed)
 from diffusers import StableDiffusion3Pipeline
 from huggingface_hub import get_token as hf_get_token
 from huggingface_hub.errors import GatedRepoError
@@ -26,8 +32,8 @@ from diffusers.training_utils import EMAModel
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
-from ..models.focal_evidence_encoder import build_physical_evidence_features
-from ..models.physics_modules import FocalPhysicalVerifier
+from ..models.focal_evidence_encoder import build_reliability_features
+from ..models.physics_modules import FocalConsistencyEvaluator
 from ..utils.image_utils import resize_probability_volume, to_model_range, to_unit_range
 
 
@@ -48,11 +54,11 @@ class FocalStackGenerationTrainer:
         self.setup_optimization()
         self.setup_tracking()
 
-        self.trace_mining_buffer: TraceMiningBuffer | None = None
+        self.trace_mining_buffer: AcceptedRefinementBuffer | None = None
         self.parent_checkpoint_sha256: str | None = None
         self.mining_verifier_config_hash: str | None = None
         if self.adaptation_enabled:
-            self.trace_mining_buffer = TraceMiningBuffer(
+            self.trace_mining_buffer = AcceptedRefinementBuffer(
                 max_items=int(self.adaptation_cfg.get('max_buffer_items', 128)),
                 round_id=str(self.adaptation_cfg.get('round_id', 'adaptation')),
                 round_index=int(self.adaptation_cfg.get('round_index', 0)),
@@ -95,6 +101,8 @@ class FocalStackGenerationTrainer:
 
     def setup_accelerator(self):
         """Setup distributed training with Accelerator"""
+        if Accelerator is None:
+            raise ModuleNotFoundError("accelerate is required to instantiate FocalStackGenerationTrainer; install focaldiffusion[train].")
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.config['training']['gradient_accumulation_steps'],
             mixed_precision=self.config['training'].get('mixed_precision', 'no'),
@@ -223,7 +231,7 @@ class FocalStackGenerationTrainer:
             raise FileNotFoundError(f"training.unsupervised_adaptation.parent_checkpoint does not exist: {parent_path}")
         self.parent_checkpoint_sha256 = checkpoint_sha256(parent_path)
         if self.trace_mining_buffer is None:
-            raise ValueError("training.unsupervised_adaptation.enabled=true requires TraceMiningBuffer initialization.")
+            raise ValueError("training.unsupervised_adaptation.enabled=true requires AcceptedRefinementBuffer initialization.")
         manifest_path = self.trace_mining_buffer.manifest_path
         if manifest_path is None:
             raise ValueError("training.unsupervised_adaptation.enabled=true requires mining_manifest for checkpoint/verifier provenance.")
@@ -255,8 +263,8 @@ class FocalStackGenerationTrainer:
         logger.info("Loading SD3.5 base model...")
         from ..pipelines import FocalStackGenerationPipeline
         from ..models import FocalStackProcessor
-        from ..models.focal_evidence_encoder import FocalEvidenceEncoder, PhysicalEvidenceEstimator
-        from ..models.task_output_decoder import TaskOutputDecoder
+        from ..models.focal_evidence_encoder import FocusLikelihoodEstimator, ReliabilityFusionHead
+        from ..models.task_output_decoder import JointReconstructionDecoder
 
         model_cfg = self.config['model']
         requested_model_id = model_cfg['base_model_id']
@@ -321,16 +329,16 @@ class FocalStackGenerationTrainer:
             focal_attention_heads=self.config['model'].get('focal_attention_heads', 8),
             focal_attention_depth=self.config['model'].get('focal_attention_depth', 2),
         )
-        self.focal_evidence_head = FocalEvidenceEncoder(
+        self.focal_evidence_head = FocusLikelihoodEstimator(
             hidden=self.config["model"].get("focal_evidence_hidden", 48),
             temperature=self.config["model"].get("focal_evidence_temperature", 0.07),
         )
-        self.physical_evidence_support_head = PhysicalEvidenceEstimator(
-            in_channels=5,
+        self.physical_evidence_support_head = ReliabilityFusionHead(
+            in_channels=8,
             hidden=self.config["model"].get("physical_evidence_support_hidden", 16),
         )
 
-        self.task_output_decoder = TaskOutputDecoder(
+        self.task_output_decoder = JointReconstructionDecoder(
             in_channels=pipe.vae.config.latent_channels,
             out_channels_depth=1,
             out_channels_rgb=pipe.vae.config.latent_channels,
@@ -364,7 +372,7 @@ class FocalStackGenerationTrainer:
         self.pipeline.physical_verifier.eval()
         evaluation_cfg = self.config.get("validation", {}).get("evaluation_verifier", {}) or {}
         eval_focus_operator = str(evaluation_cfg.get("focus_operator", "gradient_variance"))
-        self.evaluation_verifier = FocalPhysicalVerifier(focus_operator=eval_focus_operator).to(target_device)
+        self.evaluation_verifier = FocalConsistencyEvaluator(focus_operator=eval_focus_operator).to(target_device)
         self.evaluation_verifier.requires_grad_(False)
         self.evaluation_verifier.eval()
 
@@ -549,6 +557,7 @@ class FocalStackGenerationTrainer:
             depth_affinity_smoothness_weight=self.config['losses'].get('depth_affinity_smoothness_weight', 0.01),
             gate_consistency_weight=self.config['losses'].get('gate_consistency_weight', 0.0),
             focal_axis_smoothness_weight=self.config['losses'].get('focal_axis_smoothness_weight', 0.0),
+            focal_axis_unimodality_weight=self.config['losses'].get('focal_axis_unimodality_weight', self.config['losses'].get('focal_axis_smoothness_weight', 0.0)),
             local_affinity_sigma=self.config['losses'].get('local_affinity_sigma', 0.10),
             focus_target_temperature=self.config['losses'].get('focus_target_temperature', 0.07),
             focal_target_type=self.config["losses"].get("focal_target_type", "normalized"),
@@ -682,11 +691,11 @@ class FocalStackGenerationTrainer:
                     focal_entropy = F.interpolate(focal_evidence["focal_entropy"], size=generated_depth_canonical.shape[-2:], mode="bilinear", align_corners=False)
                     focal_posterior = resize_probability_volume(focal_evidence["focal_posterior"], generated_depth_canonical.shape[-2:])
                     generative_uncertainty = uncertainty
-                    support_inputs, support_maps = build_physical_evidence_features(
+                    support_inputs, support_maps = build_reliability_features(
                         focal_posterior=focal_posterior,
                         focal_entropy=focal_entropy,
                         focal_depth_canonical=focal_depth_canonical,
-                        generated_depth_canonical=generated_depth_canonical,
+                        prior_depth_canonical=generated_depth_canonical,
                         generative_uncertainty=generative_uncertainty,
                     )
                     support_outputs = self.physical_evidence_support_head(support_inputs)
@@ -720,6 +729,7 @@ class FocalStackGenerationTrainer:
                             depth_canonical=final_depth_canonical.float(),
                             all_in_focus=rgb_recon_for_trace,
                             generated_depth_canonical=generated_depth_canonical.float(),
+                            focal_plane_valid_mask=batch.get("focal_plane_valid_mask", None).to(focal_stack_for_trace.device) if isinstance(batch.get("focal_plane_valid_mask", None), torch.Tensor) else None,
                         )
 
                     loss_dict = loss_fn(
@@ -875,11 +885,11 @@ class FocalStackGenerationTrainer:
             focal_depth_canonical = F.interpolate(focal_evidence["focal_depth_canonical"].float(), size=(height, width), mode="bilinear", align_corners=False)
             focal_entropy = F.interpolate(focal_evidence["focal_entropy"].float(), size=(height, width), mode="bilinear", align_corners=False)
             focal_posterior = resize_probability_volume(focal_evidence["focal_posterior"].float(), (height, width))
-            support_inputs, _ = build_physical_evidence_features(
+            support_inputs, _ = build_reliability_features(
                 focal_posterior=focal_posterior,
                 focal_entropy=focal_entropy,
                 focal_depth_canonical=focal_depth_canonical,
-                generated_depth_canonical=generated_depth_canonical,
+                prior_depth_canonical=generated_depth_canonical,
                 generative_uncertainty=generative_uncertainty,
             )
             support_outputs = self.physical_evidence_support_head(support_inputs)
@@ -900,6 +910,7 @@ class FocalStackGenerationTrainer:
                 depth_canonical=final_depth_canonical,
                 all_in_focus=rgb_recon_unit,
                 generated_depth_canonical=generated_depth_canonical,
+                focal_plane_valid_mask=batch.get("focal_plane_valid_mask", None).to(focal_stack_unit.device) if isinstance(batch.get("focal_plane_valid_mask", None), torch.Tensor) else None,
             )
         return {
             "trace": trace,
@@ -977,7 +988,7 @@ class FocalStackGenerationTrainer:
                 accepted = self.pipeline._should_accept_refinement(before_risk, after_risk, float(self.adaptation_cfg.get("heldout_acceptance_epsilon", 1e-4)))
                 stable_focus = float(outputs["trace"].texture_confidence.detach().mean().item()) >= float(self.adaptation_cfg.get("min_focus_evidence", 0.05))
                 if self.trace_mining_buffer is None:
-                    raise RuntimeError("TraceMiningBuffer is not initialized for unsupervised adaptation.")
+                    raise RuntimeError("AcceptedRefinementBuffer is not initialized for unsupervised adaptation.")
                 mined = self.trace_mining_buffer.mine(
                     trace=outputs["trace"],
                     uncertainty=cand_uncertainty,
@@ -1088,7 +1099,7 @@ class FocalStackGenerationTrainer:
         return load_checkpoint(self, checkpoint_path)
 
 
-class TraceMiningBuffer:
+class AcceptedRefinementBuffer:
     """Lightweight manifest of mined physical-verification trace patches.
 
     The manifest stores source identity, crop geometry, focal-plane coordinates
@@ -1534,3 +1545,7 @@ def checkpoint_sha256(path: str | os.PathLike[str]) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+# Backward-compatible alias for existing adaptation manifests/tests.
+TraceMiningBuffer = AcceptedRefinementBuffer

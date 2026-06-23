@@ -1,6 +1,6 @@
 """FocalStackGeneration model components exposed for training and inference."""
 
-from .task_output_decoder import TaskOutputDecoder
+from .task_output_decoder import JointReconstructionDecoder, TaskOutputDecoder
 from .focal_attention import FocalCrossAttention
 from .focal_evidence_encoder import (
     FocusLikelihoodEstimator,
@@ -25,6 +25,7 @@ __all__ = [
     "build_reliability_features",
     "build_physical_evidence_features",
     "decode_metric_depth_from_focal_posterior",
+    "JointReconstructionDecoder",
     "TaskOutputDecoder",
     "FocalConsistencyTrace",
     "PhysicalVerificationTrace",

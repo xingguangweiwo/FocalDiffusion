@@ -40,7 +40,7 @@ class _ResidualBlock(nn.Module):
         return self.act(out + residual)
 
 
-class TaskOutputDecoder(nn.Module):
+class JointReconstructionDecoder(nn.Module):
     """Decode SD3.5 latents into all-in-focus latents, canonical depth, and uncertainty."""
 
     def __init__(
@@ -156,22 +156,20 @@ class TaskOutputDecoder(nn.Module):
         confidence = torch.sigmoid(self.confidence_head(depth_features))
         all_in_focus_latents = self.rgb_head(rgb_features)
 
-        if self.apply_latent_scaling:
-            all_in_focus_latents = all_in_focus_latents * 0.18215
-
-        all_in_focus_edges = self._compute_edges(all_in_focus_latents)
+        # VAE latent scaling is handled outside this decoder by the owning pipeline.
+        latent_gradient_features = self._compute_edges(all_in_focus_latents)
         refine_input = torch.cat(
             [
                 depth_features,
                 all_in_focus_latents,
-                all_in_focus_edges,
+                latent_gradient_features,
                 1.0 - confidence,
             ],
             dim=1,
         )
         depth_delta = self.depth_refine(refine_input)
         generated_depth_canonical = torch.sigmoid(depth_logits_coarse + (1.0 - confidence) * depth_delta)
-        uncertainty = torch.sigmoid(1.5 * (1.0 - confidence))
+        uncertainty = (1.0 - confidence).clamp(0.0, 1.0)  # uncalibrated confidence complement
 
         return {
             "generated_depth_canonical": generated_depth_canonical,
@@ -194,3 +192,7 @@ class TaskOutputDecoder(nn.Module):
         std = magnitude.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
         normalized = (magnitude - mean) / std
         return torch.cat([grad_x, grad_y], dim=1) * 0.5 + normalized
+
+
+# Backward-compatible alias for existing checkpoints and imports.
+TaskOutputDecoder = JointReconstructionDecoder

@@ -320,8 +320,10 @@ def evaluate(args):
     )
     pipeline.eval()
 
+    split_sources = config.get('data', {}).get(args.dataset) or config.get('data', {}).get({'source_validation': 'val_sources', 'target_test': 'test_sources', 'target_adaptation': 'adaptation_sources'}.get(args.dataset, ''), [])
+    dataset_type = split_sources[0].get('type', args.dataset) if isinstance(split_sources, list) and split_sources else args.dataset
     dataloader = create_dataloader(
-        dataset_type=args.dataset,
+        dataset_type=dataset_type,
         data_root=args.data_root,
         split=args.split,
         batch_size=args.batch_size,
@@ -431,12 +433,12 @@ def evaluate(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate FocalStackGeneration model")
+    parser = argparse.ArgumentParser(description="Official FocalTrace evaluation entry point")
     parser.add_argument('--config', type=str, required=True, help='Config file')
     parser.add_argument('--checkpoint', type=str, required=True, help='Model checkpoint')
-    parser.add_argument('--dataset', type=str, choices=['hypersim', 'virtual_kitti'], required=True)
+    parser.add_argument('--dataset', type=str, choices=['source_validation', 'target_test', 'target_adaptation', 'hypersim', 'virtual_kitti'], required=True)
     parser.add_argument('--data_root', type=str, required=True, help='Dataset root')
-    parser.add_argument('--split', type=str, default='test', help='Dataset split')
+    parser.add_argument('--split', type=str, default='target_test', choices=['source_validation', 'target_test', 'target_adaptation', 'test', 'val'], help='Config split to evaluate')
     parser.add_argument('--output_dir', type=str, default='./outputs/evaluation')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--num_inference_steps', type=int, default=50)
@@ -445,6 +447,8 @@ def main():
     parser.add_argument('--max_samples', type=int, help='Maximum samples to evaluate')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--fp16', action='store_true', help='Use FP16 precision')
+    parser.add_argument('--allow-target-adaptation', action='store_true', help='Permit evaluating the target_adaptation split explicitly')
+    parser.add_argument('--dry-run', action='store_true', help='Validate CLI/config without loading model or data')
     parser.add_argument(
         '--confidence-threshold',
         type=float,
@@ -464,6 +468,11 @@ def main():
         help='Top-confidence coverage fraction for selective_physical_risk_at_coverage',
     )
     args = parser.parse_args()
+    if args.dataset == 'target_adaptation' and not args.allow_target_adaptation:
+        parser.error("target_adaptation evaluation requires --allow-target-adaptation")
+    if args.dry_run:
+        print("FocalTrace evaluation dry-run OK")
+        return
     evaluate(args)
 
 

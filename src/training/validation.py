@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .sd3_objective import predict_clean_latents_from_flow, sample_sd3_flow_matching_batch
-from ..models.focal_evidence_encoder import build_physical_evidence_features
+from ..models.focal_evidence_encoder import build_reliability_features
 from ..utils.image_utils import resize_probability_volume, to_model_range, to_unit_range
 from ..utils.metrics import compute_metrics
 
@@ -168,11 +168,11 @@ def _final_depth_from_heads(
         generated_depth_canonical.shape[-2:],
     ).to(device=generated_depth_canonical.device, dtype=generated_depth_canonical.dtype)
 
-    support_inputs, support_maps = build_physical_evidence_features(
+    support_inputs, support_maps = build_reliability_features(
         focal_posterior=focal_posterior,
         focal_entropy=focal_entropy,
         focal_depth_canonical=focal_depth_canonical,
-        generated_depth_canonical=generated_depth_canonical,
+        prior_depth_canonical=generated_depth_canonical,
         generative_uncertainty=generative_uncertainty,
     )
     support_device, support_dtype = _module_device_dtype(

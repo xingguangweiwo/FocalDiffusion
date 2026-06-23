@@ -29,10 +29,13 @@ class SyntheticFocalStackRenderer:
         eps: float = 1e-6,
         psf_type: str = "gaussian",
         num_blur_levels: int | None = None,
-        exposure_normalize: bool = True,
+        exposure_normalize: bool = False,
+        mode: str = "calibrated",
     ) -> None:
         if psf_type not in {"gaussian", "disc"}:
             raise ValueError("psf_type must be 'gaussian' or 'disc'.")
+        if mode not in {"calibrated", "canonical"}:
+            raise ValueError("mode must be 'calibrated' or 'canonical'.")
         self.default_f_number = default_f_number
         self.default_focal_length = default_focal_length
         self.default_pixel_size = default_pixel_size
@@ -43,7 +46,8 @@ class SyntheticFocalStackRenderer:
         self.eps = eps
         self.psf_type = psf_type
         self.num_blur_levels = num_blur_levels or int(math.ceil(max_sigma / self.sigma_quantisation)) + 1
-        self.exposure_normalize = exposure_normalize
+        self.exposure_normalize = False
+        self.mode = mode
 
     def generate(
         self,
@@ -85,7 +89,7 @@ class SyntheticFocalStackRenderer:
             raise ValueError("focal_plane_distances must have shape [K] or [B,K]")
 
         camera = self._prepare_camera_params(camera_params, image.device, image.dtype, image.shape[0])
-        sigma = self._compute_sigma_map(depth, focus, camera)
+        sigma = self._compute_canonical_sigma_map(depth, focus) if self.mode == "canonical" else self._compute_sigma_map(depth, focus, camera)
         rendered = self.render_from_sigma(image, sigma)
         return rendered.squeeze(0) if unbatched else rendered
 
@@ -95,8 +99,6 @@ class SyntheticFocalStackRenderer:
             raise ValueError("sigma must have shape [B,K,H,W]")
         batch, channels, height, width = image.shape
         _, planes, _, _ = sigma.shape
-        if self.exposure_normalize:
-            image = image / image.mean(dim=(-2, -1), keepdim=True).clamp(min=self.eps) * image.detach().mean(dim=(-2, -1), keepdim=True).clamp(min=self.eps)
         levels = torch.linspace(0.0, self.max_sigma, self.num_blur_levels, device=image.device, dtype=image.dtype)
         basis = torch.stack([self._blur(image, level) for level in levels], dim=1)  # [B,L,C,H,W]
         scaled = (sigma.clamp(0.0, self.max_sigma) / self.max_sigma) * (self.num_blur_levels - 1)
@@ -130,6 +132,14 @@ class SyntheticFocalStackRenderer:
         else:
             camera["aperture"] = camera["focal_length"] / camera["f_number"].clamp(min=self.eps)
         return camera
+
+    def _compute_canonical_sigma_map(self, depth: torch.Tensor, focus: torch.Tensor) -> torch.Tensor:
+        """Return a normalized defocus surrogate for canonical depth coordinates."""
+        focus_min = focus.amin(dim=1, keepdim=True)
+        focus_max = focus.amax(dim=1, keepdim=True)
+        coords = (focus - focus_min) / (focus_max - focus_min).clamp(min=self.eps)
+        canonical_depth = depth[:, None].clamp(0.0, 1.0)
+        return (canonical_depth - coords[:, :, None, None, None]).abs().squeeze(2).clamp(0.0, 1.0) * self.max_sigma
 
     def _compute_sigma_map(self, depth: torch.Tensor, focus: torch.Tensor, camera: Dict[str, torch.Tensor]) -> torch.Tensor:
         focal_length = camera["focal_length"][:, None]

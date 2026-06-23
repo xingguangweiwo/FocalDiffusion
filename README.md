@@ -125,3 +125,52 @@ script/           Training, inference, evaluation entry points
 configs/          Protocol/configuration files
 tests/            CPU smoke and module tests
 ```
+
+## Release protocol and reproducibility
+
+### Method diagram (text)
+
+`focal stack + focal-plane coordinates` → `FocalSweepEncoder` → `FocusLikelihoodEstimator` → `JointReconstructionDecoder prior/AIF` → `ReliabilityFusionHead` → `FocalConsistencyEvaluator` → optional held-out-verified TTO → `FocalTraceOutput`.
+
+### Implemented / Experimental / Planned
+
+| Status | Items |
+| --- | --- |
+| Implemented | Canonical focal-depth output, focus likelihood diagnostics, reliability fusion, internal consistency diagnostics, optional selective TTO, checkpoint/config schema migration helpers. |
+| Experimental | Unsupervised adaptation with accepted-refinement replay, calibrated metric rendering when camera metadata are available, LPIPS evaluation when installed. |
+| Planned | Published benchmark numbers, full ablation tables, transparent/specular region protocols for datasets that provide masks. |
+
+### Protocol definitions
+
+* `source_validation`: source-domain validation used for model selection and smoke evaluation.
+* `target_test`: disjoint target-domain test split for zero-shot/TTO reporting.
+* `target_adaptation`: optional unlabeled adaptation split; evaluation requires `--allow-target-adaptation` and must not be reused as `target_test`.
+
+Internal consistency metrics are diagnostics of agreement with the focal/image-formation model and must not be reported as ground-truth error metrics.
+
+### Coordinate conventions
+
+Canonical depth is normalized over the represented focal sweep. Metric depth is available only in calibrated mode with camera metadata. Canonical mode uses normalized focal coordinates and is not a claim of metric accuracy.
+
+### Calibrated versus canonical rendering
+
+`SyntheticFocalStackRenderer(mode="calibrated")` uses thin-lens CoC in metric units. `mode="canonical"` uses the normalized defocus surrogate for canonical-depth TTO and diagnostics.
+
+### Checkpoint and config schema
+
+Active schema versions are `checkpoint_schema_version=2` and `config_schema_version=2`. Use `migrate_checkpoint_schema` and `migrate_config_schema` from `src.pipelines.pipeline_utils` when loading older artifacts.
+
+### Reproducible commands
+
+```bash
+python -m script.evaluate --config configs/base.yaml --checkpoint /path/to/checkpoint.pt --dataset source_validation --data_root /path/to/data --split source_validation --device cpu
+python -m script.evaluate --config configs/base.yaml --checkpoint /path/to/checkpoint.pt --dataset target_test --data_root /path/to/data --split target_test --num_refinement_steps 0
+python -m script.evaluate --config configs/base.yaml --checkpoint /path/to/checkpoint.pt --dataset target_test --data_root /path/to/data --split target_test --num_refinement_steps 2
+python -m script.evaluate --config configs/base.yaml --checkpoint /path/to/checkpoint.pt --dataset target_adaptation --allow-target-adaptation --data_root /path/to/data --split target_adaptation
+```
+
+Expected outputs are `metrics_summary.json`, optional per-sample visualizations, and refinement summaries containing attempted/accepted steps, held-out measurements, runtime, and memory.
+
+### Limitations and unsupported claims
+
+This repository does not ship SD3.5 weights, benchmark datasets, or unmeasured performance claims. Benchmark tables and ablations must be generated from the released configs and reported with dataset, split, seed, runtime, and memory settings.
