@@ -1,4 +1,4 @@
-# FocalTrace: Test-Time Refinement for Zero-Shot Cross-Domain Focal-Stack Generation and Reconstruction
+# FocalTrace: Test-Time Refinement for Focal-Stack Generation and Reconstruction via Physical Verification Trace
 
 FocalTrace is a reliability-aware focal-stack reconstruction system for all-in-focus (AIF) image reconstruction, canonical depth estimation, focus-likelihood diagnostics, and focal-stack consistency evaluation. The active method is: focal stack → focal-sweep features → focus likelihood and focus-based depth → generative prior depth and AIF reconstruction → reliability-aware fusion → focal-consistency diagnostics → optional per-instance test-time optimization. Consistency traces describe agreement between focus cues and an image-formation model; they are not ground-truth correctness labels.
 
